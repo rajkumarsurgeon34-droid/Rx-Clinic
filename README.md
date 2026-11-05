@@ -21,8 +21,7 @@ Rx Clinic server ──(AI prompts, next stage)──▶ OpenAI
 ## Setup (one time)
 
 ### 1. Database (Cloudflare D1, free)
-1. In Cloudflare: **Storage & Databases → D1 → Create database**, name it `rxclinic-db`.
-2. Copy its **Database ID** and paste it into `server/wrangler.toml` (`database_id = ...`). Tables are created automatically on first use.
+Nothing to do: the first deploy creates the D1 database `rxclinic-db` and links it to the worker. Tables are created automatically on first use.
 
 ### 2. The Rx Clinic server (Cloudflare Worker)
 1. **Workers & Pages → Create → Import a repository →** this repo, **root directory `server`**, worker name `rxclinic`.

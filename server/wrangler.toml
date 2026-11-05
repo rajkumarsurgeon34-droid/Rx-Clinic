@@ -13,9 +13,8 @@ LIVEKIT_API_KEY = "APIQnxPPJ6GZhGT"
 OPENAI_MODEL = "gpt-4o-mini"
 CLINIC_TZ_MINUTES = "330"
 
-# The clinic database. Create it once in Cloudflare (Storage & Databases → D1 → Create,
-# name it rxclinic-db), then paste its Database ID below.
+# The clinic database. No ID needed: on the first deploy Wrangler (4.45+) creates
+# the D1 database "rxclinic-db" automatically and links it to this worker.
 [[d1_databases]]
 binding = "DB"
 database_name = "rxclinic-db"
-database_id = "PASTE-YOUR-D1-DATABASE-ID-HERE"
