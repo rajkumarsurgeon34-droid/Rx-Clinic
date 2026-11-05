@@ -2,7 +2,7 @@
   "name": "rx-clinic-server",
   "private": true,
   "type": "module",
-  "main": "worker.js",
+  "main": "server/worker.js",
   "scripts": {
     "deploy": "wrangler deploy"
   },

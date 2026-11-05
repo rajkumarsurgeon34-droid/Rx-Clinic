@@ -24,13 +24,13 @@ Rx Clinic server ──(AI prompts, next stage)──▶ OpenAI
 Nothing to do: the first deploy creates the D1 database `rxclinic-db` and links it to the worker. Tables are created automatically on first use.
 
 ### 2. The Rx Clinic server (Cloudflare Worker)
-1. **Workers & Pages → Create → Import a repository →** this repo, **root directory `server`**, worker name `rxclinic`.
+1. **Workers & Pages → Create → Import a repository →** this repo, worker name `rxclinic` (leave the root directory as `/`).
 2. In the worker's **Settings → Variables and Secrets**, add Secrets:
    - `LIVEKIT_API_SECRET`: the same LiveKit API secret SRK Meet uses
    - `OPENAI_API_KEY`: your OpenAI key (for the AI features)
 3. Open `https://rxclinic.<your-subdomain>.workers.dev`. You should see `"database": true, "video": true`.
 
-`LIVEKIT_URL` and `LIVEKIT_API_KEY` are already set in `wrangler.toml` (same LiveKit project as SRK Meet).
+`LIVEKIT_URL` and `LIVEKIT_API_KEY` are already set in `wrangler.toml` (at the top of the repo) (same LiveKit project as SRK Meet).
 
 ### 3. The APK
 GitHub Actions builds `Rx-Clinic.apk` on every push. Download it from **Releases**.

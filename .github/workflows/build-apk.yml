@@ -5,6 +5,8 @@ on:
     branches: [main, master]
     paths-ignore:
       - "server/**"
+      - "wrangler.toml"
+      - "package.json"
       - "README.md"
   workflow_dispatch:
 
