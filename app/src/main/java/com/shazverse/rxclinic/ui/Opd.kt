@@ -4,6 +4,7 @@ package com.shazverse.rxclinic.ui
 
 import android.content.Intent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -64,7 +65,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.shazverse.rxclinic.Api
 import com.shazverse.rxclinic.call.CallViewModel
-import com.shazverse.rxclinic.call.Palette
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -153,34 +153,34 @@ fun OpdQueue(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit, on
     }
 
     Column(Modifier.fillMaxSize()) {
-        TopBar("OPD", onBack) { IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.Text) } }
+        TopBar("OPD", onBack) { IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) } }
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { date = LocalDate.parse(date).minusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Previous day", tint = Palette.Text) }
-            Text("Checked in · ${dayLabel(date)}", color = Palette.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            IconButton(onClick = { date = LocalDate.parse(date).plusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Next day", tint = Palette.Text) }
+            IconButton(onClick = { date = LocalDate.parse(date).minusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Previous day", tint = Ui.Text) }
+            Text("Checked in · ${dayLabel(date)}", color = Ui.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            IconButton(onClick = { date = LocalDate.parse(date).plusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Next day", tint = Ui.Text) }
         }
         Box(Modifier.padding(horizontal = 16.dp)) { ErrorText(err) }
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            if (loading && list.isEmpty()) item { CircularProgressIndicator(color = Palette.Teal) }
+            if (loading && list.isEmpty()) item { CircularProgressIndicator(color = Ui.Teal) }
             if (!loading && list.isEmpty() && err == null) item {
-                Text("No patients have checked in on this day. Patients check in from Patient → Check-in.", color = Palette.Muted)
+                Text("No patients have checked in on this day. Patients check in from Patient → Check-in.", color = Ui.Muted)
             }
             items(list, key = { it.str("id") }) { v ->
                 val p = v.obj("patient")
                 Row(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Palette.Card).clickable { onOpen(v.str("id")) }.padding(14.dp),
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(16.dp)).clickable { onOpen(v.str("id")) }.padding(14.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(v.str("token"), color = Palette.Teal, fontSize = 22.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.width(44.dp))
+                    Text(v.str("token"), color = Ui.Teal, fontSize = 22.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.width(44.dp))
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(p.str("name"), color = Palette.Text, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                            if (v.optBoolean("urgent")) { Spacer(Modifier.width(6.dp)); Pill("Urgent", Palette.Red) }
+                            Text(p.str("name"), color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                            if (v.optBoolean("urgent")) { Spacer(Modifier.width(6.dp)); Pill("Urgent", Ui.Red) }
                         }
-                        Text("${p.str("age")} y · ${p.str("sex")} · ${v.str("complaint")}", color = Palette.Muted, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text("${p.str("age")} y · ${p.str("sex")} · ${v.str("complaint")}", color = Ui.Muted, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     }
                     val st = v.str("status")
-                    Pill(when (st) { "waiting" -> "Waiting"; "consult" -> "In consult"; "sent" -> "Prescribed"; else -> st }, when (st) { "waiting" -> Palette.Amber; "sent" -> Color(0xFF74D19F); else -> Palette.Teal })
+                    Pill(when (st) { "waiting" -> "Waiting"; "consult" -> "In consult"; "sent" -> "Prescribed"; else -> st }, when (st) { "waiting" -> Ui.Amber; "sent" -> Ui.Green; else -> Ui.Teal })
                 }
             }
         }
@@ -304,18 +304,18 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
         }
         val v = visit
         if (v == null) {
-            Box(Modifier.padding(16.dp)) { if (loadErr != null) ErrorText(loadErr) else CircularProgressIndicator(color = Palette.Teal) }
+            Box(Modifier.padding(16.dp)) { if (loadErr != null) ErrorText(loadErr) else CircularProgressIndicator(color = Ui.Teal) }
             return@Column
         }
         val p = v.obj("patient")
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("${p.str("age")} y · ${p.str("sex")} · Token ${v.str("token")}", color = Palette.Muted)
-                    if (v.optBoolean("urgent")) Pill("Urgent at check-in", Palette.Red)
-                    Pill(when (status) { "waiting" -> "Waiting"; "consult" -> "In consult"; "sent" -> "Prescribed"; else -> status }, Palette.Teal)
+                    Text("${p.str("age")} y · ${p.str("sex")} · Token ${v.str("token")}", color = Ui.Muted)
+                    if (v.optBoolean("urgent")) Pill("Urgent at check-in", Ui.Red)
+                    Pill(when (status) { "waiting" -> "Waiting"; "consult" -> "In consult"; "sent" -> "Prescribed"; else -> status }, Ui.Teal)
                 }
-                saveMsg?.let { Text(it, color = if (it.endsWith(".")) Palette.Teal else Palette.Red, fontSize = 13.sp) }
+                saveMsg?.let { Text(it, color = if (it.endsWith(".")) Ui.Teal else Ui.Red, fontSize = 13.sp) }
             }
 
             // 1. History
@@ -323,7 +323,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                 Section("1", "History") {
                     val cs = v.obj("caseSheet")
                     if (cs == null) {
-                        Text("No structured case sheet yet.", color = Palette.Muted)
+                        Text("No structured case sheet yet.", color = Ui.Muted)
                         AiButton("Build case sheet from answers", busy["sheet"] == true) {
                             busy["sheet"] = true
                             scope.launch {
@@ -339,10 +339,10 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                         ErrorText(errs["sheet"])
                     } else {
                         Label("Chief complaints")
-                        cs.objs("chiefComplaints").forEachIndexed { i, c -> Text("${i + 1}. ${c.str("complaint")}${if (c.str("duration").isNotBlank()) " — " + c.str("duration") else ""}", color = Palette.Text, fontWeight = FontWeight.SemiBold) }
-                        if (cs.str("hpi").isNotBlank()) { Label("History of present illness"); Text(cs.str("hpi"), color = Palette.Text) }
+                        cs.objs("chiefComplaints").forEachIndexed { i, c -> Text("${i + 1}. ${c.str("complaint")}${if (c.str("duration").isNotBlank()) " — " + c.str("duration") else ""}", color = Ui.Text, fontWeight = FontWeight.SemiBold) }
+                        if (cs.str("hpi").isNotBlank()) { Label("History of present illness"); Text(cs.str("hpi"), color = Ui.Text) }
                         val flags = cs.strs("redFlags")
-                        if (flags.isNotEmpty()) Text("Red flags: " + flags.joinToString("; "), color = Palette.Red, fontWeight = FontWeight.SemiBold)
+                        if (flags.isNotEmpty()) Text("Red flags: " + flags.joinToString("; "), color = Ui.Red, fontWeight = FontWeight.SemiBold)
                         val past = cs.obj("past"); val h = cs.obj("habits")
                         Kv("Past illness", past.str("medical")); Kv("Surgery", past.str("surgical")); Kv("Transfusion", past.str("transfusion"))
                         Kv("Current drugs", past.str("drugs")); Kv("Drug allergy", past.str("allergies"))
@@ -352,7 +352,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                     }
                     var showQa by remember { mutableStateOf(false) }
                     TextButton(onClick = { showQa = !showQa }) { Text(if (showQa) "Hide patient's own answers" else "Show patient's own answers (${v.objs("qa").size})") }
-                    if (showQa) v.objs("qa").forEach { Text("${it.str("q")} — ${it.str("a")}", color = Palette.Muted, fontSize = 13.sp) }
+                    if (showQa) v.objs("qa").forEach { Text("${it.str("q")} — ${it.str("a")}", color = Ui.Muted, fontSize = 13.sp) }
                 }
             }
 
@@ -384,13 +384,13 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                     ErrorText(errs["assess"])
                     assessment?.let { a ->
                         AiBox {
-                            if (a.str("summary").isNotBlank()) Text(a.str("summary"), color = Palette.Text, fontWeight = FontWeight.SemiBold)
-                            if (a.strs("redFlags").isNotEmpty()) Text("Red flags: " + a.strs("redFlags").joinToString("; "), color = Palette.Red)
-                            if (a.strs("examineFor").isNotEmpty()) Text("Look for: " + a.strs("examineFor").joinToString("; "), color = Palette.Teal, fontSize = 14.sp)
+                            if (a.str("summary").isNotBlank()) Text(a.str("summary"), color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                            if (a.strs("redFlags").isNotEmpty()) Text("Red flags: " + a.strs("redFlags").joinToString("; "), color = Ui.Red)
+                            if (a.strs("examineFor").isNotEmpty()) Text("Look for: " + a.strs("examineFor").joinToString("; "), color = Ui.Teal, fontSize = 14.sp)
                             a.obj("provisional")?.let { pv ->
                                 AiItem {
                                     Label("Provisional diagnosis")
-                                    Text(pv.str("diagnosis"), color = Palette.Text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                    Text(pv.str("diagnosis"), color = Ui.Text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                                     Why(pv.str("justification"))
                                     OutlinedButton(onClick = { provisional = pv.str("diagnosis") }) { Text("Use this") }
                                 }
@@ -399,11 +399,11 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                             a.objs("differentials").forEach { d ->
                                 AiItem {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(d.str("diagnosis"), color = Palette.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                                        Pill(d.str("likelihood"), when (d.str("likelihood")) { "high" -> Palette.Red; "moderate" -> Palette.Amber; else -> Palette.Muted })
+                                        Text(d.str("diagnosis"), color = Ui.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                                        Pill(d.str("likelihood"), when (d.str("likelihood")) { "high" -> Ui.Red; "moderate" -> Ui.Amber; else -> Ui.Muted })
                                     }
-                                    if (d.strs("for").isNotEmpty()) Text("For: " + d.strs("for").joinToString("; "), color = Color(0xFF74D19F), fontSize = 13.sp)
-                                    if (d.strs("against").isNotEmpty()) Text("Against: " + d.strs("against").joinToString("; "), color = Palette.Red, fontSize = 13.sp)
+                                    if (d.strs("for").isNotEmpty()) Text("For: " + d.strs("for").joinToString("; "), color = Ui.Green, fontSize = 13.sp)
+                                    if (d.strs("against").isNotEmpty()) Text("Against: " + d.strs("against").joinToString("; "), color = Ui.Red, fontSize = 13.sp)
                                     TextButton(onClick = { provisional = d.str("diagnosis") }) { Text("Use as provisional") }
                                 }
                             }
@@ -413,8 +413,8 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                                 Row(verticalAlignment = Alignment.Top, modifier = Modifier.clickable { if (n in ordered) ordered.remove(n) else ordered.add(n) }) {
                                     Checkbox(n in ordered, { if (it) ordered.add(n) else ordered.remove(n) })
                                     Column(Modifier.padding(top = 10.dp)) {
-                                        Text("$n  ·  ${inv.str("priority")}", color = Palette.Text, fontWeight = FontWeight.SemiBold)
-                                        Text(inv.str("reason"), color = Palette.Muted, fontSize = 13.sp)
+                                        Text("$n  ·  ${inv.str("priority")}", color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                                        Text(inv.str("reason"), color = Ui.Muted, fontSize = 13.sp)
                                     }
                                 }
                             }
@@ -427,7 +427,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
             // 4. Results
             item {
                 Section("4", "Investigation results") {
-                    if (ordered.isNotEmpty()) Text("Ordered: " + ordered.joinToString(", "), color = Palette.Muted, fontSize = 13.sp)
+                    if (ordered.isNotEmpty()) Text("Ordered: " + ordered.joinToString(", "), color = Ui.Muted, fontSize = 13.sp)
                     OutlinedTextField(resultsText, { resultsText = it }, label = { Text("Type the results (e.g. Hb 12.1, TC 14,800, USG: …)") }, minLines = 3, modifier = Modifier.fillMaxWidth())
                     AiButton("Analyse results", busy["analyse"] == true) {
                         if (resultsText.isBlank()) { errs["analyse"] = "Type the results first." }
@@ -440,16 +440,16 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                         AiBox {
                             an.objs("findings").forEach { f ->
                                 val bad = f.str("flag") != "normal"
-                                Text("${f.str("test")}: ${f.str("value")} — ${f.str("flag")}", color = if (bad) Palette.Red else Color(0xFF74D19F), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                                if (f.str("meaning").isNotBlank()) Text(f.str("meaning"), color = Palette.Muted, fontSize = 13.sp)
+                                Text("${f.str("test")}: ${f.str("value")} — ${f.str("flag")}", color = if (bad) Ui.Red else Ui.Green, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                if (f.str("meaning").isNotBlank()) Text(f.str("meaning"), color = Ui.Muted, fontSize = 13.sp)
                             }
                             if (an.str("diagnosis").isNotBlank()) AiItem {
                                 Label("Diagnosis with results · confidence ${an.str("confidence")}")
-                                Text(an.str("diagnosis"), color = Palette.Text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text(an.str("diagnosis"), color = Ui.Text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                                 Why(an.str("justification"))
                                 OutlinedButton(onClick = { finalDx = an.str("diagnosis") }) { Text("Use as final diagnosis") }
                             }
-                            if (an.objs("furtherTests").isNotEmpty()) Text("Further tests: " + an.objs("furtherTests").joinToString("; ") { it.str("name") + " (" + it.str("reason") + ")" }, color = Palette.Muted, fontSize = 13.sp)
+                            if (an.objs("furtherTests").isNotEmpty()) Text("Further tests: " + an.objs("furtherTests").joinToString("; ") { it.str("name") + " (" + it.str("reason") + ")" }, color = Ui.Muted, fontSize = 13.sp)
                         }
                     }
                     OutlinedTextField(finalDx, { finalDx = it }, label = { Text("Final diagnosis") }, modifier = Modifier.fillMaxWidth())
@@ -467,28 +467,28 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                     ErrorText(errs["treat"])
                     treatment?.let { tr ->
                         AiBox {
-                            Text("Approach: ${tr.str("approach")}", color = Palette.Teal, fontWeight = FontWeight.SemiBold)
+                            Text("Approach: ${tr.str("approach")}", color = Ui.Teal, fontWeight = FontWeight.SemiBold)
                             val s = tr.obj("surgical")
                             if (s?.optBoolean("recommended") == true) AiItem {
                                 Label("Surgical management · ${s.str("urgency")}")
-                                Text(s.str("procedure"), color = Palette.Text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                                if (s.str("indication").isNotBlank()) Text("Indication: " + s.str("indication"), color = Palette.Text, fontSize = 14.sp)
-                                if (s.strs("preop").isNotEmpty()) Text("Pre-op: " + s.strs("preop").joinToString("; "), color = Palette.Text, fontSize = 14.sp)
+                                Text(s.str("procedure"), color = Ui.Text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                if (s.str("indication").isNotBlank()) Text("Indication: " + s.str("indication"), color = Ui.Text, fontSize = 14.sp)
+                                if (s.strs("preop").isNotEmpty()) Text("Pre-op: " + s.strs("preop").joinToString("; "), color = Ui.Text, fontSize = 14.sp)
                                 Why(s.str("justification"))
                                 OutlinedButton(onClick = { surgery = "${s.str("procedure")} (${s.str("urgency")})" }) { Text("Add to plan") }
                             }
-                            if (tr.strs("cautions").isNotEmpty()) Text("Cautions: " + tr.strs("cautions").joinToString("; "), color = Palette.Amber, fontSize = 14.sp)
+                            if (tr.strs("cautions").isNotEmpty()) Text("Cautions: " + tr.strs("cautions").joinToString("; "), color = Ui.Amber, fontSize = 14.sp)
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Label("Medicines"); Spacer(Modifier.weight(1f))
                                 TextButton(onClick = { tr.objs("medicines").forEach { m -> if (rx.none { it.generic == m.str("generic") }) rx.add(aiDrug(m)) } }) { Text("Add all") }
                             }
                             tr.objs("medicines").forEach { m ->
                                 AiItem {
-                                    Text("${m.str("form")} ${m.str("generic")} ${m.str("strength")}", color = Palette.Text, fontWeight = FontWeight.SemiBold)
-                                    Text("${m.str("dose")} · ${m.str("frequency")} · ${m.str("timing")} · ${m.str("duration")}", color = Palette.Text, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-                                    if (m.str("instructions").isNotBlank()) Text(m.str("instructions"), color = Palette.Text, fontSize = 13.sp)
+                                    Text("${m.str("form")} ${m.str("generic")} ${m.str("strength")}", color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                                    Text("${m.str("dose")} · ${m.str("frequency")} · ${m.str("timing")} · ${m.str("duration")}", color = Ui.Text, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                                    if (m.str("instructions").isNotBlank()) Text(m.str("instructions"), color = Ui.Text, fontSize = 13.sp)
                                     Why(m.str("reason"))
-                                    if (rx.any { it.generic == m.str("generic") }) Pill("On prescription", Color(0xFF74D19F))
+                                    if (rx.any { it.generic == m.str("generic") }) Pill("On prescription", Ui.Green)
                                     else OutlinedButton(onClick = { rx.add(aiDrug(m)) }) { Text("Add to prescription") }
                                 }
                             }
@@ -498,8 +498,8 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                             }
                             tr.objs("advice").forEach { a ->
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Column(Modifier.weight(1f)) { Text(a.str("text"), color = Palette.Text, fontSize = 14.sp); Why(a.str("why")) }
-                                    if (a.str("text") in advice) Pill("Added", Color(0xFF74D19F)) else TextButton(onClick = { advice.add(a.str("text")) }) { Text("Add") }
+                                    Column(Modifier.weight(1f)) { Text(a.str("text"), color = Ui.Text, fontSize = 14.sp); Why(a.str("why")) }
+                                    if (a.str("text") in advice) Pill("Added", Ui.Green) else TextButton(onClick = { advice.add(a.str("text")) }) { Text("Add") }
                                 }
                             }
                             tr.obj("physio")?.takeIf { it.optBoolean("needed") }?.let { ph ->
@@ -510,7 +510,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                             }
                             val days = tr.optInt("reviewInDays", 0)
                             if (days > 0) AiItem {
-                                Text("Review in $days days", color = Palette.Text, fontWeight = FontWeight.SemiBold); Why(tr.str("reviewReason"))
+                                Text("Review in $days days", color = Ui.Text, fontWeight = FontWeight.SemiBold); Why(tr.str("reviewReason"))
                                 OutlinedButton(onClick = { review = LocalDate.now().plusDays(days.toLong()).toString(); reviewNote = tr.str("reviewReason") }) { Text("Set review date") }
                             }
                         }
@@ -522,9 +522,9 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
             item {
                 Section("6", "Prescription") {
                     if (surgery.isNotBlank()) Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Surgical plan: $surgery", color = Palette.Teal, modifier = Modifier.weight(1f)); IconButton(onClick = { surgery = "" }) { Icon(Icons.Filled.Close, "Remove", tint = Palette.Red) }
+                        Text("Surgical plan: $surgery", color = Ui.Teal, modifier = Modifier.weight(1f)); IconButton(onClick = { surgery = "" }) { Icon(Icons.Filled.Close, "Remove", tint = Ui.Red) }
                     }
-                    if (rx.isEmpty()) Text("No medicines yet. Add from the suggestions above or type a name below.", color = Palette.Muted)
+                    if (rx.isEmpty()) Text("No medicines yet. Add from the suggestions above or type a name below.", color = Ui.Muted)
                     rx.forEachIndexed { i, r -> RxEditor(r, onChange = { rx[i] = it }, onDelete = { rx.removeAt(i) }) }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(newDrug, { newDrug = it }, label = { Text("Add a medicine (generic name)") }, singleLine = true, modifier = Modifier.weight(1f))
@@ -533,8 +533,8 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                     Label("Advice to patient")
                     advice.forEachIndexed { i, a ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("• $a", color = Palette.Text, modifier = Modifier.weight(1f), fontSize = 14.sp)
-                            IconButton(onClick = { advice.removeAt(i) }) { Icon(Icons.Filled.Close, "Remove advice", tint = Palette.Red) }
+                            Text("• $a", color = Ui.Text, modifier = Modifier.weight(1f), fontSize = 14.sp)
+                            IconButton(onClick = { advice.removeAt(i) }) { Icon(Icons.Filled.Close, "Remove advice", tint = Ui.Red) }
                         }
                     }
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -555,7 +555,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                         val text = prescriptionText(vm.prefs.doctorName, p.str("name"), p.str("age"), p.str("sex"), finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote)
                         context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share prescription"))
                     }, modifier = Modifier.fillMaxWidth()) { Text("Share prescription (WhatsApp, SMS…)") }
-                    Text("AI suggestions are for the doctor to verify. Nothing reaches the prescription until you add it.", color = Palette.Muted, fontSize = 12.sp)
+                    Text("AI suggestions are for the doctor to verify. Nothing reaches the prescription until you add it.", color = Ui.Muted, fontSize = 12.sp)
                 }
             }
         }
@@ -587,12 +587,12 @@ private fun prescriptionText(
 @Composable
 private fun Section(step: String, title: String, content: @Composable () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Palette.Card).padding(16.dp),
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(16.dp)).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(step, color = Palette.Teal, fontFamily = FontFamily.Monospace, modifier = Modifier.width(22.dp))
-            Text(title, color = Palette.Text, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+            Text(step, color = Ui.Teal, fontFamily = FontFamily.Monospace, modifier = Modifier.width(22.dp))
+            Text(title, color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, fontFamily = FontFamily.Serif)
         }
         content()
     }
@@ -600,9 +600,9 @@ private fun Section(step: String, title: String, content: @Composable () -> Unit
 
 @Composable
 private fun AiBox(content: @Composable () -> Unit) {
-    val ai = Color(0xFFA9ACFF)
+    val ai = Ui.Ai
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF1F2147)).padding(12.dp),
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Ui.AiSoft).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text("AI suggestion · verify before acting", color = ai, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
@@ -613,7 +613,7 @@ private fun AiBox(content: @Composable () -> Unit) {
 @Composable
 private fun AiItem(content: @Composable () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Palette.Card).padding(10.dp),
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(10.dp)).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) { content() }
 }
@@ -621,33 +621,33 @@ private fun AiItem(content: @Composable () -> Unit) {
 @Composable
 private fun AiButton(label: String, busy: Boolean, onClick: () -> Unit) {
     if (busy) Row(verticalAlignment = Alignment.CenterVertically) {
-        CircularProgressIndicator(color = Color(0xFFA9ACFF), modifier = Modifier.size(20.dp))
-        Spacer(Modifier.width(10.dp)); Text("Thinking… usually 10–40 seconds", color = Color(0xFFA9ACFF))
+        CircularProgressIndicator(color = Ui.Ai, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(10.dp)); Text("Thinking… usually 10–40 seconds", color = Ui.Ai)
     } else Button(onClick = onClick, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4447A3))) { Text(label, color = Color.White) }
 }
 
 @Composable
-private fun Label(text: String) = Text(text.uppercase(), color = Palette.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp)
+private fun Label(text: String) = Text(text.uppercase(), color = Ui.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp)
 
 @Composable
-private fun Why(text: String) { if (text.isNotBlank()) Text("Why: $text", color = Palette.Muted, fontSize = 13.sp) }
+private fun Why(text: String) { if (text.isNotBlank()) Text("Why: $text", color = Ui.Muted, fontSize = 13.sp) }
 
 @Composable
 private fun Kv(k: String, v: String) {
     if (v.isBlank()) return
-    Row { Text(k, color = Palette.Muted, fontSize = 14.sp, modifier = Modifier.width(130.dp)); Text(v, color = Palette.Text, fontSize = 14.sp) }
+    Row { Text(k, color = Ui.Muted, fontSize = 14.sp, modifier = Modifier.width(130.dp)); Text(v, color = Ui.Text, fontSize = 14.sp) }
 }
 
 @Composable
 private fun RxEditor(r: RxItem, onChange: (RxItem) -> Unit, onDelete: () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Palette.CardHigh).padding(10.dp),
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Ui.CardHigh).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(r.line(), color = Palette.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            if (r.fromAi) Pill("AI", Color(0xFFA9ACFF))
-            IconButton(onClick = onDelete) { Icon(Icons.Filled.Close, "Delete medicine", tint = Palette.Red) }
+            Text(r.line(), color = Ui.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            if (r.fromAi) Pill("AI", Ui.Ai)
+            IconButton(onClick = onDelete) { Icon(Icons.Filled.Close, "Delete medicine", tint = Ui.Red) }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             OutlinedTextField(r.form, { onChange(r.copy(form = it)) }, label = { Text("Form", fontSize = 11.sp) }, singleLine = true, modifier = Modifier.weight(1f))

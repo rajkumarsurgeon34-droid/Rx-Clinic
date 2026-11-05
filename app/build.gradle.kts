@@ -12,8 +12,8 @@ android {
         applicationId = "com.shazverse.rxclinic"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3"
+        versionCode = 4
+        versionName = "0.4"
         // The Rx Clinic server address (Cloudflare Worker). Override with the RX_CLINIC_SERVER_URL repo variable.
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${System.getenv("RX_CLINIC_SERVER_URL")?.takeIf { it.isNotBlank() } ?: "https://rx-clinic.rajkumarsurgeon34.workers.dev"}\"")
     }

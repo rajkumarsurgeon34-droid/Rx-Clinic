@@ -12,6 +12,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.SideEffect
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import com.shazverse.rxclinic.call.CallScreen
@@ -20,6 +22,8 @@ import com.shazverse.rxclinic.call.CallViewModel
 import com.shazverse.rxclinic.call.Palette
 import com.shazverse.rxclinic.call.RxTheme
 import com.shazverse.rxclinic.ui.RxApp
+import com.shazverse.rxclinic.ui.RxLightTheme
+import com.shazverse.rxclinic.ui.Ui
 
 class MainActivity : ComponentActivity() {
 
@@ -43,12 +47,23 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            RxTheme {
-                // Surface sets light text and icon colours for everything on the dark background.
-                Surface(color = Palette.Bg, contentColor = Palette.Text, modifier = Modifier.fillMaxSize()) {
-                    if (vm.state == CallState.Idle) {
+            val inCall = vm.state != CallState.Idle
+            SideEffect {
+                // Dark status-bar icons on the light app; light icons on the dark video call.
+                WindowCompat.getInsetsController(window, window.decorView).apply {
+                    isAppearanceLightStatusBars = !inCall
+                    isAppearanceLightNavigationBars = !inCall
+                }
+            }
+            if (!inCall) {
+                RxLightTheme {
+                    Surface(color = Ui.Bg, contentColor = Ui.Text, modifier = Modifier.fillMaxSize()) {
                         RxApp(vm, withMedia = ::withMedia)
-                    } else {
+                    }
+                }
+            } else {
+                RxTheme {
+                    Surface(color = Palette.Bg, contentColor = Palette.Text, modifier = Modifier.fillMaxSize()) {
                         CallScreen(vm, requestScreenShare = ::requestScreenShare)
                     }
                 }

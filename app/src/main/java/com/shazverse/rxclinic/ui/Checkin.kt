@@ -4,6 +4,7 @@ package com.shazverse.rxclinic.ui
 
 import android.speech.tts.TextToSpeech
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -52,7 +53,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.shazverse.rxclinic.Api
 import com.shazverse.rxclinic.call.CallViewModel
-import com.shazverse.rxclinic.call.Palette
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.Locale
@@ -217,8 +217,8 @@ fun CheckinScreen(vm: CallViewModel, onBack: () -> Unit) {
             }
             when (stage) {
                 "start" -> {
-                    Text(t("welcome"), color = Palette.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Serif)
-                    Text(t("sub"), color = Palette.Muted)
+                    Text(t("welcome"), color = Ui.Text, fontSize = 28.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif, lineHeight = 34.sp)
+                    Text(t("sub"), color = Ui.Muted)
                     OutlinedTextField(name, { name = it.take(60) }, label = { Text(t("name")) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(age, { age = it.filter(Char::isDigit).take(3) }, label = { Text(t("age")) }, singleLine = true,
@@ -231,10 +231,10 @@ fun CheckinScreen(vm: CallViewModel, onBack: () -> Unit) {
                     }
                     Row(verticalAlignment = Alignment.Top, modifier = Modifier.clickable { consent = !consent }) {
                         Checkbox(consent, { consent = it })
-                        Text(t("consent"), color = Palette.Text, modifier = Modifier.padding(top = 12.dp))
+                        Text(t("consent"), color = Ui.Text, modifier = Modifier.padding(top = 12.dp))
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(t("voice"), color = Palette.Text, modifier = Modifier.weight(1f))
+                        Text(t("voice"), color = Ui.Text, modifier = Modifier.weight(1f))
                         Switch(voiceOn, { voiceOn = it })
                     }
                     ErrorText(err)
@@ -247,27 +247,27 @@ fun CheckinScreen(vm: CallViewModel, onBack: () -> Unit) {
                     ) { Text(t("start"), fontSize = 18.sp) }
                 }
                 "chat" -> {
-                    qa.takeLast(2).forEach { (q, a) -> Text("$q — $a", color = Palette.Muted, fontSize = 13.sp) }
+                    qa.takeLast(2).forEach { (q, a) -> Text("$q — $a", color = Ui.Muted, fontSize = 13.sp) }
                     Column(
-                        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Palette.Card).padding(18.dp),
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(18.dp)).padding(18.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
                         val q = current
                         when {
                             busy -> Row(verticalAlignment = Alignment.CenterVertically) {
-                                CircularProgressIndicator(color = Palette.Teal, modifier = Modifier.size(22.dp))
-                                Spacer(Modifier.width(12.dp)); Text(t("thinking"), color = Palette.Muted)
+                                CircularProgressIndicator(color = Ui.Teal, modifier = Modifier.size(22.dp))
+                                Spacer(Modifier.width(12.dp)); Text(t("thinking"), color = Ui.Muted)
                             }
                             err != null && q == null -> {
                                 ErrorText(err)
                                 Button(onClick = { nextQuestion() }) { Text(t("retry")) }
                             }
                             q != null -> {
-                                if (q.urgent) Text(t("urgent"), color = Palette.Red, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                                if (q.urgent) Text(t("urgent"), color = Ui.Red, fontWeight = FontWeight.Bold, fontSize = 17.sp)
                                 Row(verticalAlignment = Alignment.Top) {
-                                    Text(q.text, color = Palette.Text, fontSize = 22.sp, fontFamily = FontFamily.Serif, lineHeight = 30.sp, modifier = Modifier.weight(1f))
+                                    Text(q.text, color = Ui.Text, fontSize = 22.sp, fontFamily = FontFamily.Serif, lineHeight = 30.sp, modifier = Modifier.weight(1f))
                                     IconButton(onClick = { speak(q.text + ". " + q.options.joinToString(", ")) }) {
-                                        Icon(Icons.AutoMirrored.Filled.VolumeUp, "Read aloud", tint = Palette.Teal)
+                                        Icon(Icons.AutoMirrored.Filled.VolumeUp, "Read aloud", tint = Ui.Teal)
                                     }
                                 }
                                 if (q.options.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -287,20 +287,20 @@ fun CheckinScreen(vm: CallViewModel, onBack: () -> Unit) {
                             }
                         }
                     }
-                    if (voiceMissing && lang != "en") Text(t("novoice"), color = Palette.Muted, fontSize = 13.sp)
+                    if (voiceMissing && lang != "en") Text(t("novoice"), color = Ui.Muted, fontSize = 13.sp)
                 }
                 "saving" -> Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 24.dp)) {
-                    CircularProgressIndicator(color = Palette.Teal, modifier = Modifier.size(24.dp))
-                    Spacer(Modifier.width(12.dp)); Text(t("saving"), color = Palette.Text)
+                    CircularProgressIndicator(color = Ui.Teal, modifier = Modifier.size(24.dp))
+                    Spacer(Modifier.width(12.dp)); Text(t("saving"), color = Ui.Text)
                 }
                 "done" -> Column(
-                    Modifier.fillMaxWidth().padding(top = 24.dp).clip(RoundedCornerShape(18.dp)).background(Palette.Card).padding(24.dp),
+                    Modifier.fillMaxWidth().padding(top = 24.dp).clip(RoundedCornerShape(18.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(18.dp)).padding(24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text(t("token"), color = Palette.Muted)
-                    Text("$token", color = Palette.Teal, fontSize = 64.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
-                    Text(closing.ifBlank { t("thanks") }, color = Palette.Text, fontSize = 18.sp, textAlign = TextAlign.Center)
-                    if (urgent) Text(t("urgent"), color = Palette.Red, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+                    Text(t("token"), color = Ui.Muted)
+                    Text("$token", color = Ui.Teal, fontSize = 64.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    Text(closing.ifBlank { t("thanks") }, color = Ui.Text, fontSize = 18.sp, textAlign = TextAlign.Center)
+                    if (urgent) Text(t("urgent"), color = Ui.Red, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
                     Button(onClick = {
                         name = ""; age = ""; sex = ""; phone = ""; consent = false; stage = "start"; token = 0; closing = ""
                         turns.clear(); qa.clear(); current = null; urgent = false
