@@ -38,16 +38,19 @@ Nothing to do: the first deploy creates the D1 database `rxclinic-db` and links 
 GitHub Actions builds `Rx-Clinic.apk` on every push. Download it from **Releases**.
 If your worker address is not `https://rx-clinic.rajkumarsurgeon34.workers.dev`, either add a repository variable `RX_CLINIC_SERVER_URL`, or change it in the app under ⚙️ Settings.
 
-## Default PINs
+## Sign-in PINs (defaults)
 
-| Role | PIN |
-|---|---|
-| Doctor | 1001 |
-| Nursing staff | 2002 |
-| Pharmacy | 3003 |
-| Lab & diagnostics | 4004 |
+| Login | PIN | What it opens |
+|---|---|---|
+| Patient | none | Check-in, booking, video teleconsult (booking code + mobile) |
+| Doctor | 1001 | OPD case sheets with AI, appointments, video |
+| Nursing staff | 2002 | Triage vitals |
+| Pharmacy | 3003 | Dispensing queue, medicine stock |
+| Lab | 4004 | Test orders and reports |
+| Diagnostics | 5005 | USG, CT, MRI, PET-CT, X-ray orders and reports |
+| Admin | 9009 | Overview, every section, change PINs and clinic details |
 
-Change them before real use (the doctor can change PINs through the server's `/api/settings`; a settings screen comes next).
+Only the admin can change PINs (Admin → Sign-in PINs). Change them before real use.
 
 ## Privacy
 

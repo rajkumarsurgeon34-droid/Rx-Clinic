@@ -14,7 +14,7 @@
 //   CLINIC_TZ_MINUTES   optional, clinic time zone offset, default 330 (India)
 
 const enc = new TextEncoder();
-const DEFAULT_PINS = { doctor: "1001", staff: "2002", pharmacy: "3003", lab: "4004" };
+const DEFAULT_PINS = { doctor: "1001", staff: "2002", pharmacy: "3003", lab: "4004", diagnostics: "5005", admin: "9009" };
 const STAFF_ROLES = Object.keys(DEFAULT_PINS);
 const DEFAULT_CLINIC = { name: "Rx Clinic", doctor: "Dr. M. Rajkumar", qual: "MBBS, DNB General Surgery" };
 const SESSIONS = [["09:00", "13:00"], ["17:00", "20:00"]];
@@ -159,7 +159,7 @@ async function makeSession(env, role) {
 
 async function requireStaff(env, session, roles) {
   const [role, exp, sig] = String(session || "").split(".");
-  if (!role || !exp || !sig || !roles.includes(role)) throw new HttpError(401, "Sign in again");
+  if (!role || !exp || !sig || !(roles.includes(role) || role === "admin")) throw new HttpError(401, "Sign in again");
   if (Number(exp) < now()) throw new HttpError(401, "Sign in again: your session expired");
   const expected = b64url(await hmac(secret(env), `session:${role}.${exp}`)).slice(0, 32);
   if (!safeEqual(expected, sig)) throw new HttpError(401, "Sign in again");
@@ -355,6 +355,23 @@ function visitSummary(id, v) {
   return { id, token: v.token, date: v.date, createdAt: v.createdAt, status: v.status, urgent: !!v.urgent, lang: v.lang, patient: v.patient, complaint: cc };
 }
 
+// ---------- orders, pharmacy, nursing ----------
+
+const IMAGING = [
+  ["PET-CT", /\bpet\b|pet[- ]?ct/i], ["MRI", /\bmri\b|\bmrcp\b|magnetic resonance/i], ["CT", /\bct\b|\bcect\b|\bhrct\b|computed tomograph/i],
+  ["USG", /\busg\b|ultrasound|ultrasonograph|sonograph|doppler|\becho\b|\bfast\b/i], ["X-ray", /x[- ]?ray|\bcxr\b|radiograph/i],
+  ["Mammogram", /mammo/i], ["Endoscopy", /endoscop|colonoscop|\bogd\b|\bercp\b/i],
+];
+function classifyTest(name) {
+  for (const [modality, re] of IMAGING) if (re.test(name)) return { kind: "imaging", modality };
+  return { kind: "lab", modality: "Lab" };
+}
+
+async function listDocs(env, coll, where = "", args = []) {
+  const rows = (await (await db(env)).prepare(`SELECT id, data FROM docs WHERE coll = ?${where ? " AND " + where : ""}`).bind(coll, ...args).all()).results || [];
+  return rows.map((r) => Object.assign({ id: r.id }, JSON.parse(r.data)));
+}
+
 // ---------- routes ----------
 
 async function handle(request, env) {
@@ -432,8 +449,9 @@ async function handle(request, env) {
     }
 
     case "/api/settings": {
-      await requireStaff(env, body.session, ["doctor"]);
+      const who = await requireStaff(env, body.session, ["doctor"]);
       if (body.pins && typeof body.pins === "object") {
+        if (who !== "admin") throw new HttpError(403, "Only the admin can change PINs");
         const pins = Object.assign({}, DEFAULT_PINS, await getSetting(env, "pins", {}));
         for (const r of STAFF_ROLES) if (/^\d{4,8}$/.test(String(body.pins[r] || ""))) pins[r] = String(body.pins[r]);
         await setSetting(env, "pins", pins);
@@ -443,7 +461,9 @@ async function handle(request, env) {
         for (const k of ["name", "doctor", "qual", "reg", "address", "phone", "hours"]) if (k in body.clinic) c[k] = clean(body.clinic[k], 200);
         await setSetting(env, "clinic", c);
       }
-      return json({ ok: true, clinic: Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {})) });
+      const out = { ok: true, clinic: Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {})) };
+      if (who === "admin") out.pins = Object.assign({}, DEFAULT_PINS, await getSetting(env, "pins", {}));
+      return json(out);
     }
 
     case "/api/doctor/appointments": {
@@ -579,6 +599,149 @@ async function handle(request, env) {
       if (JSON.stringify(v).length > 900000) throw new HttpError(413, "This case sheet is too large to save");
       await putDoc(env, "visits", id, v);
       return json({ ok: true, status: v.status });
+    }
+
+    // ----- investigation orders: lab and diagnostics -----
+    case "/api/orders/create": {
+      await requireStaff(env, body.session, ["doctor"]);
+      const visitId = String(body.visitId || "");
+      const v = await getDoc(env, "visits", visitId);
+      if (!v) throw new HttpError(404, "Visit not found");
+      const existing = await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [visitId]);
+      const have = new Set(existing.map((o) => o.test.toLowerCase()));
+      const { date } = clinicNow(env);
+      const made = [];
+      for (const t of (Array.isArray(body.tests) ? body.tests : []).slice(0, 30)) {
+        const test = clean(t, 120);
+        if (!test || have.has(test.toLowerCase())) continue;
+        const c = classifyTest(test);
+        const o = { visitId, patient: { name: v.patient?.name || "", age: v.patient?.age || "", sex: v.patient?.sex || "" }, token: v.token,
+          test, kind: c.kind, modality: c.modality, status: "ordered", date, orderedAt: Date.now(), result: "", impression: "" };
+        const id = crypto.randomUUID();
+        await putDoc(env, "orders", id, o);
+        have.add(test.toLowerCase()); made.push(Object.assign({ id }, o));
+      }
+      return json({ created: made.length, orders: made });
+    }
+
+    case "/api/orders/list": {
+      const role = await requireStaff(env, body.session, ["doctor", "lab", "diagnostics"]);
+      let list;
+      if (body.visitId) list = await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [String(body.visitId)]);
+      else {
+        const kind = role === "lab" ? "lab" : role === "diagnostics" ? "imaging" : (body.kind === "imaging" ? "imaging" : "lab");
+        const since = addDays(clinicNow(env).date, -7);
+        list = await listDocs(env, "orders", "json_extract(data, '$.kind') = ? AND json_extract(data, '$.date') >= ?", [kind, since]);
+        list = list.filter((o) => o.status !== "reported" || o.date === clinicNow(env).date);
+      }
+      list.sort((a, b) => (a.orderedAt || 0) - (b.orderedAt || 0));
+      return json({ orders: list });
+    }
+
+    case "/api/orders/update": {
+      await requireStaff(env, body.session, ["lab", "diagnostics"]);
+      const id = String(body.id || "");
+      const o = await getDoc(env, "orders", id);
+      if (!o) throw new HttpError(404, "Order not found");
+      const st = String(body.status || "");
+      if (!["ordered", "collected", "scheduled", "reported"].includes(st)) throw new HttpError(400, "Invalid status");
+      o.status = st;
+      if (st === "collected" || st === "scheduled") o[st + "At"] = Date.now();
+      if (st === "reported") {
+        o.result = clean(body.result, 6000);
+        o.impression = clean(body.impression, 2000);
+        if (!o.result && !o.impression) throw new HttpError(400, "Enter the report first");
+        o.reportedAt = Date.now();
+      }
+      await putDoc(env, "orders", id, o);
+      return json({ ok: true });
+    }
+
+    // ----- pharmacy -----
+    case "/api/pharmacy/stock": {
+      await requireStaff(env, body.session, ["pharmacy", "doctor"]);
+      const list = (await listDocs(env, "stock")).sort((a, b) => a.generic.localeCompare(b.generic));
+      return json({ stock: list });
+    }
+
+    case "/api/pharmacy/stock/save": {
+      await requireStaff(env, body.session, ["pharmacy"]);
+      const items = Array.isArray(body.items) ? body.items.slice(0, 500) : [body.item || {}];
+      let n = 0;
+      for (const it of items) {
+        const generic = clean(it.generic, 120);
+        if (!generic) continue;
+        const id = typeof it.id === "string" && ID_RE.test(it.id) ? it.id : crypto.randomUUID();
+        await putDoc(env, "stock", id, { generic, brand: clean(it.brand, 80), form: clean(it.form, 20) || "Tab", strength: clean(it.strength, 40), stock: Math.max(0, Math.floor(Number(it.stock) || 0)) });
+        n++;
+      }
+      return json({ saved: n });
+    }
+
+    case "/api/pharmacy/stock/delete": {
+      await requireStaff(env, body.session, ["pharmacy"]);
+      await D.prepare("DELETE FROM docs WHERE coll = 'stock' AND id = ?").bind(String(body.id || "")).run();
+      return json({ ok: true });
+    }
+
+    case "/api/pharmacy/queue": {
+      await requireStaff(env, body.session, ["pharmacy"]);
+      const since = addDays(clinicNow(env).date, -2);
+      const list = (await listDocs(env, "visits", "json_extract(data, '$.status') IN ('sent', 'dispensed') AND json_extract(data, '$.date') >= ?", [since]))
+        .map((v) => ({ id: v.id, token: v.token, date: v.date, status: v.status, patient: v.patient, rx: v.rx, dispensedAt: v.dispensedAt || null }))
+        .sort((a, b) => (a.status === b.status ? (b.rx?.sentAt || 0) - (a.rx?.sentAt || 0) : a.status === "sent" ? -1 : 1));
+      return json({ queue: list });
+    }
+
+    case "/api/pharmacy/dispense": {
+      await requireStaff(env, body.session, ["pharmacy"]);
+      const id = String(body.id || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Prescription not found");
+      v.status = "dispensed"; v.dispensedAt = Date.now();
+      await putDoc(env, "visits", id, v);
+      return json({ ok: true });
+    }
+
+    // ----- nursing: OPD triage vitals -----
+    case "/api/nurse/queue": {
+      await requireStaff(env, body.session, ["staff"]);
+      const { date } = clinicNow(env);
+      const list = (await listDocs(env, "visits", "json_extract(data, '$.date') = ?", [date]))
+        .map((v) => Object.assign(visitSummary(v.id, v), { triage: v.triage || null }))
+        .sort((a, b) => (a.token || 0) - (b.token || 0));
+      return json({ visits: list });
+    }
+
+    case "/api/nurse/vitals": {
+      await requireStaff(env, body.session, ["staff"]);
+      const id = String(body.id || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Patient not found");
+      const vit = {};
+      for (const k of ["bp", "pulse", "temp", "spo2", "rr", "rbs", "weight", "height"]) vit[k] = clean(body.vitals?.[k], 12);
+      v.triage = { vitals: vit, note: clean(body.note, 500), at: Date.now() };
+      await putDoc(env, "visits", id, v);
+      return json({ ok: true });
+    }
+
+    // ----- admin -----
+    case "/api/admin/overview": {
+      await requireStaff(env, body.session, ["admin"]);
+      const { date } = clinicNow(env);
+      const visits = await listDocs(env, "visits", "json_extract(data, '$.date') = ?", [date]);
+      const orders = await listDocs(env, "orders", "json_extract(data, '$.date') = ?", [date]);
+      const appts = (await D.prepare("SELECT mode, status FROM appointments WHERE date = ?").bind(date).all()).results || [];
+      const stock = await listDocs(env, "stock");
+      const count = (arr, f) => arr.filter(f).length;
+      return json({
+        date,
+        opd: { checkedIn: visits.length, waiting: count(visits, (v) => v.status === "waiting"), prescribed: count(visits, (v) => v.status === "sent" || v.status === "dispensed"), urgent: count(visits, (v) => v.urgent) },
+        appointments: { total: count(appts, (a) => a.status !== "cancelled"), tele: count(appts, (a) => a.mode === "tele" && a.status !== "cancelled") },
+        lab: { pending: count(orders, (o) => o.kind === "lab" && o.status !== "reported"), reported: count(orders, (o) => o.kind === "lab" && o.status === "reported") },
+        diagnostics: { pending: count(orders, (o) => o.kind === "imaging" && o.status !== "reported"), reported: count(orders, (o) => o.kind === "imaging" && o.status === "reported") },
+        pharmacy: { toDispense: count(visits, (v) => v.status === "sent"), dispensed: count(visits, (v) => v.status === "dispensed"), outOfStock: count(stock, (x) => !x.stock) },
+      });
     }
 
     // ----- AI (OpenAI), for the doctor's tools -----

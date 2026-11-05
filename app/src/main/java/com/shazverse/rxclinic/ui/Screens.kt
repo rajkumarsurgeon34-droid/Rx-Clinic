@@ -34,7 +34,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Assignment
+import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.EventAvailable
@@ -94,26 +96,34 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private enum class Screen { Home, PatientHome, Book, MyAppointments, DoctorLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin }
+private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin }
+
+private fun roleScreen(role: String) = when (role) {
+    "doctor" -> Screen.DoctorHome; "staff" -> Screen.Nurse; "pharmacy" -> Screen.Pharmacy
+    "lab" -> Screen.Lab; "diagnostics" -> Screen.Diagnostics; else -> Screen.Admin
+}
 
 /** Everything outside the video call. */
 @Composable
 fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     var screen by rememberSaveable { mutableStateOf(Screen.Home) }
     var showSettings by remember { mutableStateOf(false) }
-    var comingSoon by remember { mutableStateOf<String?>(null) }
     var caseId by rememberSaveable { mutableStateOf("") }
+    var loginRole by rememberSaveable { mutableStateOf("doctor") }
     val prefs = vm.prefs
+
+    fun open(role: String) {
+        val has = if (role == "admin") prefs.session("admin") != null else prefs.sessionFor(role) != null
+        if (has) screen = roleScreen(role) else { loginRole = role; screen = Screen.StaffLogin }
+    }
+    // Admin returns to the admin page; everyone else to the home screen.
+    val back: () -> Unit = { screen = if (prefs.session("admin") != null) Screen.Admin else Screen.Home }
+    fun signedOut(role: String): () -> Unit = { loginRole = role; screen = Screen.StaffLogin }
 
     CompositionLocalProvider(LocalContentColor provides Ui.Text) {
     Box(Modifier.fillMaxSize().background(Ui.Bg).statusBarsPadding().navigationBarsPadding()) {
         when (screen) {
-            Screen.Home -> HomeScreen(
-                onPatient = { screen = Screen.PatientHome },
-                onDoctor = { screen = if (prefs.session("doctor") != null) Screen.DoctorHome else Screen.DoctorLogin },
-                onOther = { comingSoon = it },
-                onSettings = { showSettings = true },
-            )
+            Screen.Home -> HomeScreen(onPatient = { screen = Screen.PatientHome }, onRole = { open(it) }, onSettings = { showSettings = true })
             Screen.PatientHome -> PatientHome(
                 onBack = { screen = Screen.Home },
                 onCheckin = { screen = Screen.Checkin },
@@ -122,25 +132,22 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             )
             Screen.Book -> BookScreen(vm, onBack = { screen = Screen.PatientHome }, onDone = { screen = Screen.MyAppointments })
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
-            Screen.DoctorLogin -> DoctorLogin(vm, onBack = { screen = Screen.Home }, onIn = { screen = Screen.DoctorHome })
-            Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = { screen = Screen.DoctorLogin })
-            Screen.DoctorHome -> DoctorHome(vm, onBack = { screen = Screen.Home }, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onSignedOut = { screen = Screen.DoctorLogin })
-            Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = { screen = Screen.DoctorLogin })
+            Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { screen = roleScreen(loginRole) })
+            Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = signedOut("doctor"))
+            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onSignedOut = signedOut("doctor"))
+            Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = signedOut("doctor"))
             Screen.Case -> CaseScreen(vm, caseId, onBack = { screen = Screen.OpdQueue })
             Screen.Checkin -> CheckinScreen(vm, onBack = { screen = Screen.PatientHome })
+            Screen.Nurse -> NurseScreen(vm, onBack = back, onSignedOut = signedOut("staff"))
+            Screen.Pharmacy -> PharmacyScreen(vm, onBack = back, onSignedOut = signedOut("pharmacy"))
+            Screen.Lab -> OrdersScreen(vm, "lab", onBack = back, onSignedOut = signedOut("lab"))
+            Screen.Diagnostics -> OrdersScreen(vm, "diagnostics", onBack = back, onSignedOut = signedOut("diagnostics"))
+            Screen.Admin -> AdminScreen(vm, onBack = { screen = Screen.Home }, onOpen = { open(it) }, onSignedOut = signedOut("admin"))
         }
     }
     }
 
     if (showSettings) SettingsDialog(vm, onDismiss = { showSettings = false })
-    comingSoon?.let { who ->
-        AlertDialog(
-            onDismissRequest = { comingSoon = null },
-            title = { Text(who) },
-            text = { Text("The $who section moves into the app in the next update: same screens as the Rx Clinic preview, with its own PIN.") },
-            confirmButton = { TextButton(onClick = { comingSoon = null }) { Text("OK") } },
-        )
-    }
 }
 
 // ---------------- Shared pieces ----------------
@@ -212,7 +219,7 @@ fun time12(t: String): String = runCatching {
 // ---------------- Home ----------------
 
 @Composable
-private fun HomeScreen(onPatient: () -> Unit, onDoctor: () -> Unit, onOther: (String) -> Unit, onSettings: () -> Unit) {
+private fun HomeScreen(onPatient: () -> Unit, onRole: (String) -> Unit, onSettings: () -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("℞", color = Ui.Red, fontSize = 34.sp, fontFamily = FontFamily.Serif)
@@ -221,11 +228,13 @@ private fun HomeScreen(onPatient: () -> Unit, onDoctor: () -> Unit, onOther: (St
             IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings", tint = Ui.Text) }
         }
         Text("Who is using the app?", color = Ui.Muted, modifier = Modifier.padding(bottom = 16.dp))
-        RoleCard("Patient", "Book an appointment, join your video teleconsult", Icons.Filled.Person, onPatient)
-        RoleCard("Doctor", "Appointments and video teleconsults", Icons.Filled.MedicalServices, onDoctor)
-        RoleCard("Nursing staff", "Ward vitals, medicines given, nursing notes", Icons.Filled.LocalHospital) { onOther("Nursing staff") }
-        RoleCard("Pharmacy", "Prescriptions to dispense, stock", Icons.Filled.LocalPharmacy) { onOther("Pharmacy") }
-        RoleCard("Lab & diagnostics", "Orders, samples, reports", Icons.Filled.Biotech) { onOther("Lab & diagnostics") }
+        RoleCard("Patient", "Check in, book an appointment, video teleconsult", Icons.Filled.Person, onPatient)
+        RoleCard("Doctor", "OPD case sheets with AI, appointments, video", Icons.Filled.MedicalServices) { onRole("doctor") }
+        RoleCard("Nursing staff", "Triage vitals for today's OPD", Icons.Filled.LocalHospital) { onRole("staff") }
+        RoleCard("Pharmacy", "Prescriptions to dispense, medicine stock", Icons.Filled.LocalPharmacy) { onRole("pharmacy") }
+        RoleCard("Lab", "Test orders, samples, reports", Icons.Filled.Biotech) { onRole("lab") }
+        RoleCard("Diagnostics", "USG, CT scan, MRI scan, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onRole("diagnostics") }
+        RoleCard("Admin", "Overview, PINs, clinic details, every section", Icons.Filled.AdminPanelSettings) { onRole("admin") }
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -488,42 +497,8 @@ private fun MyAppointments(vm: CallViewModel, withMedia: (() -> Unit) -> Unit, o
 // ---------------- Doctor ----------------
 
 @Composable
-private fun DoctorLogin(vm: CallViewModel, onBack: () -> Unit, onIn: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    var pin by remember { mutableStateOf("") }
-    var err by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().imePadding()) {
-        TopBar("Doctor sign-in", onBack)
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Enter the doctor PIN.", color = Ui.Muted)
-            OutlinedTextField(
-                pin, { pin = it.filter(Char::isDigit).take(8) }, label = { Text("PIN") }, singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword), modifier = Modifier.fillMaxWidth(),
-            )
-            ErrorText(err)
-            Button(
-                onClick = {
-                    busy = true; err = null
-                    scope.launch {
-                        try {
-                            val s = Api(vm.prefs.serverUrl).login("doctor", pin)
-                            vm.prefs.saveSession("doctor", s.token)
-                            vm.prefs.doctorName = s.doctorName
-                            onIn()
-                        } catch (e: Exception) { err = e.message } finally { busy = false }
-                    }
-                },
-                enabled = pin.isNotBlank() && !busy, modifier = Modifier.fillMaxWidth().height(50.dp),
-            ) { Text(if (busy) "Signing in…" else "Sign in") }
-        }
-    }
-}
-
-@Composable
 private fun DoctorDay(vm: CallViewModel, withMedia: (() -> Unit) -> Unit, onBack: () -> Unit, onSignedOut: () -> Unit) {
-    val session = vm.prefs.session("doctor") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
+    val session = vm.prefs.sessionFor("doctor") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
     var date by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }

@@ -25,6 +25,9 @@ class Prefs(context: Context) {
 
     /** Signed-in staff session, per role. */
     fun session(role: String): String? = sp.getString("session_$role", null)
+
+    /** The role's own sign-in, or the admin's (admin can open every section). */
+    fun sessionFor(role: String): String? = session(role) ?: session("admin")
     fun saveSession(role: String, token: String?) =
         sp.edit().apply { if (token == null) remove("session_$role") else putString("session_$role", token) }.apply()
 

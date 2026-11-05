@@ -129,6 +129,9 @@ class Api(private val baseUrl: String) {
         return o.optJSONObject("json") ?: throw ApiException("The AI reply was empty. Try again.")
     }
 
+    /** Any POST endpoint of the Rx Clinic server. */
+    suspend fun call(path: String, body: JSONObject): JSONObject = post(path, body)
+
     private fun joined(o: JSONObject) = Joined(
         o.getString("url"), o.getString("token"), o.getString("identity"), o.getString("role"),
         o.getString("room"), o.optString("title"),

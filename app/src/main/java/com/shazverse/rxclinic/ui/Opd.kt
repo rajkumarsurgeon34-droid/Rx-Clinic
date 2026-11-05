@@ -3,6 +3,7 @@
 package com.shazverse.rxclinic.ui
 
 import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -72,6 +73,10 @@ import java.time.LocalDate
 
 // ---------- JSON helpers ----------
 
+internal fun orderStatusLabel(s: String) = when (s) {
+    "ordered" -> "Ordered"; "collected" -> "Sample collected"; "scheduled" -> "Scan scheduled"; "reported" -> "Reported"; else -> s
+}
+
 internal fun JSONObject?.str(k: String): String {
     val v = this?.opt(k) ?: return ""
     return if (v == JSONObject.NULL) "" else v.toString()
@@ -135,7 +140,7 @@ fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppoi
 
 @Composable
 fun OpdQueue(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit, onSignedOut: () -> Unit) {
-    val session = vm.prefs.session("doctor") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
+    val session = vm.prefs.sessionFor("doctor") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     var date by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
     var refresh by remember { mutableIntStateOf(0) }
@@ -191,7 +196,7 @@ fun OpdQueue(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit, on
 
 @Composable
 fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
-    val session = vm.prefs.session("doctor") ?: run { LaunchedEffect(Unit) { onBack() }; return }
+    val session = vm.prefs.sessionFor("doctor") ?: run { LaunchedEffect(Unit) { onBack() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -220,6 +225,10 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
     var saveMsg by remember { mutableStateOf<String?>(null) }
     var newDrug by remember { mutableStateOf("") }
     var newAdvice by remember { mutableStateOf("") }
+    val orders = remember { mutableStateListOf<JSONObject>() }
+    var ordersTick by remember { mutableIntStateOf(0) }
+    val stockNames = remember { mutableStateListOf<String>() }
+    var stockText by remember { mutableStateOf("") }
 
     LaunchedEffect(visitId) {
         try {
@@ -239,7 +248,28 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                 surgery = w.str("surgeryPlan"); physio = w.str("physio"); psych = w.str("psych")
                 review = w.str("review"); reviewNote = w.str("reviewNote")
             }
+            // Vitals recorded by the nurse at triage fill any empty boxes
+            v.obj("triage")?.obj("vitals")?.let { tv -> tv.keys().forEach { k -> if (vitals[k].isNullOrBlank() && tv.str(k).isNotBlank()) vitals[k] = tv.str(k) } }
         } catch (e: Exception) { loadErr = e.message }
+        runCatching {
+            val st = api.call("/api/pharmacy/stock", JSONObject().put("session", session)).objs("stock")
+            stockNames.clear(); stockNames.addAll(st.filter { it.optInt("stock") > 0 }.map { it.str("generic") })
+            stockText = st.joinToString("\n") { "${it.str("generic")} ${it.str("strength")} (${it.str("form")}) | stock ${it.optInt("stock")}" }
+        }
+    }
+
+    LaunchedEffect(visitId, ordersTick) {
+        runCatching {
+            val o = api.call("/api/orders/list", JSONObject().put("session", session).put("visitId", visitId)).objs("orders")
+            orders.clear(); orders.addAll(o)
+        }
+    }
+
+    fun inStock(name: String): Boolean? {
+        if (stockNames.isEmpty()) return null
+        val n = name.lowercase().trim()
+        if (n.length < 4) return null
+        return stockNames.any { val g = it.lowercase(); g.length >= 4 && (n.contains(g) || g.contains(n)) }
     }
 
     fun workJson(): JSONObject {
@@ -252,7 +282,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
             .put("surgeryPlan", surgery).put("physio", physio).put("psych", psych).put("review", review).put("reviewNote", reviewNote)
     }
 
-    fun save(newStatus: String? = null, withRx: Boolean = false) = scope.launch {
+    fun save(newStatus: String? = null, withRx: Boolean = false, quiet: Boolean = false) = scope.launch {
         saveMsg = null
         try {
             val patch = JSONObject().put("work", workJson())
@@ -265,14 +295,18 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                 .put("sentAt", System.currentTimeMillis()).put("doctor", vm.prefs.doctorName))
             api.saveVisit(session, visitId, patch)
             if (st != null) status = st
-            saveMsg = if (withRx) "Prescription saved." else "Saved."
-        } catch (e: Exception) { saveMsg = e.message ?: "Couldn't save" }
+            saveMsg = if (withRx) "Prescription saved and sent to the pharmacy." else "Saved."
+            if (!quiet) Toast.makeText(context, saveMsg, Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            saveMsg = e.message ?: "Couldn't save"
+            Toast.makeText(context, "Not saved: $saveMsg", Toast.LENGTH_LONG).show()
+        }
     }
 
     fun runAi(key: String, prompt: () -> String, apply: (JSONObject) -> Unit) {
         busy[key] = true; errs.remove(key)
         scope.launch {
-            try { apply(api.aiJson(session, prompt())); save() }
+            try { apply(api.aiJson(session, prompt())); save(quiet = true) }
             catch (e: Exception) { errs[key] = e.message ?: "The AI could not answer. Try again." }
             finally { busy[key] = false }
         }
@@ -427,7 +461,45 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
             // 4. Results
             item {
                 Section("4", "Investigation results") {
+                    val sent = orders.map { it.str("test").lowercase() }.toSet()
+                    val unsent = ordered.filter { it.lowercase() !in sent }
                     if (ordered.isNotEmpty()) Text("Ordered: " + ordered.joinToString(", "), color = Ui.Muted, fontSize = 13.sp)
+                    var sending by remember { mutableStateOf(false) }
+                    if (unsent.isNotEmpty()) Button(
+                        enabled = !sending,
+                        onClick = {
+                            sending = true
+                            scope.launch {
+                                try {
+                                    val r = api.call("/api/orders/create", JSONObject().put("session", session).put("visitId", visitId).put("tests", JSONArray(unsent)))
+                                    Toast.makeText(context, "Sent ${r.optInt("created")} test(s) to the lab and diagnostics", Toast.LENGTH_SHORT).show()
+                                    ordersTick++
+                                } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't send", Toast.LENGTH_LONG).show() }
+                                sending = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(if (sending) "Sending…" else "Send ${unsent.size} test(s) to lab & diagnostics") }
+                    if (orders.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
+                        Label("Orders and reports"); Spacer(Modifier.weight(1f))
+                        TextButton(onClick = { ordersTick++ }) { Text("Refresh") }
+                    }
+                    orders.forEach { o ->
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ui.CardHigh).padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("${o.str("test")}  ·  ${o.str("modality")}", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                Pill(orderStatusLabel(o.str("status")), if (o.str("status") == "reported") Ui.Green else Ui.Amber)
+                            }
+                            if (o.str("status") == "reported") {
+                                if (o.str("result").isNotBlank()) Text(o.str("result"), color = Ui.Text, fontSize = 13.sp)
+                                if (o.str("impression").isNotBlank()) Text("Impression: " + o.str("impression"), color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                TextButton(onClick = {
+                                    val line = "${o.str("test")}: ${o.str("result")}${if (o.str("impression").isNotBlank()) " Impression: " + o.str("impression") else ""}"
+                                    resultsText = if (resultsText.isBlank()) line else resultsText.trimEnd() + "\n" + line
+                                }) { Text("Copy into results") }
+                            }
+                        }
+                    }
                     OutlinedTextField(resultsText, { resultsText = it }, label = { Text("Type the results (e.g. Hb 12.1, TC 14,800, USG: …)") }, minLines = 3, modifier = Modifier.fillMaxWidth())
                     AiButton("Analyse results", busy["analyse"] == true) {
                         if (resultsText.isBlank()) { errs["analyse"] = "Type the results first." }
@@ -461,7 +533,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                 Section("5", "Treatment suggestions") {
                     AiButton(if (treatment == null) "Suggest treatment" else "Suggest again", busy["treat"] == true) {
                         runAi("treat", {
-                            "You are a clinical decision-support assistant for a qualified doctor in an Indian OPD (general surgery and general medicine). Suggest management for the doctor to review, edit or reject.\n${caseText(true)}\nInstructions:\n- Decide whether management is medical, surgical, or both. For surgery give the procedure, indication, urgency and pre-op work-up.\n- Prescribe by generic name with adult doses used in India (adjust for age, weight, kidney or liver disease and pregnancy). Check allergies and current drugs; list interactions or contraindications under cautions.\n- Frequency in Indian notation (1-0-1 = morning-afternoon-night). timing is one of: After food, Before food, With food, Empty stomach, At bedtime, As needed.\n- Advice must fit THIS patient's history (e.g. stop smoking only if they smoke; diet matching the diagnosis). Include warning signs to return early.\n- Suggest physiotherapy or a psychologist only when there is a reason. Give a review interval in days.\nReply with ONLY this JSON: {\"approach\":\"medical|surgical|both\",\"surgical\":{\"recommended\":false,\"procedure\":\"\",\"indication\":\"\",\"urgency\":\"emergency|urgent|elective\",\"preop\":[\"\"],\"justification\":\"\"},\"medicines\":[{\"generic\":\"\",\"form\":\"Tab\",\"strength\":\"\",\"dose\":\"1 tab\",\"frequency\":\"1-0-1\",\"timing\":\"After food\",\"duration\":\"5 days\",\"instructions\":\"\",\"reason\":\"\"}],\"cautions\":[\"\"],\"advice\":[{\"text\":\"\",\"why\":\"\"}],\"physio\":{\"needed\":false,\"reason\":\"\"},\"psych\":{\"needed\":false,\"reason\":\"\"},\"reviewInDays\":7,\"reviewReason\":\"\"}"
+                            "You are a clinical decision-support assistant for a qualified doctor in an Indian OPD (general surgery and general medicine). Suggest management for the doctor to review, edit or reject.\n${caseText(true)}\nInstructions:\n- Decide whether management is medical, surgical, or both. For surgery give the procedure, indication, urgency and pre-op work-up.\n- Prescribe by generic name with adult doses used in India (adjust for age, weight, kidney or liver disease and pregnancy). Check allergies and current drugs; list interactions or contraindications under cautions.\n- Frequency in Indian notation (1-0-1 = morning-afternoon-night). timing is one of: After food, Before food, With food, Empty stomach, At bedtime, As needed.\n- Advice must fit THIS patient's history (e.g. stop smoking only if they smoke; diet matching the diagnosis). Include warning signs to return early.\n- Suggest physiotherapy or a psychologist only when there is a reason. Give a review interval in days.\n- Prefer medicines in the clinic pharmacy stock below when clinically appropriate; you may suggest others when better.\nClinic pharmacy stock (generic strength (form) | units):\n${stockText.ifBlank { "(not available)" }}\nReply with ONLY this JSON: {\"approach\":\"medical|surgical|both\",\"surgical\":{\"recommended\":false,\"procedure\":\"\",\"indication\":\"\",\"urgency\":\"emergency|urgent|elective\",\"preop\":[\"\"],\"justification\":\"\"},\"medicines\":[{\"generic\":\"\",\"form\":\"Tab\",\"strength\":\"\",\"dose\":\"1 tab\",\"frequency\":\"1-0-1\",\"timing\":\"After food\",\"duration\":\"5 days\",\"instructions\":\"\",\"reason\":\"\"}],\"cautions\":[\"\"],\"advice\":[{\"text\":\"\",\"why\":\"\"}],\"physio\":{\"needed\":false,\"reason\":\"\"},\"psych\":{\"needed\":false,\"reason\":\"\"},\"reviewInDays\":7,\"reviewReason\":\"\"}"
                         }) { r -> treatment = r; if (finalDx.isBlank() && provisional.isBlank()) finalDx = analysis.str("diagnosis") }
                     }
                     ErrorText(errs["treat"])
@@ -525,7 +597,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                         Text("Surgical plan: $surgery", color = Ui.Teal, modifier = Modifier.weight(1f)); IconButton(onClick = { surgery = "" }) { Icon(Icons.Filled.Close, "Remove", tint = Ui.Red) }
                     }
                     if (rx.isEmpty()) Text("No medicines yet. Add from the suggestions above or type a name below.", color = Ui.Muted)
-                    rx.forEachIndexed { i, r -> RxEditor(r, onChange = { rx[i] = it }, onDelete = { rx.removeAt(i) }) }
+                    rx.forEachIndexed { i, r -> RxEditor(r, inStock(r.generic), onChange = { rx[i] = it }, onDelete = { rx.removeAt(i) }) }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(newDrug, { newDrug = it }, label = { Text("Add a medicine (generic name)") }, singleLine = true, modifier = Modifier.weight(1f))
                         TextButton(onClick = { if (newDrug.isNotBlank()) { rx.add(RxItem(newDrug.trim())); newDrug = "" } }) { Text("Add") }
@@ -551,6 +623,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                         OutlinedTextField(reviewNote, { reviewNote = it }, label = { Text("Review note") }, singleLine = true, modifier = Modifier.weight(1.4f))
                     }
                     Button(onClick = { save("sent", withRx = true) }, modifier = Modifier.fillMaxWidth()) { Text("Finish and save prescription") }
+                    saveMsg?.let { Text(it, color = if (it.startsWith("Prescription") || it == "Saved.") Ui.Green else Ui.Red, fontWeight = FontWeight.SemiBold) }
                     OutlinedButton(onClick = {
                         val text = prescriptionText(vm.prefs.doctorName, p.str("name"), p.str("age"), p.str("sex"), finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote)
                         context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share prescription"))
@@ -639,14 +712,15 @@ private fun Kv(k: String, v: String) {
 }
 
 @Composable
-private fun RxEditor(r: RxItem, onChange: (RxItem) -> Unit, onDelete: () -> Unit) {
+private fun RxEditor(r: RxItem, inStock: Boolean?, onChange: (RxItem) -> Unit, onDelete: () -> Unit) {
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Ui.CardHigh).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(r.line(), color = Ui.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            if (r.fromAi) Pill("AI", Ui.Ai)
+            if (inStock == true) Pill("In pharmacy", Ui.Green) else if (inStock == false) Pill("Not in pharmacy", Ui.Amber)
+            if (r.fromAi) { Spacer(Modifier.width(4.dp)); Pill("AI", Ui.Ai) }
             IconButton(onClick = onDelete) { Icon(Icons.Filled.Close, "Delete medicine", tint = Ui.Red) }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
