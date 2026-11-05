@@ -87,6 +87,48 @@ class Api(private val baseUrl: String) {
         post("/api/meet/$action", body)
     }
 
+    // ----- patient check-in (AI history taking) -----
+
+    /** Next interview question. [turns] alternate assistant (the question JSON) and user (the answer). */
+    suspend fun checkinNext(lang: String, age: String, sex: String, turns: List<Pair<String, String>>): JSONObject {
+        val arr = JSONArray()
+        turns.forEach { (role, content) -> arr.put(JSONObject().put("role", role).put("content", content)) }
+        return post("/api/checkin/next", JSONObject().put("lang", lang).put("age", age).put("sex", sex).put("turns", arr))
+    }
+
+    /** Saves the check-in; the server builds the English case sheet. Returns the token number. */
+    suspend fun checkinFinish(
+        name: String, age: String, sex: String, phone: String, lang: String,
+        qa: List<Pair<String, String>>, urgent: Boolean,
+    ): Int {
+        val arr = JSONArray()
+        qa.forEach { (q, a) -> arr.put(JSONObject().put("q", q).put("a", a)) }
+        val o = post("/api/checkin/finish", JSONObject()
+            .put("patient", JSONObject().put("name", name).put("age", age).put("sex", sex).put("phone", phone))
+            .put("lang", lang).put("qa", arr).put("urgent", urgent))
+        return o.optInt("token")
+    }
+
+    // ----- doctor: OPD -----
+
+    suspend fun visits(session: String, date: String): List<JSONObject> {
+        val arr = post("/api/doctor/visits", JSONObject().put("session", session).put("date", date)).optJSONArray("visits") ?: JSONArray()
+        return (0 until arr.length()).map { arr.getJSONObject(it) }
+    }
+
+    suspend fun visit(session: String, id: String): JSONObject =
+        post("/api/doctor/visit", JSONObject().put("session", session).put("id", id)).getJSONObject("visit")
+
+    suspend fun saveVisit(session: String, id: String, patch: JSONObject) {
+        post("/api/doctor/visit/save", JSONObject().put("session", session).put("id", id).put("patch", patch))
+    }
+
+    /** Asks the AI (OpenAI, through the server) for a JSON answer. */
+    suspend fun aiJson(session: String, prompt: String): JSONObject {
+        val o = post("/api/ai", JSONObject().put("session", session).put("prompt", prompt).put("json", true))
+        return o.optJSONObject("json") ?: throw ApiException("The AI reply was empty. Try again.")
+    }
+
     private fun joined(o: JSONObject) = Joined(
         o.getString("url"), o.getString("token"), o.getString("identity"), o.getString("role"),
         o.getString("room"), o.optString("title"),
@@ -105,7 +147,7 @@ class Api(private val baseUrl: String) {
         try {
             conn.requestMethod = method
             conn.connectTimeout = 15_000
-            conn.readTimeout = 30_000
+            conn.readTimeout = 90_000
             if (body != null) {
                 conn.doOutput = true
                 conn.setRequestProperty("Content-Type", "application/json")

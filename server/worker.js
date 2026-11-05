@@ -219,17 +219,20 @@ async function ensureRoom(env, appt) {
 
 // ---------- OpenAI ----------
 
-async function askOpenAI(env, prompt, wantJson) {
+const DOCTOR_SYSTEM = "You assist qualified doctors in an Indian hospital. The doctor makes every decision. Be accurate and concise.";
+
+async function askOpenAI(env, prompt, wantJson, system = DOCTOR_SYSTEM) {
+  return chatOpenAI(env, [{ role: "system", content: system }, { role: "user", content: prompt }], wantJson);
+}
+
+async function chatOpenAI(env, messages, wantJson) {
   if (!env.OPENAI_API_KEY) throw new HttpError(503, "AI is not set up yet: add OPENAI_API_KEY in the worker settings");
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: env.OPENAI_MODEL || "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "You assist qualified doctors in an Indian hospital. The doctor makes every decision. Be accurate and concise." },
-        { role: "user", content: prompt },
-      ],
+      messages,
       ...(wantJson ? { response_format: { type: "json_object" } } : {}),
     }),
   });
@@ -238,6 +241,50 @@ async function askOpenAI(env, prompt, wantJson) {
   const text = data?.choices?.[0]?.message?.content || "";
   if (!wantJson) return { text };
   try { return { json: JSON.parse(text) }; } catch { throw new HttpError(502, "The AI reply was not valid JSON. Try again."); }
+}
+
+// ---------- patient check-in (AI history taking) ----------
+
+const LANG_NAMES = { en: "English", ta: "Tamil", hi: "Hindi" };
+
+function intakeRules(lang, age, sex) {
+  const L = LANG_NAMES[lang] || "English";
+  return `You are the history-taking assistant of an Indian outpatient clinic (general surgery and general medicine). You interview the PATIENT on a phone or tablet before the doctor sees them.
+Patient: ${age} years, ${sex}.
+Language: write every question and option in ${L}${lang === "en" ? "" : " script"}, in simple everyday words a non-medical person understands. Medical terms may follow in brackets.
+Rules:
+- One short question per turn, like a careful resident taking history. Offer 2-6 tappable answer options in the same language when sensible; set "multi": true when several may apply. The patient can also type freely.
+- Cover: chief complaints with duration; history of the presenting illness explored like a clinician (site, onset, character, radiation, severity, timing, aggravating and relieving factors, associated symptoms relevant to the complaint); red-flag symptoms; past illnesses (diabetes, hypertension, TB, asthma, heart disease, thyroid, epilepsy, jaundice); past surgeries; blood transfusions; drug allergies; current medicines; habits (smoking, alcohol, tobacco chewing); diet; sleep; appetite; bowel and bladder; menstrual and obstetric history if female aged 12-55; family history.
+- Never diagnose, reassure or advise treatment.
+- If the patient reports an emergency symptom happening now (chest pain, severe breathlessness, heavy bleeding, fainting, confusion, thoughts of self-harm), set "urgent": true and begin that question by asking them to tell the staff immediately.
+- Finish when you have enough for a complete case sheet, usually 12-20 questions.
+Reply with ONLY one JSON object:
+{"done": false, "question": "...", "options": ["..."], "multi": false, "urgent": false}
+When finished reply: {"done": true, "closing": "<one thank-you sentence in ${L}>"}`;
+}
+
+function caseSheetPrompt(qa, age, sex, lang) {
+  return `Convert this outpatient intake interview into a structured case sheet in ENGLISH for the treating doctor. The patient answered in ${LANG_NAMES[lang] || "English"}; translate faithfully. Use only what the patient said. Write "Not asked" for topics not covered and "Nil" for denied ones. Do not diagnose.
+Patient: ${age} years, ${sex}.
+Interview:
+${qa.map((x, i) => `Q${i + 1}: ${x.q}\nA: ${x.a}`).join("\n")}
+Reply with ONLY this JSON:
+{"chiefComplaints":[{"complaint":"","duration":""}],"hpi":"one clinical paragraph","past":{"medical":"","surgical":"","transfusion":"","drugs":"","allergies":""},"habits":{"smoking":"","alcohol":"","tobacco":"","diet":"","sleep":"","appetiteBowelBladder":""},"menstrualObstetric":"","family":"","redFlags":[]}`;
+}
+
+async function getDoc(env, coll, id) {
+  const r = await (await db(env)).prepare("SELECT data FROM docs WHERE coll = ? AND id = ?").bind(coll, id).first();
+  return r ? JSON.parse(r.data) : null;
+}
+
+async function putDoc(env, coll, id, data) {
+  await (await db(env)).prepare("INSERT INTO docs (coll, id, data, updated) VALUES (?, ?, ?, ?) ON CONFLICT(coll, id) DO UPDATE SET data = excluded.data, updated = excluded.updated")
+    .bind(coll, id, JSON.stringify(data), Date.now()).run();
+}
+
+function visitSummary(id, v) {
+  const cc = (v.caseSheet?.chiefComplaints || []).map((c) => c.complaint + (c.duration ? " · " + c.duration : "")).join("; ") || v.qa?.[0]?.a || "";
+  return { id, token: v.token, date: v.date, createdAt: v.createdAt, status: v.status, urgent: !!v.urgent, lang: v.lang, patient: v.patient, complaint: cc };
 }
 
 // ---------- routes ----------
@@ -402,6 +449,68 @@ async function handle(request, env) {
         await D.prepare("UPDATE appointments SET status = 'completed' WHERE room = ? AND status = 'in-call'").bind(room).run();
       }
       return json({ ok: true });
+    }
+
+    // ----- patient check-in: AI interview -----
+    case "/api/checkin/next": {
+      const lang = ["en", "ta", "hi"].includes(body.lang) ? body.lang : "en";
+      const turns = Array.isArray(body.turns) ? body.turns.slice(-60) : [];
+      const msgs = [{ role: "system", content: intakeRules(lang, clean(body.age, 3), clean(body.sex, 10)) }];
+      msgs.push({ role: "user", content: "Begin the interview now with the first question." });
+      for (const t of turns) {
+        if (t && (t.role === "user" || t.role === "assistant")) msgs.push({ role: t.role, content: clean(t.content, 1500) });
+      }
+      const r = await chatOpenAI(env, msgs, true);
+      return json(r.json || {});
+    }
+
+    case "/api/checkin/finish": {
+      const p = body.patient || {};
+      const name = clean(p.name, 60);
+      if (!name) throw new HttpError(400, "Enter the patient's name");
+      const lang = ["en", "ta", "hi"].includes(body.lang) ? body.lang : "en";
+      const qa = (Array.isArray(body.qa) ? body.qa : []).slice(0, 60).map((x) => ({ q: clean(x?.q, 600), a: clean(x?.a, 600) }));
+      let caseSheet = null;
+      try { caseSheet = (await askOpenAI(env, caseSheetPrompt(qa, clean(p.age, 3), clean(p.sex, 10), lang), true)).json || null; } catch { caseSheet = null; }
+      const { date } = clinicNow(env);
+      const today = (await D.prepare("SELECT data FROM docs WHERE coll = 'visits' AND json_extract(data, '$.date') = ?").bind(date).all()).results || [];
+      const token = today.reduce((m, r) => Math.max(m, Number(JSON.parse(r.data).token) || 0), 0) + 1;
+      const id = crypto.randomUUID();
+      const visit = {
+        patient: { name, age: clean(p.age, 3), sex: clean(p.sex, 10), phone: digits(p.phone) }, lang, qa, caseSheet,
+        urgent: !!body.urgent, status: "waiting", token, date, createdAt: Date.now(), work: null, rx: null,
+      };
+      await putDoc(env, "visits", id, visit);
+      return json({ id, token });
+    }
+
+    // ----- doctor: OPD visits -----
+    case "/api/doctor/visits": {
+      await requireStaff(env, body.session, ["doctor"]);
+      const date = String(body.date || clinicNow(env).date);
+      const rows = (await D.prepare("SELECT id, data FROM docs WHERE coll = 'visits' AND json_extract(data, '$.date') = ? ORDER BY updated DESC").bind(date).all()).results || [];
+      const list = rows.map((r) => visitSummary(r.id, JSON.parse(r.data))).sort((a, b) => (a.token || 0) - (b.token || 0));
+      return json({ visits: list });
+    }
+
+    case "/api/doctor/visit": {
+      await requireStaff(env, body.session, ["doctor"]);
+      const v = await getDoc(env, "visits", String(body.id || ""));
+      if (!v) throw new HttpError(404, "Visit not found");
+      return json({ id: body.id, visit: v });
+    }
+
+    case "/api/doctor/visit/save": {
+      await requireStaff(env, body.session, ["doctor"]);
+      const id = String(body.id || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Visit not found");
+      const patch = body.patch || {};
+      for (const k of ["work", "rx", "caseSheet"]) if (k in patch) v[k] = patch[k];
+      if (["waiting", "consult", "sent", "dispensed", "done"].includes(patch.status)) v.status = patch.status;
+      if (JSON.stringify(v).length > 900000) throw new HttpError(413, "This case sheet is too large to save");
+      await putDoc(env, "visits", id, v);
+      return json({ ok: true, status: v.status });
     }
 
     // ----- AI (OpenAI), for the doctor's tools -----

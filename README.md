@@ -4,10 +4,12 @@ AI-assisted hospital app for Android by ShazVerse Technologies: appointment book
 
 Video calls are built in, using the same engine as **SRK Meet** (LiveKit): the doctor is the host, the patient waits in a waiting room until the doctor admits them. Mute, camera flip, chat, reactions and screen sharing all work inside Rx Clinic.
 
-## What's in this version (stage 1)
+## What's in this version
 
-- **Patient:** book a clinic visit or a video teleconsult (15-minute slots, next 7 days), keep a list of bookings on the phone, and **Join video call** at the booked time.
-- **Doctor:** sign in with a PIN, see each day's appointments, **Start video call** for teleconsults, admit the patient from the waiting room, and mark visits arrived, completed, no-show or cancelled.
+- **Patient check-in:** an AI interview takes the history one question at a time in English, Tamil or Hindi, reads each question aloud, and sends an English case sheet to the doctor. The patient gets a token number.
+- **Patient booking:** book a clinic visit or a video teleconsult (15-minute slots, next 7 days), keep a list of bookings on the phone, and **Join video call** at the booked time.
+- **Doctor OPD:** the day's checked-in patients; case sheet with history, vitals and examination; AI-suggested investigations, differential and provisional diagnosis; AI analysis of typed results; AI treatment suggestions (surgical plan, medicines, advice, referrals, review date); an editable prescription that can be saved and shared.
+- **Doctor appointments:** **Start video call** for teleconsults, admit the patient from the waiting room, and mark visits arrived, completed, no-show or cancelled.
 - Nursing staff, pharmacy and lab sign-ins are listed and come in the next stage.
 
 ## How it fits together

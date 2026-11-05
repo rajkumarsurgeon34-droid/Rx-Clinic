@@ -34,6 +34,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Assignment
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.EventAvailable
@@ -52,11 +53,13 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -80,6 +83,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.shazverse.rxclinic.Api
+import com.shazverse.rxclinic.BuildConfig
 import com.shazverse.rxclinic.Appt
 import com.shazverse.rxclinic.MyBooking
 import com.shazverse.rxclinic.Slot
@@ -91,7 +95,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private enum class Screen { Home, PatientHome, Book, MyAppointments, DoctorLogin, DoctorDay }
+private enum class Screen { Home, PatientHome, Book, MyAppointments, DoctorLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin }
 
 /** Everything outside the video call. */
 @Composable
@@ -99,26 +103,34 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     var screen by rememberSaveable { mutableStateOf(Screen.Home) }
     var showSettings by remember { mutableStateOf(false) }
     var comingSoon by remember { mutableStateOf<String?>(null) }
+    var caseId by rememberSaveable { mutableStateOf("") }
     val prefs = vm.prefs
 
+    CompositionLocalProvider(LocalContentColor provides Palette.Text) {
     Box(Modifier.fillMaxSize().background(Palette.Bg).statusBarsPadding().navigationBarsPadding()) {
         when (screen) {
             Screen.Home -> HomeScreen(
                 onPatient = { screen = Screen.PatientHome },
-                onDoctor = { screen = if (prefs.session("doctor") != null) Screen.DoctorDay else Screen.DoctorLogin },
+                onDoctor = { screen = if (prefs.session("doctor") != null) Screen.DoctorHome else Screen.DoctorLogin },
                 onOther = { comingSoon = it },
                 onSettings = { showSettings = true },
             )
             Screen.PatientHome -> PatientHome(
                 onBack = { screen = Screen.Home },
+                onCheckin = { screen = Screen.Checkin },
                 onBook = { screen = Screen.Book },
                 onMine = { screen = Screen.MyAppointments },
             )
             Screen.Book -> BookScreen(vm, onBack = { screen = Screen.PatientHome }, onDone = { screen = Screen.MyAppointments })
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
-            Screen.DoctorLogin -> DoctorLogin(vm, onBack = { screen = Screen.Home }, onIn = { screen = Screen.DoctorDay })
-            Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.Home }, onSignedOut = { screen = Screen.DoctorLogin })
+            Screen.DoctorLogin -> DoctorLogin(vm, onBack = { screen = Screen.Home }, onIn = { screen = Screen.DoctorHome })
+            Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = { screen = Screen.DoctorLogin })
+            Screen.DoctorHome -> DoctorHome(vm, onBack = { screen = Screen.Home }, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onSignedOut = { screen = Screen.DoctorLogin })
+            Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = { screen = Screen.DoctorLogin })
+            Screen.Case -> CaseScreen(vm, caseId, onBack = { screen = Screen.OpdQueue })
+            Screen.Checkin -> CheckinScreen(vm, onBack = { screen = Screen.PatientHome })
         }
+    }
     }
 
     if (showSettings) SettingsDialog(vm, onDismiss = { showSettings = false })
@@ -135,18 +147,18 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
 // ---------------- Shared pieces ----------------
 
 @Composable
-private fun TopBar(title: String, onBack: (() -> Unit)?, actions: @Composable () -> Unit = {}) {
+internal fun TopBar(title: String, onBack: (() -> Unit)?, actions: @Composable () -> Unit = {}) {
     if (onBack != null) BackHandler { onBack() }
     Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+        if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Palette.Text) }
         else Spacer(Modifier.width(12.dp))
-        Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(title, color = Palette.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
         actions()
     }
 }
 
 @Composable
-private fun Card(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+internal fun Card(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     Column(
         modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Palette.Card).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -154,7 +166,7 @@ private fun Card(modifier: Modifier = Modifier, content: @Composable () -> Unit)
 }
 
 @Composable
-private fun Pill(text: String, color: Color) {
+internal fun Pill(text: String, color: Color) {
     Text(
         text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
         modifier = Modifier.clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.15f)).padding(horizontal = 10.dp, vertical = 3.dp),
@@ -162,7 +174,7 @@ private fun Pill(text: String, color: Color) {
 }
 
 @Composable
-private fun Choice(text: String, selected: Boolean, enabled: Boolean = true, modifier: Modifier = Modifier, onClick: () -> Unit) {
+internal fun Choice(text: String, selected: Boolean, enabled: Boolean = true, modifier: Modifier = Modifier, onClick: () -> Unit) {
     val bg = if (selected) Palette.Blue else Palette.CardHigh
     Text(
         text,
@@ -174,7 +186,7 @@ private fun Choice(text: String, selected: Boolean, enabled: Boolean = true, mod
 }
 
 @Composable
-private fun ErrorText(msg: String?) {
+internal fun ErrorText(msg: String?) {
     if (!msg.isNullOrBlank()) Text(msg, color = Palette.Red, fontSize = 14.sp)
 }
 
@@ -206,8 +218,8 @@ private fun HomeScreen(onPatient: () -> Unit, onDoctor: () -> Unit, onOther: (St
         Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("℞", color = Palette.Red, fontSize = 34.sp, fontFamily = FontFamily.Serif)
             Spacer(Modifier.width(8.dp))
-            Text("Rx Clinic", fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Serif, modifier = Modifier.weight(1f))
-            IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings") }
+            Text("Rx Clinic", color = Palette.Text, fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Serif, modifier = Modifier.weight(1f))
+            IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings", tint = Palette.Text) }
         }
         Text("Who is using the app?", color = Palette.Muted, modifier = Modifier.padding(bottom = 16.dp))
         RoleCard("Patient", "Book an appointment, join your video teleconsult", Icons.Filled.Person, onPatient)
@@ -220,7 +232,7 @@ private fun HomeScreen(onPatient: () -> Unit, onDoctor: () -> Unit, onOther: (St
 }
 
 @Composable
-private fun RoleCard(title: String, sub: String, icon: ImageVector, onClick: () -> Unit) {
+internal fun RoleCard(title: String, sub: String, icon: ImageVector, onClick: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().padding(bottom = 10.dp).clip(RoundedCornerShape(16.dp)).background(Palette.Card).clickable(onClick = onClick).padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -230,7 +242,7 @@ private fun RoleCard(title: String, sub: String, icon: ImageVector, onClick: () 
         }
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+            Text(title, color = Palette.Text, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
             Text(sub, color = Palette.Muted, fontSize = 13.sp)
         }
     }
@@ -246,6 +258,7 @@ private fun SettingsDialog(vm: CallViewModel, onDismiss: () -> Unit) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(server, { server = it }, label = { Text("Rx Clinic server address") }, singleLine = true)
                 Text("Set once. It's the address of your Rx Clinic Cloudflare Worker.", color = Palette.Muted, fontSize = 13.sp)
+                Text("App version ${BuildConfig.VERSION_NAME}", color = Palette.Muted, fontSize = 13.sp)
             }
         },
         confirmButton = { Button(onClick = { vm.prefs.serverUrl = server; onDismiss() }) { Text("Save") } },
@@ -256,10 +269,11 @@ private fun SettingsDialog(vm: CallViewModel, onDismiss: () -> Unit) {
 // ---------------- Patient ----------------
 
 @Composable
-private fun PatientHome(onBack: () -> Unit, onBook: () -> Unit, onMine: () -> Unit) {
+private fun PatientHome(onBack: () -> Unit, onCheckin: () -> Unit, onBook: () -> Unit, onMine: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         TopBar("Patient", onBack)
         Column(Modifier.padding(horizontal = 16.dp)) {
+            RoleCard("Check-in at the clinic", "Answer a few questions before you see the doctor (English, தமிழ், हिन्दी)", Icons.Filled.Assignment, onCheckin)
             RoleCard("Book an appointment", "Visit the clinic or see the doctor on video", Icons.Filled.CalendarMonth, onBook)
             RoleCard("My appointments", "Check your booking and join your video teleconsult", Icons.Filled.EventAvailable, onMine)
         }
@@ -402,7 +416,7 @@ private fun MyAppointments(vm: CallViewModel, withMedia: (() -> Unit) -> Unit, o
 
     Column(Modifier.fillMaxSize()) {
         TopBar("My appointments", onBack) {
-            IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh") }
+            IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.Text) }
         }
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             if (bookings.isEmpty()) item {
@@ -536,13 +550,13 @@ private fun DoctorDay(vm: CallViewModel, withMedia: (() -> Unit) -> Unit, onBack
 
     Column(Modifier.fillMaxSize()) {
         TopBar(vm.prefs.doctorName.ifBlank { "Doctor" }, onBack) {
-            IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh") }
+            IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.Text) }
             TextButton(onClick = { signOut() }) { Text("Sign out") }
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { date = LocalDate.parse(date).minusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Previous day") }
+            IconButton(onClick = { date = LocalDate.parse(date).minusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Previous day", tint = Palette.Text) }
             Text("Appointments · ${dayLabel(date)}", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            IconButton(onClick = { date = LocalDate.parse(date).plusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Next day") }
+            IconButton(onClick = { date = LocalDate.parse(date).plusDays(1).toString() }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Next day", tint = Palette.Text) }
         }
         Box(Modifier.padding(horizontal = 16.dp)) { ErrorText(err) }
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -581,7 +595,7 @@ private fun DoctorDay(vm: CallViewModel, withMedia: (() -> Unit) -> Unit, onBack
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun FlowRow2(content: @Composable () -> Unit) {
+internal fun FlowRow2(content: @Composable () -> Unit) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) { content() }
 }
 
