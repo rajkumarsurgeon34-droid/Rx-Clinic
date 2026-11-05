@@ -1,10 +1,10 @@
 # Cloudflare Worker settings for the Rx Clinic server.
 # Cloudflare builds this automatically when the worker is connected to this
 # GitHub repo with root directory "/server" (the copy at the repo root is for "/").
-name = "rxclinic"
+name = "rx-clinic"
 main = "worker.js"
 compatibility_date = "2025-01-01"
-# Serve at https://rxclinic.<your-subdomain>.workers.dev
+# Serve at https://rx-clinic.<your-subdomain>.workers.dev
 workers_dev = true
 
 # Not secret: the LiveKit project address and key ID (same LiveKit project as SRK Meet).
