@@ -1,0 +1,12 @@
+{
+  "name": "rx-clinic-server",
+  "private": true,
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}
