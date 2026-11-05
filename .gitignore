@@ -1,0 +1,17 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.kotlin/
+node_modules/
+.wrangler/
+.dev.vars
+
+# Windows app
+windows/node_modules/
+windows/dist/
+windows/renderer/app.bundle.js
+!windows/build/

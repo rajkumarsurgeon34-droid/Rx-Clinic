@@ -1,0 +1,130 @@
+package com.shazverse.rxclinic
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+
+data class Appt(
+    val id: String, val date: String, val time: String, val mode: String, val status: String,
+    val name: String, val age: String, val sex: String, val phone: String, val reason: String,
+    val lang: String, val code: String,
+) {
+    val isTele get() = mode == "tele"
+    val isOpen get() = status !in setOf("completed", "cancelled", "no-show")
+
+    companion object {
+        fun from(o: JSONObject) = Appt(
+            id = o.optString("id"), date = o.optString("date"), time = o.optString("time"),
+            mode = o.optString("mode"), status = o.optString("status", "booked"),
+            name = o.optString("name"), age = o.optString("age"), sex = o.optString("sex"),
+            phone = o.optString("phone"), reason = o.optString("reason"), lang = o.optString("lang", "en"),
+            code = o.optString("code"),
+        )
+    }
+}
+
+data class Slot(val time: String, val free: Boolean)
+data class Session(val token: String, val role: String, val doctorName: String, val clinicName: String)
+data class Joined(val url: String, val token: String, val identity: String, val role: String, val room: String, val title: String)
+
+class ApiException(message: String) : Exception(message)
+
+/** Talks to the Rx Clinic server (server/worker.js). */
+class Api(private val baseUrl: String) {
+
+    suspend fun slots(date: String): List<Slot> {
+        val o = get("/api/slots?date=" + URLEncoder.encode(date, "UTF-8"))
+        val arr = o.optJSONArray("slots") ?: JSONArray()
+        return (0 until arr.length()).map { arr.getJSONObject(it).let { s -> Slot(s.optString("t"), s.optBoolean("free")) } }
+    }
+
+    suspend fun book(
+        name: String, age: String, sex: String, phone: String, date: String, time: String,
+        mode: String, reason: String, lang: String,
+    ): Appt {
+        val o = post("/api/book", JSONObject()
+            .put("name", name).put("age", age).put("sex", sex).put("phone", phone)
+            .put("date", date).put("time", time).put("mode", mode).put("reason", reason).put("lang", lang))
+        return Appt.from(o.getJSONObject("appointment"))
+    }
+
+    suspend fun myAppointment(code: String, phone: String): Appt =
+        Appt.from(post("/api/appt", JSONObject().put("code", code).put("phone", phone)).getJSONObject("appointment"))
+
+    suspend fun login(role: String, pin: String): Session {
+        val o = post("/api/login", JSONObject().put("role", role).put("pin", pin))
+        val c = o.optJSONObject("clinic") ?: JSONObject()
+        return Session(o.getString("session"), o.getString("role"), c.optString("doctor"), c.optString("name"))
+    }
+
+    suspend fun dayAppointments(session: String, date: String): List<Appt> {
+        val arr = post("/api/doctor/appointments", JSONObject().put("session", session).put("date", date))
+            .optJSONArray("appointments") ?: JSONArray()
+        return (0 until arr.length()).map { Appt.from(arr.getJSONObject(it)) }
+    }
+
+    suspend fun setStatus(session: String, id: String, status: String) {
+        post("/api/doctor/status", JSONObject().put("session", session).put("id", id).put("status", status))
+    }
+
+    suspend fun doctorToken(session: String, apptId: String): Joined =
+        joined(post("/api/tele/token", JSONObject().put("session", session).put("id", apptId)))
+
+    suspend fun patientToken(code: String, phone: String, identity: String?): Joined {
+        val body = JSONObject().put("code", code).put("phone", phone)
+        if (identity != null) body.put("identity", identity)
+        return joined(post("/api/tele/token", body))
+    }
+
+    /** Host controls for the doctor: admit, remove, mute, end. */
+    suspend fun meet(action: String, session: String, room: String, identity: String?) {
+        val body = JSONObject().put("session", session).put("room", room)
+        if (identity != null) body.put("identity", identity)
+        post("/api/meet/$action", body)
+    }
+
+    private fun joined(o: JSONObject) = Joined(
+        o.getString("url"), o.getString("token"), o.getString("identity"), o.getString("role"),
+        o.getString("room"), o.optString("title"),
+    )
+
+    private suspend fun get(path: String): JSONObject = request("GET", path, null)
+    private suspend fun post(path: String, body: JSONObject): JSONObject = request("POST", path, body)
+
+    private suspend fun request(method: String, path: String, body: JSONObject?): JSONObject = withContext(Dispatchers.IO) {
+        if (baseUrl.isBlank()) throw ApiException("Set the Rx Clinic server address in Settings first.")
+        val conn = try {
+            URL(baseUrl + path).openConnection() as HttpURLConnection
+        } catch (e: Exception) {
+            throw ApiException("The server address looks wrong. Check it in Settings.")
+        }
+        try {
+            conn.requestMethod = method
+            conn.connectTimeout = 15_000
+            conn.readTimeout = 30_000
+            if (body != null) {
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.outputStream.use { it.write(body.toString().toByteArray()) }
+            }
+            val code = conn.responseCode
+            val text = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+            val json = runCatching { JSONObject(text) }.getOrNull()
+            if (code !in 200..299 || json == null) {
+                throw ApiException(json?.optString("error")?.takeIf { it.isNotBlank() } ?: "Server error ($code)")
+            }
+            json
+        } catch (e: ApiException) {
+            throw e
+        } catch (e: Exception) {
+            throw ApiException("Can't reach the Rx Clinic server. Check your internet.")
+        } finally {
+            conn.disconnect()
+        }
+    }
+}

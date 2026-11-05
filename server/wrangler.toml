@@ -1,0 +1,21 @@
+# Cloudflare Worker settings for the Rx Clinic server.
+# Cloudflare builds this automatically when the worker is connected to this
+# GitHub repo with root directory "server".
+name = "rxclinic"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Not secret: the LiveKit project address and key ID (same LiveKit project as SRK Meet).
+# Add these as Secrets in Cloudflare: LIVEKIT_API_SECRET, OPENAI_API_KEY
+[vars]
+LIVEKIT_URL = "wss://srk-meet-6n4nciq0.livekit.cloud"
+LIVEKIT_API_KEY = "APIQnxPPJ6GZhGT"
+OPENAI_MODEL = "gpt-4o-mini"
+CLINIC_TZ_MINUTES = "330"
+
+# The clinic database. Create it once in Cloudflare (Storage & Databases → D1 → Create,
+# name it rxclinic-db), then paste its Database ID below.
+[[d1_databases]]
+binding = "DB"
+database_name = "rxclinic-db"
+database_id = "PASTE-YOUR-D1-DATABASE-ID-HERE"
