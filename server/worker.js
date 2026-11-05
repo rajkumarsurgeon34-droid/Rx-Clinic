@@ -263,9 +263,38 @@ async function chatClaude(env, messages, wantJson) {
   return wantJson ? { json: parseJsonReply(text) } : { text };
 }
 
+// Cloudflare Workers AI: free daily allowance, no API key (binding "AI" in wrangler.toml).
+async function chatWorkersAI(env, messages, wantJson) {
+  if (!env.AI) throw new HttpError(503, "AI is not set up yet: add ANTHROPIC_API_KEY or OPENAI_API_KEY in the worker settings");
+  const msgs = messages.map((m) => ({ role: m.role, content: m.content }));
+  if (wantJson && msgs[0]?.role === "system") msgs[0] = { role: "system", content: msgs[0].content + "\n\nReply with only one valid JSON object and no other text." };
+  let out;
+  try {
+    out = await env.AI.run(env.WORKERS_AI_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast", { messages: msgs, max_tokens: 2500 });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (/neuron|limit|quota|429/i.test(msg)) throw new HttpError(429, "Today's free AI allowance is used up. It resets at 5:30 am, or add a Claude or OpenAI key.");
+    throw new HttpError(502, "AI error: " + msg);
+  }
+  const r = out?.response;
+  if (r && typeof r === "object") return wantJson ? { json: r } : { text: JSON.stringify(r) };
+  const text = String(r || "");
+  return wantJson ? { json: parseJsonReply(text) } : { text };
+}
+
+// Order: Claude key → OpenAI key → free Cloudflare Workers AI. A paid provider that fails
+// for billing reasons (no credit, quota) falls back to Workers AI so the clinic keeps working.
 async function chatOpenAI(env, messages, wantJson) {
-  if (env.ANTHROPIC_API_KEY) return chatClaude(env, messages, wantJson);
-  if (!env.OPENAI_API_KEY) throw new HttpError(503, "AI is not set up yet: add ANTHROPIC_API_KEY or OPENAI_API_KEY in the worker settings");
+  const fallback = async (e) => {
+    if (env.AI && /credit|quota|billing|insufficient|429|balance/i.test(String(e?.message))) return chatWorkersAI(env, messages, wantJson);
+    throw e;
+  };
+  if (env.ANTHROPIC_API_KEY) { try { return await chatClaude(env, messages, wantJson); } catch (e) { return fallback(e); } }
+  if (env.OPENAI_API_KEY) { try { return await chatOpenAIDirect(env, messages, wantJson); } catch (e) { return fallback(e); } }
+  return chatWorkersAI(env, messages, wantJson);
+}
+
+async function chatOpenAIDirect(env, messages, wantJson) {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -337,7 +366,7 @@ async function handle(request, env) {
     if (path === "/") {
       let database = false;
       try { await db(env); database = true; } catch { /* reported below */ }
-      return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : "none" });
+      return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
     }
     if (path === "/api/slots") {
       const date = url.searchParams.get("date") || "";

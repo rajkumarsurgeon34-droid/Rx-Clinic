@@ -21,3 +21,7 @@ CLINIC_TZ_MINUTES = "330"
 [[d1_databases]]
 binding = "DB"
 database_name = "rxclinic-db"
+
+# Free AI fallback: Cloudflare Workers AI (no key needed; 10,000 neurons/day free)
+[ai]
+binding = "AI"
