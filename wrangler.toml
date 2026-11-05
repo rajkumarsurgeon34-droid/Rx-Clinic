@@ -8,11 +8,12 @@ compatibility_date = "2025-01-01"
 workers_dev = true
 
 # Not secret: the LiveKit project address and key ID (same LiveKit project as SRK Meet).
-# Add these as Secrets in Cloudflare: LIVEKIT_API_SECRET, OPENAI_API_KEY
+# Add these as Secrets in Cloudflare: LIVEKIT_API_SECRET, and ANTHROPIC_API_KEY (Claude) or OPENAI_API_KEY
 [vars]
 LIVEKIT_URL = "wss://srk-meet-6n4nciq0.livekit.cloud"
 LIVEKIT_API_KEY = "APIQnxPPJ6GZhGT"
 OPENAI_MODEL = "gpt-4o-mini"
+CLAUDE_MODEL = "claude-sonnet-5-5"
 CLINIC_TZ_MINUTES = "330"
 
 # The clinic database. No ID needed: on the first deploy Wrangler (4.45+) creates

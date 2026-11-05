@@ -7,7 +7,9 @@
 //   LIVEKIT_URL         e.g. wss://your-project.livekit.cloud            (variable)
 //   LIVEKIT_API_KEY     from LiveKit Cloud → Settings → Keys              (variable)
 //   LIVEKIT_API_SECRET  from the same page                               (secret)
-//   OPENAI_API_KEY      for the AI features                              (secret, optional for now)
+//   ANTHROPIC_API_KEY   Claude for the AI features (used first if set)   (secret)
+//   CLAUDE_MODEL        optional, defaults to claude-sonnet-5-5           (variable)
+//   OPENAI_API_KEY      OpenAI for the AI features, if no Claude key     (secret)
 //   OPENAI_MODEL        optional, defaults to gpt-4o-mini                (variable)
 //   CLINIC_TZ_MINUTES   optional, clinic time zone offset, default 330 (India)
 
@@ -225,8 +227,45 @@ async function askOpenAI(env, prompt, wantJson, system = DOCTOR_SYSTEM) {
   return chatOpenAI(env, [{ role: "system", content: system }, { role: "user", content: prompt }], wantJson);
 }
 
+// Pulls one JSON object out of a model's reply (tolerates code fences or a sentence around it).
+function parseJsonReply(text) {
+  try { return JSON.parse(text); } catch { /* try harder */ }
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) { try { return JSON.parse(fence[1]); } catch { /* fall through */ } }
+  const a = text.indexOf("{"), b = text.lastIndexOf("}");
+  if (a >= 0 && b > a) { try { return JSON.parse(text.slice(a, b + 1)); } catch { /* fall through */ } }
+  throw new HttpError(502, "The AI reply was not valid JSON. Try again.");
+}
+
+// Claude (Anthropic) is used when ANTHROPIC_API_KEY is set; otherwise OpenAI.
+async function chatClaude(env, messages, wantJson) {
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const turns = [];
+  for (const m of messages.filter((x) => x.role !== "system")) {
+    const last = turns[turns.length - 1];
+    if (last && last.role === m.role) last.content += "\n\n" + m.content; // Claude needs alternating turns
+    else turns.push({ role: m.role, content: m.content });
+  }
+  if (!turns.length || turns[0].role !== "user") turns.unshift({ role: "user", content: "Begin." });
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: env.CLAUDE_MODEL || "claude-sonnet-5-5",
+      max_tokens: 4000,
+      system: system + (wantJson ? "\n\nReply with only one valid JSON object and no other text." : ""),
+      messages: turns,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new HttpError(502, data?.error?.message || `AI error (${res.status})`);
+  const text = (data?.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
+  return wantJson ? { json: parseJsonReply(text) } : { text };
+}
+
 async function chatOpenAI(env, messages, wantJson) {
-  if (!env.OPENAI_API_KEY) throw new HttpError(503, "AI is not set up yet: add OPENAI_API_KEY in the worker settings");
+  if (env.ANTHROPIC_API_KEY) return chatClaude(env, messages, wantJson);
+  if (!env.OPENAI_API_KEY) throw new HttpError(503, "AI is not set up yet: add ANTHROPIC_API_KEY or OPENAI_API_KEY in the worker settings");
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -240,7 +279,7 @@ async function chatOpenAI(env, messages, wantJson) {
   if (!res.ok) throw new HttpError(502, data?.error?.message || `AI error (${res.status})`);
   const text = data?.choices?.[0]?.message?.content || "";
   if (!wantJson) return { text };
-  try { return { json: JSON.parse(text) }; } catch { throw new HttpError(502, "The AI reply was not valid JSON. Try again."); }
+  return { json: parseJsonReply(text) };
 }
 
 // ---------- patient check-in (AI history taking) ----------
@@ -298,7 +337,7 @@ async function handle(request, env) {
     if (path === "/") {
       let database = false;
       try { await db(env); database = true; } catch { /* reported below */ }
-      return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!env.OPENAI_API_KEY });
+      return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : "none" });
     }
     if (path === "/api/slots") {
       const date = url.searchParams.get("date") || "";

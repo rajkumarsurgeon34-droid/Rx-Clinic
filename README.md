@@ -29,7 +29,7 @@ Nothing to do: the first deploy creates the D1 database `rxclinic-db` and links 
 1. **Workers & Pages → Create → Import a repository →** this repo, worker name `rx-clinic` (leave the root directory as `/`).
 2. In the worker's **Settings → Variables and Secrets**, add Secrets:
    - `LIVEKIT_API_SECRET`: the same LiveKit API secret SRK Meet uses
-   - `OPENAI_API_KEY`: your OpenAI key (for the AI features)
+   - `ANTHROPIC_API_KEY`: your Claude API key (for the AI features), **or** `OPENAI_API_KEY` for OpenAI. If both are set, Claude is used.
 3. Open `https://rx-clinic.<your-subdomain>.workers.dev`. You should see `"database": true, "video": true`.
 
 `LIVEKIT_URL` and `LIVEKIT_API_KEY` are already set in `wrangler.toml` (at the top of the repo) (same LiveKit project as SRK Meet).
