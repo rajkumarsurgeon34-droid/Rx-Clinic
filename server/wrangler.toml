@@ -4,6 +4,8 @@
 name = "rxclinic"
 main = "worker.js"
 compatibility_date = "2025-01-01"
+# Serve at https://rxclinic.<your-subdomain>.workers.dev
+workers_dev = true
 
 # Not secret: the LiveKit project address and key ID (same LiveKit project as SRK Meet).
 # Add these as Secrets in Cloudflare: LIVEKIT_API_SECRET, OPENAI_API_KEY
