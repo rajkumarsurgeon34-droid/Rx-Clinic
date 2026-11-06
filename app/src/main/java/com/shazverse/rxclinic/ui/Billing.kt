@@ -536,7 +536,14 @@ fun BillingScreen(vm: CallViewModel, onChart: (String) -> Unit = {}, onBack: () 
     var refresh by remember { mutableIntStateOf(0) }
     Column(Modifier.fillMaxSize()) {
         TopBar("Billing", onBack) { AccountButton(vm, onSignedOut) }
-        QuickLinks(listOf("Patients" to onPatients, "Follow-ups" to onFollowUps))
+        QuickLinks(buildList {
+            add("Patients" to onPatients); add("Follow-ups" to onFollowUps)
+            if (vm.prefs.has("reports")) add("Accounts & reports" to { onChart("@accounts") })
+            add("Dues" to { onChart("@accounts") })
+            if (vm.prefs.has("insurance")) add("Insurance" to { onChart("@insurance") })
+            if (vm.prefs.has("homecare")) add("Home care" to { onChart("@homecare") })
+            if (vm.prefs.has("ip")) add("Bed board" to { onChart("@beds") })
+        })
         FlowRow(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf("opd" to "OPD bills", "total" to "Patient total", "ip" to "Inpatients", "day" to "Collections").filter { it.first != "ip" || vm.prefs.has("ip") }.forEach { (k, l) -> Choice(l, tab == k) { tab = k } }
         }

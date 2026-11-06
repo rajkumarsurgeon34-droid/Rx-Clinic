@@ -243,7 +243,7 @@ async function ensureAdmin(env) {
 
 function publicUser(id, u) {
   return { id, username: u.username, name: u.name, role: u.role, qual: u.qual || "", reg: u.reg || "", phone: u.phone || "",
-    active: u.active !== false, mustChange: !!u.mustChange, created: u.created || 0, lastLogin: u.lastLogin || 0 };
+    active: u.active !== false, mustChange: !!u.mustChange, created: u.created || 0, lastLogin: u.lastLogin || 0, branch: u.branch || "" };
 }
 
 async function findUser(env, username) {
@@ -676,9 +676,50 @@ async function applyStock(env, bill, restore = false) {
     const s = await getDoc(env, "stock", ref);
     if (!s) continue;
     s.stock = Math.max(0, (Number(s.stock) || 0) - delta);
+    useBatches(s, delta);
     await putDoc(env, "stock", ref, s);
   }
   bill.stockApplied = want;
+}
+
+/** Keeps batch quantities in step with stock: issue from the earliest expiry first; returns go back to the latest batch. */
+function useBatches(s, delta) {
+  if (!Array.isArray(s.batches) || !s.batches.length) return;
+  s.batches.sort((a, b) => String(a.expiry || "9999").localeCompare(String(b.expiry || "9999")));
+  if (delta > 0) { let left = delta; for (const b of s.batches) { const t = Math.min(b.qty, left); b.qty -= t; left -= t; if (!left) break; } }
+  else s.batches[s.batches.length - 1].qty += -delta;
+  s.batches = s.batches.filter((b) => b.qty > 0).slice(-50);
+}
+
+// ---------- notifications ----------
+async function notify(env, n) {
+  // n: { to: "role:doctor" | "user:<name>", title, body, link }
+  await putDoc(env, "notifications", crypto.randomUUID(), { to: clean(n.to, 100), title: clean(n.title, 120), body: clean(n.body, 400), link: clean(n.link, 120), at: Date.now(), readBy: [] });
+}
+
+// ---------- simple records (expenses, suppliers, insurance, home care, camps, wards, goals, branches, packages) ----------
+const REC = {
+  expenses: { read: ["billing"], write: ["billing"], feature: "expenses" },
+  suppliers: { read: ["pharmacy", "billing"], write: ["pharmacy"], feature: "purchase" },
+  policies: { read: ["billing", "staff", "doctor"], write: ["billing", "staff"], feature: "insurance" },
+  claims: { read: ["billing", "doctor"], write: ["billing"], feature: "insurance" },
+  corporates: { read: ["billing"], write: ["billing"], feature: "insurance" },
+  homevisits: { read: ["staff", "doctor", "billing"], write: ["staff", "doctor", "billing"], feature: "homecare" },
+  camps: { read: ["staff", "doctor", "billing"], write: ["staff", "doctor"], feature: "mobileunit" },
+  campregs: { read: ["staff", "doctor"], write: ["staff", "doctor"], feature: "mobileunit" },
+  wards: { read: ["staff", "doctor", "billing"], write: [], feature: "ip" },
+  goals: { read: ["billing"], write: [], feature: "goals" },
+  branches: { read: ["doctor", "staff", "billing", "pharmacy", "lab", "diagnostics"], write: [] },
+  packages: { read: ["billing", "staff", "doctor"], write: [] },
+};
+function sanitize(v, depth = 0) {
+  if (depth > 5) return null;
+  if (typeof v === "string") return v.trim().slice(0, 4000);
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "boolean" || v === null) return v;
+  if (Array.isArray(v)) return v.slice(0, 300).map((x) => sanitize(x, depth + 1));
+  if (typeof v === "object") return Object.fromEntries(Object.entries(v).slice(0, 100).map(([k, x]) => [String(k).slice(0, 60), sanitize(x, depth + 1)]));
+  return null;
 }
 
 function canDept(role, dept) { return role === "admin" || (DEPT_ROLES[dept] || []).includes(role); }
@@ -727,8 +768,8 @@ async function handle(request, env) {
       try { await db(env); database = true; } catch { /* reported below */ }
       return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
     }
-    if (path === "/login" || path === "/portal" || path === "/terms" || path === "/hmis") {
-      const page = path === "/login" ? loginPage : path === "/portal" ? portalPage : path === "/hmis" ? hmisPage : termsPage;
+    if (path === "/login" || path === "/portal" || path === "/terms" || path === "/hmis" || path === "/me") {
+      const page = path === "/login" ? loginPage : path === "/portal" ? portalPage : path === "/hmis" ? hmisPage : path === "/me" ? mePage : termsPage;
       return new Response(page(), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     }
     if (path === "/api/license") {
@@ -753,6 +794,7 @@ async function handle(request, env) {
   }
 
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (path === "/api/pay/webhook") return razorpayWebhook(request, env);
   let body = {};
   try { body = await request.json(); } catch { throw new HttpError(400, "Invalid JSON"); }
   const D = await db(env);
@@ -781,6 +823,7 @@ async function handle(request, env) {
       await D.prepare(`INSERT INTO appointments (id, created_at, date, time, mode, status, name, age, sex, phone, reason, lang, code, room, source, patient_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .bind(row.id, row.created_at, row.date, row.time, row.mode, row.status, row.name, row.age, row.sex, row.phone, row.reason, row.lang, row.code, row.room, row.source, patientId).run();
+      await notify(env, { to: "role:doctor", title: "New appointment", body: `${row.name} · ${row.date} ${row.time}${row.mode === "tele" ? " · video" : ""}`, link: "" });
       return json({ appointment: publicAppt(row) });
     }
 
@@ -878,7 +921,7 @@ async function handle(request, env) {
         if (["lab", "diagnostics"].includes(role) && !pl.features[role]) throw new HttpError(409, `${FEATURE_NAMES[role]} is not in your ${pl.name} plan`);
       }
       if (!isNew && (u.role !== role || (u.active !== false) !== active)) u.ver = (u.ver || 0) + 1; // signs them out
-      Object.assign(u, { username, role, name, active, qual: clean(x.qual ?? u.qual, 80), reg: clean(x.reg ?? u.reg, 40), phone: digits(x.phone ?? u.phone) });
+      Object.assign(u, { username, role, name, active, qual: clean(x.qual ?? u.qual, 80), reg: clean(x.reg ?? u.reg, 40), phone: digits(x.phone ?? u.phone), branch: clean(x.branch ?? u.branch, 40) });
       if (isNew || x.password) {
         u.passHash = await hashPassword(validPassword(x.password));
         u.mustChange = true;
@@ -893,7 +936,7 @@ async function handle(request, env) {
       if (body.clinic && typeof body.clinic === "object") {
         if (who !== "admin") throw new HttpError(403, "Only the admin can change clinic details");
         const c = await clinicInfo(env);
-        for (const k of ["name", "doctor", "qual", "reg", "address", "phone", "hours"]) if (k in body.clinic) c[k] = clean(body.clinic[k], 200);
+        for (const k of ["name", "doctor", "qual", "reg", "address", "phone", "hours", "upi", "gstin"]) if (k in body.clinic) c[k] = clean(body.clinic[k], 200);
         await setSetting(env, "clinic", c);
       }
       return json({ ok: true, clinic: await clinicInfo(env) });
@@ -1208,6 +1251,7 @@ async function handle(request, env) {
         o.impression = clean(body.impression, 2000);
         if (!o.result && !o.impression) throw new HttpError(400, "Enter the report first");
         o.reportedAt = Date.now();
+        await notify(env, { to: "role:doctor", title: `Report ready: ${o.test}`, body: `${o.patient?.name || ""} (${o.patient?.id || ""})`, link: o.visitId?.startsWith("ip:") ? "ip-" + o.visitId.slice(3) : "v-" + o.visitId });
       }
       await putDoc(env, "orders", id, o);
       return json({ ok: true });
@@ -1228,7 +1272,9 @@ async function handle(request, env) {
         const generic = clean(it.generic, 120);
         if (!generic) continue;
         const id = typeof it.id === "string" && ID_RE.test(it.id) ? it.id : crypto.randomUUID();
-        await putDoc(env, "stock", id, { generic, brand: clean(it.brand, 80), form: clean(it.form, 20) || "Tab", strength: clean(it.strength, 40), stock: Math.max(0, Math.floor(Number(it.stock) || 0)), price: Math.max(0, money(it.price)) });
+        const old = (await getDoc(env, "stock", id)) || {};
+        await putDoc(env, "stock", id, Object.assign(old, { generic, brand: clean(it.brand, 80), form: clean(it.form, 20) || "Tab", strength: clean(it.strength, 40), stock: Math.max(0, Math.floor(Number(it.stock) || 0)), price: Math.max(0, money(it.price)),
+          category: it.category === "non-drug" ? "non-drug" : (it.category === "drug" ? "drug" : old.category || "drug"), reorder: it.reorder !== undefined ? Math.max(0, Math.floor(Number(it.reorder) || 0)) : (old.reorder ?? 10) }));
         n++;
       }
       return json({ saved: n });
@@ -1309,6 +1355,320 @@ async function handle(request, env) {
         })(),
         pharmacy: { toDispense: count(visits, (v) => v.status === "sent"), dispensed: count(visits, (v) => v.status === "dispensed"), outOfStock: count(stock, (x) => !x.stock) },
       });
+    }
+
+    // ----- simple records -----
+    case "/api/rec/list": {
+      const coll = String(body.coll || ""), cfg = REC[coll];
+      if (!cfg) throw new HttpError(400, "Unknown list");
+      await requireUser(env, body.session, [...new Set([...cfg.read, ...cfg.write])]);
+      if (cfg.feature) await needFeature(env, cfg.feature);
+      let list;
+      const f = body.where && typeof body.where === "object" ? Object.entries(body.where).slice(0, 3) : [];
+      if (f.length) list = await listDocs(env, coll, f.map(([k]) => `json_extract(data, '$.${k.replace(/[^\w.]/g, "")}') = ?`).join(" AND "), f.map(([, v]) => v));
+      else list = await listDocs(env, coll);
+      if (body.from) list = list.filter((x) => (x.date || "") >= body.from && (!body.to || (x.date || "") <= body.to));
+      return json({ items: list.sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.created || 0) - (a.created || 0)).slice(0, 1000) });
+    }
+
+    case "/api/rec/save": {
+      const coll = String(body.coll || ""), cfg = REC[coll];
+      if (!cfg) throw new HttpError(400, "Unknown list");
+      const me = await requireUser(env, body.session, cfg.write.length ? cfg.write : ["admin"]);
+      if (cfg.feature) await needFeature(env, cfg.feature);
+      const data = sanitize(body.item || {});
+      if (JSON.stringify(data).length > 60000) throw new HttpError(400, "Too much data in one record");
+      const id = typeof body.id === "string" && ID_RE.test(body.id) ? body.id : crypto.randomUUID();
+      const old = (await getDoc(env, coll, id)) || { created: Date.now(), createdBy: me.user.name || me.role };
+      const doc = Object.assign(old, data, { updated: Date.now(), updatedBy: me.user.name || me.role });
+      if (!doc.date) doc.date = clinicNow(env).date;
+      if (coll === "claims" && !doc.no) doc.no = await nextNo(env, "claim", "CLM");
+      if (coll === "homevisits" && !doc.no) doc.no = await nextNo(env, "hv", "HV");
+      if (coll === "camps" && !doc.no) doc.no = await nextNo(env, "camp", "CAMP");
+      await putDoc(env, coll, id, doc);
+      return json({ item: Object.assign({ id }, doc) });
+    }
+
+    case "/api/rec/delete": {
+      const coll = String(body.coll || ""), cfg = REC[coll];
+      if (!cfg) throw new HttpError(400, "Unknown list");
+      await requireUser(env, body.session, cfg.write.length ? cfg.write : ["admin"]);
+      await D.prepare("DELETE FROM docs WHERE coll = ? AND id = ?").bind(coll, String(body.id || "")).run();
+      return json({ ok: true });
+    }
+
+    // ----- pharmacy: purchases, batches, alerts -----
+    case "/api/pharmacy/purchase": {
+      const me = await requireUser(env, body.session, ["pharmacy"]);
+      await needFeature(env, "purchase");
+      const items = (Array.isArray(body.items) ? body.items : []).slice(0, 200);
+      if (!items.length) throw new HttpError(400, "Add at least one item");
+      const stock = await listDocs(env, "stock");
+      const lines = [];
+      for (const it of items) {
+        const generic = clean(it.generic, 120), qty = Math.max(0, Math.floor(Number(it.qty) || 0));
+        if (!generic || !qty) continue;
+        const strength = clean(it.strength, 40), form = clean(it.form, 20) || "Tab";
+        let s = stock.find((x) => x.generic.toLowerCase() === generic.toLowerCase() && (x.strength || "").toLowerCase() === strength.toLowerCase() && (x.form || "").toLowerCase() === form.toLowerCase());
+        const id = s ? s.id : crypto.randomUUID();
+        s = s || { generic, strength, form, brand: clean(it.brand, 80), stock: 0, price: 0, category: it.category === "non-drug" ? "non-drug" : "drug", reorder: 10, batches: [] };
+        delete s.id;
+        s.stock = (Number(s.stock) || 0) + qty;
+        if (Number(it.mrp) > 0) s.price = money(it.mrp);
+        if (it.brand) s.brand = clean(it.brand, 80);
+        s.batches = (s.batches || []).concat([{ batch: clean(it.batch, 40), expiry: /^\d{4}-\d{2}(-\d{2})?$/.test(it.expiry || "") ? it.expiry : "", qty, cost: money(it.cost) }]).slice(-50);
+        await putDoc(env, "stock", id, s);
+        lines.push({ stockId: id, generic, strength, form, batch: clean(it.batch, 40), expiry: clean(it.expiry, 10), qty, cost: money(it.cost), mrp: money(it.mrp), amount: money(qty * (Number(it.cost) || 0)) });
+      }
+      if (!lines.length) throw new HttpError(400, "Enter the quantity for each item");
+      const doc = { supplier: clean(body.supplier, 120), invoice: clean(body.invoice, 60), date: /^\d{4}-\d{2}-\d{2}$/.test(body.date || "") ? body.date : clinicNow(env).date,
+        lines, total: money(lines.reduce((x, l) => x + l.amount, 0)), paid: !!body.paid, created: Date.now(), by: me.user.name || me.role, no: await nextNo(env, "purchase", "PUR") };
+      const pid = crypto.randomUUID();
+      await putDoc(env, "purchases", pid, doc);
+      return json({ purchase: Object.assign({ id: pid }, doc) });
+    }
+
+    case "/api/pharmacy/purchases": {
+      await requireUser(env, body.session, ["pharmacy", "billing"]);
+      return json({ purchases: (await listDocs(env, "purchases")).sort((a, b) => b.created - a.created).slice(0, 200) });
+    }
+
+    case "/api/pharmacy/alerts": {
+      await requireUser(env, body.session, ["pharmacy", "doctor", "billing"]);
+      const stock = await listDocs(env, "stock"), today = clinicNow(env).date, soon = addDays(today, 90);
+      const low = [], expiring = [], expired = [];
+      for (const s of stock) {
+        if ((Number(s.stock) || 0) <= (s.reorder ?? 10)) low.push({ id: s.id, name: `${s.form || ""} ${s.generic} ${s.strength || ""}`.trim(), stock: s.stock || 0, reorder: s.reorder ?? 10, category: s.category || "drug" });
+        for (const b of s.batches || []) {
+          if (!b.expiry || !b.qty) continue;
+          const e = b.expiry.length === 7 ? b.expiry + "-28" : b.expiry;
+          const row = { id: s.id, name: `${s.form || ""} ${s.generic} ${s.strength || ""}`.trim(), batch: b.batch, expiry: b.expiry, qty: b.qty, value: money(b.qty * (b.cost || 0)) };
+          if (e < today) expired.push(row); else if (e <= soon) expiring.push(row);
+        }
+      }
+      expiring.sort((a, b) => a.expiry.localeCompare(b.expiry));
+      return json({ low: low.sort((a, b) => a.stock - b.stock), expiring, expired, stock: stock.length });
+    }
+
+    // ----- reports -----
+    case "/api/reports/sales": {
+      await requireUser(env, body.session, ["billing"]);
+      await needFeature(env, "reports");
+      const today = clinicNow(env).date;
+      const from = /^\d{4}-\d{2}-\d{2}$/.test(body.from || "") ? body.from : today.slice(0, 8) + "01", to = /^\d{4}-\d{2}-\d{2}$/.test(body.to || "") ? body.to : today;
+      const by = body.groupBy === "month" ? 7 : 10;
+      const bills = (await listDocs(env, "bills", "json_extract(data, '$.date') >= ? AND json_extract(data, '$.date') <= ?", [from, to])).filter((b) => b.status !== "cancelled" && b.status !== "to-ip" && b.status !== "on-ip-bill");
+      const periods = {}, depts = {}, doctors = {}, branches = {};
+      for (const b of bills) {
+        const k = b.date.slice(0, by);
+        const P = (periods[k] = periods[k] || { period: k, billed: 0, collected: 0, opd: 0, pharmacy: 0, lab: 0, diagnostics: 0, ip: 0 });
+        P.billed = money(P.billed + b.total); P.collected = money(P.collected + b.paid); P[b.dept] = money((P[b.dept] || 0) + b.total);
+        depts[b.dept] = money((depts[b.dept] || 0) + b.total);
+        const br = b.branch || "Main"; branches[br] = money((branches[br] || 0) + b.total);
+      }
+      // Doctor-wise: patients seen, prescriptions, OPD and linked department revenue
+      const visits = await listDocs(env, "visits", "json_extract(data, '$.date') >= ? AND json_extract(data, '$.date') <= ?", [from, to]);
+      const vById = Object.fromEntries(visits.map((v) => [v.id, v]));
+      for (const v of visits) { const d = v.doctor?.name || "Not recorded"; const D2 = (doctors[d] = doctors[d] || { doctor: d, patients: 0, revenue: 0 }); D2.patients++; }
+      for (const b of bills) { const v = b.visitId && vById[b.visitId]; if (v) { const d = v.doctor?.name || "Not recorded"; const D2 = (doctors[d] = doctors[d] || { doctor: d, patients: 0, revenue: 0 }); D2.revenue = money(D2.revenue + b.total); } }
+      for (const a of await listDocs(env, "bills", "json_extract(data, '$.dept') = 'ip' AND json_extract(data, '$.date') >= ? AND json_extract(data, '$.date') <= ?", [from, to])) {
+        if (a.status === "cancelled") continue; const d = a.doctor || "Not recorded"; const D2 = (doctors[d] = doctors[d] || { doctor: d, patients: 0, revenue: 0 }); D2.revenue = money(D2.revenue + a.total);
+      }
+      const exps = (await listDocs(env, "expenses")).filter((e) => e.date >= from && e.date <= to);
+      const expenses = money(exps.reduce((x, e) => x + (Number(e.amount) || 0), 0));
+      const expByCat = {};
+      for (const e of exps) expByCat[e.category || "Other"] = money((expByCat[e.category || "Other"] || 0) + (Number(e.amount) || 0));
+      const billed = money(bills.reduce((x, b) => x + b.total, 0)), collected = money(bills.reduce((x, b) => x + b.paid, 0));
+      const goals = (await listDocs(env, "goals")).filter((g) => g.month && g.month >= from.slice(0, 7) && g.month <= to.slice(0, 7));
+      return json({ from, to, billed, collected, expenses, net: money(collected - expenses), byPeriod: Object.values(periods).sort((a, b) => a.period.localeCompare(b.period)), byDept: depts,
+        byDoctor: Object.values(doctors).sort((a, b) => b.revenue - a.revenue), byBranch: branches, expByCat, goals, bills: bills.length });
+    }
+
+    case "/api/reports/dues": {
+      await requireUser(env, body.session, ["billing"]);
+      const bills = (await listDocs(env, "bills", "json_extract(data, '$.date') >= ?", [addDays(clinicNow(env).date, -365)])).filter((b) => (b.status === "unpaid" || b.status === "partial") && b.balance > 0.004);
+      const now = Date.now();
+      const rows = bills.map((b) => ({ id: b.id, no: b.no, dept: b.deptName, date: b.date, patient: b.patient, total: b.total, balance: b.balance, days: Math.floor((now - b.created) / 864e5) })).sort((a, b) => b.days - a.days);
+      const ip = [];
+      for (const a of await listDocs(env, "admissions", "json_extract(data, '$.status') = 'admitted'")) { const acc = await ipAccount(env, a); if (acc.due > 0) ip.push({ id: a.id, no: a.no, patient: a.patient, ward: a.ward, total: acc.total, advance: acc.advance, due: acc.due }); }
+      const age = { "0–30 days": 0, "31–60 days": 0, "61–90 days": 0, "90+ days": 0 };
+      for (const r of rows) age[r.days <= 30 ? "0–30 days" : r.days <= 60 ? "31–60 days" : r.days <= 90 ? "61–90 days" : "90+ days"] = money(age[r.days <= 30 ? "0–30 days" : r.days <= 60 ? "31–60 days" : r.days <= 90 ? "61–90 days" : "90+ days"] + r.balance);
+      return json({ bills: rows, inpatients: ip, ageing: age, total: money(rows.reduce((x, r) => x + r.balance, 0) + ip.reduce((x, r) => x + r.due, 0)) });
+    }
+
+    case "/api/reports/appointments": {
+      await requireUser(env, body.session, ["billing", "doctor"]);
+      const today = clinicNow(env).date;
+      const from = /^\d{4}-\d{2}-\d{2}$/.test(body.from || "") ? body.from : addDays(today, -30), to = /^\d{4}-\d{2}-\d{2}$/.test(body.to || "") ? body.to : today;
+      const rows = (await D.prepare("SELECT date, time, mode, status, source FROM appointments WHERE date >= ? AND date <= ?").bind(from, to).all()).results || [];
+      const count = (k) => rows.reduce((m, r) => { const v = typeof k === "function" ? k(r) : r[k] || "unknown"; m[v] = (m[v] || 0) + 1; return m; }, {});
+      const byDay = count("date"), byHour = count((r) => (r.time || "").slice(0, 2) + ":00"), byWeekday = count((r) => ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][new Date(r.date + "T00:00:00Z").getUTCDay()]);
+      const done = rows.filter((r) => r.status === "completed").length, noShow = rows.filter((r) => r.status === "no-show").length, cancelled = rows.filter((r) => r.status === "cancelled").length;
+      const visits = (await listDocs(env, "visits", "json_extract(data, '$.date') >= ? AND json_extract(data, '$.date') <= ?", [from, to])).length;
+      return json({ from, to, total: rows.length, completed: done, noShow, cancelled, noShowRate: rows.length ? Math.round((noShow / rows.length) * 100) : 0,
+        byMode: count("mode"), bySource: count((r) => r.source === "patient" ? "Online / QR" : "Desk / phone"), byStatus: count("status"), byDay, byHour, byWeekday, walkIns: visits });
+    }
+
+    // ----- bed board -----
+    case "/api/beds": {
+      await requireUser(env, body.session, ["staff", "doctor", "billing"]);
+      await needFeature(env, "ip");
+      const wards = (await listDocs(env, "wards")).sort((a, b) => (a.order || 0) - (b.order || 0) || String(a.name).localeCompare(String(b.name)));
+      const adm = await listDocs(env, "admissions", "json_extract(data, '$.status') = 'admitted'");
+      const used = new Set();
+      const out = wards.map((w) => {
+        const beds = String(w.beds || "").split(/[,\n]/).map((x) => x.trim()).filter(Boolean).map((bed) => {
+          const a = adm.find((x) => String(x.bed || "").trim().toLowerCase() === bed.toLowerCase() && (!w.match || x.ward === w.match || x.ward === w.name));
+          if (a) used.add(a.id);
+          return { bed, admission: a ? { id: a.id, no: a.no, patient: a.patient, doctor: a.doctor, day: Math.max(1, Math.ceil((Date.now() - a.admittedAt) / 864e5)), reason: a.reason } : null, blocked: (w.blocked || []).includes(bed) };
+        });
+        return { id: w.id, name: w.name, match: w.match || "", beds, free: beds.filter((b) => !b.admission && !b.blocked).length, occupied: beds.filter((b) => b.admission).length };
+      });
+      const unassigned = adm.filter((a) => !used.has(a.id)).map((a) => ({ id: a.id, no: a.no, patient: a.patient, ward: a.ward, bed: a.bed }));
+      return json({ wards: out, unassigned, totals: { beds: out.reduce((x, w) => x + w.beds.length, 0), occupied: out.reduce((x, w) => x + w.occupied, 0), free: out.reduce((x, w) => x + w.free, 0) } });
+    }
+
+    // ----- insurance claims -----
+    case "/api/claims/action": {
+      const me = await requireUser(env, body.session, ["billing"]);
+      await needFeature(env, "insurance");
+      const id = String(body.id || "");
+      const c = await getDoc(env, "claims", id);
+      if (!c) throw new HttpError(404, "Claim not found");
+      const steps = { submit: "pre-auth sent", approve: "approved", query: "query", reject: "rejected", enhance: "enhancement sent", final: "final claim sent", settle: "settled", close: "closed" };
+      const st = steps[body.action];
+      if (!st) throw new HttpError(400, "Unknown step");
+      c.status = st;
+      const amt = money(body.amount);
+      if (body.action === "approve") c.approved = money((c.approved || 0) + amt);
+      if (body.action === "settle") {
+        c.settled = amt; c.deduction = money(body.deduction); c.utr = clean(body.utr, 60);
+        if (c.billId && amt > 0) {
+          const b = await getDoc(env, "bills", c.billId);
+          if (b && b.status !== "cancelled") { const pay = Math.min(amt, Math.max(0, b.balance)); if (pay > 0) { b.payments.push({ amount: pay, mode: "Insurance", ref: `${c.no} ${c.utr}`.trim(), at: Date.now(), by: me.user.name || me.role }); computeBill(b); await putDoc(env, "bills", c.billId, b); } }
+        }
+      }
+      c.log = (c.log || []).concat([{ step: st, amount: amt, note: clean(body.note, 500), at: Date.now(), by: me.user.name || me.role }]).slice(-50);
+      await putDoc(env, "claims", id, c);
+      return json({ claim: Object.assign({ id }, c) });
+    }
+
+    // ----- notifications -----
+    case "/api/notify/list": {
+      const s2 = await readSession(env, body.session);
+      if (s2.role === "patient") return json({ items: [] });
+      const name = s2.user.name || "";
+      const list = (await listDocs(env, "notifications", "json_extract(data, '$.at') >= ?", [Date.now() - 14 * 864e5]))
+        .filter((n) => n.to === "role:" + s2.role || n.to === "user:" + name || (s2.role === "admin" && n.to.startsWith("role:")))
+        .sort((a, b) => b.at - a.at).slice(0, 60).map((n) => ({ id: n.id, title: n.title, body: n.body, link: n.link, at: n.at, read: (n.readBy || []).includes(s2.uid) }));
+      return json({ items: list, unread: list.filter((n) => !n.read).length });
+    }
+
+    case "/api/notify/read": {
+      const s2 = await readSession(env, body.session);
+      const ids = Array.isArray(body.ids) ? body.ids.slice(0, 100) : [];
+      for (const id of ids) { const n = await getDoc(env, "notifications", String(id)); if (n && !(n.readBy || []).includes(s2.uid)) { n.readBy = (n.readBy || []).concat([s2.uid]).slice(-200); await putDoc(env, "notifications", String(id), n); } }
+      return json({ ok: true });
+    }
+
+    // ----- chat with patients -----
+    case "/api/chat/threads": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      await needFeature(env, "chat");
+      const msgs = await listDocs(env, "messages", "json_extract(data, '$.at') >= ?", [Date.now() - 90 * 864e5]);
+      const t = {};
+      for (const m of msgs) { const x = (t[m.patientId] = t[m.patientId] || { patientId: m.patientId, name: m.patientName, last: null, unread: 0 }); if (!x.last || m.at > x.last.at) x.last = { text: m.text, at: m.at, from: m.from }; if (m.from === "patient" && !m.read) x.unread++; }
+      return json({ threads: Object.values(t).sort((a, b) => b.last.at - a.last.at) });
+    }
+
+    case "/api/chat/get": {
+      let pid, who;
+      const s2 = await readSession(env, body.session);
+      if (s2.role === "patient") { pid = s2.uid; who = "patient"; }
+      else { await requireUser(env, body.session, ["doctor", "staff", "billing"]); pid = String(body.patientId || "").toUpperCase(); who = "clinic"; }
+      const msgs = (await listDocs(env, "messages", "json_extract(data, '$.patientId') = ?", [pid])).sort((a, b) => a.at - b.at).slice(-200);
+      for (const m of msgs) if (!m.read && m.from !== who) { m.read = true; const id = m.id; delete m.id; await putDoc(env, "messages", id, m); m.id = id; }
+      return json({ messages: msgs });
+    }
+
+    case "/api/chat/send": {
+      const s2 = await readSession(env, body.session);
+      const text = clean(body.text, 2000);
+      if (!text) throw new HttpError(400, "Write a message");
+      let pid, name, from, by;
+      if (s2.role === "patient") { pid = s2.uid; name = s2.user.name; from = "patient"; by = s2.user.name; }
+      else {
+        await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+        pid = String(body.patientId || "").toUpperCase();
+        const p = await getDoc(env, "patients", pid);
+        if (!p) throw new HttpError(404, "Patient not found");
+        name = p.name; from = "clinic"; by = s2.user.name || s2.role;
+      }
+      await putDoc(env, "messages", crypto.randomUUID(), { patientId: pid, patientName: name, from, by, text, at: Date.now(), read: false });
+      if (from === "patient") await notify(env, { to: "role:staff", title: "New message from a patient", body: `${name}: ${text.slice(0, 120)}`, link: "msg-" + pid });
+      return json({ ok: true });
+    }
+
+    // ----- files: report photos and PDFs -----
+    case "/api/files/upload": {
+      const me = await requireUser(env, body.session, ["doctor", "staff", "lab", "diagnostics"]);
+      const data = String(body.data || "");
+      if (!/^[A-Za-z0-9+/=]+$/.test(data)) throw new HttpError(400, "File data is not valid");
+      if (data.length > 1200000) throw new HttpError(400, "File is too large. Keep it under 850 KB (photos are shrunk automatically).");
+      const type = ["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(body.type) ? body.type : "";
+      if (!type) throw new HttpError(400, "Only photos (JPG, PNG) and PDF files");
+      const id = crypto.randomUUID();
+      await putDoc(env, "files", id, { name: clean(body.name, 120) || "report", type, data, patientId: String(body.patientId || "").toUpperCase(), orderId: clean(body.orderId, 64), visitId: clean(body.visitId, 64), at: Date.now(), by: me.user.name || me.role });
+      if (body.orderId) { const o = await getDoc(env, "orders", String(body.orderId)); if (o) { o.files = (o.files || []).concat([id]).slice(-10); await putDoc(env, "orders", String(body.orderId), o); } }
+      return json({ id });
+    }
+
+    case "/api/files/list": {
+      await requireUser(env, body.session, ["doctor", "staff", "lab", "diagnostics"]);
+      const pid = String(body.patientId || "").toUpperCase();
+      const rows = (await D.prepare("SELECT id, json_extract(data, '$.name') AS name, json_extract(data, '$.type') AS type, json_extract(data, '$.at') AS at, json_extract(data, '$.by') AS by, json_extract(data, '$.orderId') AS orderId FROM docs WHERE coll = 'files' AND json_extract(data, '$.patientId') = ?").bind(pid).all()).results || [];
+      return json({ files: rows.sort((a, b) => b.at - a.at) });
+    }
+
+    case "/api/files/get": {
+      const s2 = await readSession(env, body.session);
+      const f = await getDoc(env, "files", String(body.id || ""));
+      if (!f) throw new HttpError(404, "File not found");
+      if (s2.role === "patient" && f.patientId !== s2.uid) throw new HttpError(403, "Not your file");
+      return json({ name: f.name, type: f.type, data: f.data });
+    }
+
+    // ----- WhatsApp and online payment -----
+    case "/api/wa/send": {
+      // Sends through the WhatsApp Cloud API when the clinic has set it up; otherwise returns a wa.me link to open.
+      const me = await requireUser(env, body.session, ["doctor", "staff", "billing", "pharmacy", "lab", "diagnostics"]);
+      const phone = digits(body.phone), text = clean(body.text, 1500);
+      if (phone.length !== 10 || !text) throw new HttpError(400, "Enter a 10-digit mobile number and the message");
+      if (env.WHATSAPP_TOKEN && env.WHATSAPP_PHONE_ID) {
+        const r = await fetch(`https://graph.facebook.com/v20.0/${env.WHATSAPP_PHONE_ID}/messages`, { method: "POST", headers: { authorization: `Bearer ${env.WHATSAPP_TOKEN}`, "content-type": "application/json" },
+          body: JSON.stringify({ messaging_product: "whatsapp", to: "91" + phone, type: "text", text: { body: text } }) });
+        if (r.ok) return json({ sent: true });
+      }
+      return json({ sent: false, link: `https://wa.me/91${phone}?text=${encodeURIComponent(text)}`, by: me.role });
+    }
+
+    case "/api/pay/link": {
+      // UPI payment details for a bill; a Razorpay payment link when the clinic has added its keys.
+      await requireUser(env, body.session, ["billing", "pharmacy", "lab", "diagnostics", "staff"]);
+      const b = await getDoc(env, "bills", String(body.billId || ""));
+      if (!b) throw new HttpError(404, "Bill not found");
+      if (!(b.balance > 0)) throw new HttpError(400, "Nothing is due on this bill");
+      const c = await clinicInfo(env);
+      const upi = c.upi ? `upi://pay?pa=${encodeURIComponent(c.upi)}&pn=${encodeURIComponent(c.name)}&am=${b.balance.toFixed(2)}&cu=INR&tn=${encodeURIComponent("Bill " + b.no)}` : "";
+      let link = "";
+      if (env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET) {
+        const r = await fetch("https://api.razorpay.com/v1/payment_links", { method: "POST", headers: { authorization: "Basic " + btoa(env.RAZORPAY_KEY_ID + ":" + env.RAZORPAY_KEY_SECRET), "content-type": "application/json" },
+          body: JSON.stringify({ amount: Math.round(b.balance * 100), currency: "INR", description: `${c.name} · ${b.deptName} bill ${b.no}`, reference_id: String(body.billId),
+            customer: { name: b.patient.name, contact: b.patient.phone ? "+91" + b.patient.phone : undefined }, notify: { sms: !!b.patient.phone }, reminder_enable: true }) });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.short_url) link = j.short_url;
+      }
+      return json({ amount: b.balance, upi, link, no: b.no });
     }
 
     // ----- HMIS: inpatient chart -----
@@ -1557,6 +1917,8 @@ async function handle(request, env) {
         date: /^\d{4}-\d{2}-\d{2}$/.test(f.date || "") ? f.date : clinicNow(env).date, created: Date.now(), by: me.user.name || me.role, byId: me.uid };
       const id = crypto.randomUUID();
       await putDoc(env, "requests", id, r);
+      if (type === "consult") await notify(env, { to: r.toDoctor ? "user:" + r.toDoctor : "role:doctor", title: "Cross consultation request", body: `${r.patient.name} from ${r.by}: ${f.remarks || f.unit || ""}`, link: r.admissionId ? "ip-" + r.admissionId : "v-" + r.visitId });
+      if (type === "surgery") await notify(env, { to: "role:staff", title: "Surgery booked", body: `${r.patient.name}: ${f.procedure} on ${r.date} ${f.time || ""}`, link: "ot-" + id });
       return json({ request: Object.assign({ id }, r) });
     }
 
@@ -1795,7 +2157,7 @@ async function handle(request, env) {
       const b = isNew ? { dept, deptName: DEPT_NAMES[dept], payments: [], created: Date.now(), createdBy: me.user.name || me.role, date: clinicNow(env).date } : await getDoc(env, "bills", id);
       if (!b) throw new HttpError(404, "Bill not found");
       if (!isNew && (b.status === "cancelled" || b.status === "on-ip-bill" || (b.paid > 0 && me.role !== "admin"))) throw new HttpError(409, "This bill can't be changed now. Cancel it and make a new one.");
-      if (isNew) b.no = await nextNo(env, dept, DEPTS[dept]);
+      if (isNew) { b.no = await nextNo(env, dept, DEPTS[dept]); b.branch = me.user.branch || ""; }
       b.patient = billPatient(x.patient || b.patient);
       if (!b.patient.name) throw new HttpError(400, "Enter the patient's name");
       b.visitId = clean(x.visitId ?? b.visitId, 64);
@@ -2151,7 +2513,7 @@ h1{font:600 30px/1.2 "Segoe UI",system-ui;text-align:center;margin:4px 0 4px}
 const $=(i)=>document.getElementById(i);
 const store=()=>{try{return localStorage.getItem("rx_remember")==="0"?sessionStorage:localStorage}catch{return null}};
 const NEXT=(new URLSearchParams(location.search).get("next")||"").replace(/[^a-z/]/g,"");
-const dest=(role)=>NEXT||(["doctor","staff","admin","billing"].includes(role)?"/hmis":"/portal");
+const dest=(role)=>NEXT||(["doctor","staff","admin","billing","pharmacy","lab","diagnostics"].includes(role)?"/hmis":"/portal");
 try{const s=localStorage.getItem("rx_session")||sessionStorage.getItem("rx_session");if(s&&!location.hash.includes("new"))location.replace(dest(localStorage.getItem("rx_role")||sessionStorage.getItem("rx_role")))}catch{}
 try{$("u").value=localStorage.getItem("rx_user")||""}catch{}
 $("eye").onclick=()=>{const t=$("p").type==="password";$("p").type=t?"text":"password";$("eye").textContent=t?"Hide":"Show"};
@@ -2461,7 +2823,10 @@ td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}tr
 .empty{padding:24px;text-align:center;color:var(--muted)}
 /* chart */
 .chart{display:grid;grid-template-columns:230px minmax(0,1fr);gap:12px;align-items:start}.chart>section,.side{min-width:0}.rx td:nth-child(2){min-width:170px}.rx td:nth-child(8){min-width:150px}
-.side{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:hidden;position:sticky;top:58px}
+.side{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:hidden;position:sticky;top:100px}
+.nav{background:#fff;border-bottom:1px solid var(--line);display:flex;gap:2px;align-items:center;padding:4px max(14px,env(safe-area-inset-left));overflow-x:auto;position:sticky;top:50px;z-index:19}
+.nav a{padding:7px 12px;border-radius:6px;text-decoration:none;color:var(--muted);font-weight:600;white-space:nowrap;font-size:13.5px}.nav a.on{background:var(--soft);color:var(--head)}.nav .sp{flex:1}
+#bell{border:0;background:none;font-size:18px;position:relative;padding:4px 8px}#bn{position:absolute;top:0;right:0;background:var(--red);color:#fff;border-radius:999px;font-size:10px;padding:1px 5px;display:none;font-style:normal}
 .side .ban{background:var(--banner);font-weight:700;padding:6px 10px;text-transform:uppercase;font-size:13px}
 .side .id{display:flex;gap:10px;padding:10px;align-items:center;border-bottom:1px solid var(--line)}.av{width:52px;height:52px;border-radius:8px;background:#dfe7ea;display:grid;place-items:center;font:700 20px Georgia,serif;color:var(--head);flex:none}
 .side dl{margin:0;padding:8px 10px;display:grid;gap:6px;border-bottom:1px solid var(--line)}.side dt{font-size:11px;color:var(--muted)}.side dd{margin:0;font-weight:600;font-size:12.5px}
@@ -2517,7 +2882,7 @@ const ic=(k,c="currentColor")=>'<svg viewBox="0 0 24 24" fill="none" stroke="'+c
 let ME={},DASH=null,FILTER="all";
 
 async function route(){const h=location.hash;let m;if((m=h.match(/^#v-(.+)$/)))return chart(m[1]);if((m=h.match(/^#ip-(.+)$/)))return ipChart(m[1]);if((m=h.match(/^#ot-(.+)$/)))return otRecord(m[1]);if(h==="#ot")return otList();return dashboard()}
-window.onhashchange=route;
+window.onhashchange=()=>route();
 
 // ---------- dashboard ----------
 async function dashboard(date){
@@ -2925,6 +3290,352 @@ function drawOt(){
   $("#sv")&&($("#sv").onclick=()=>{const c=$$("#cb tr").map(tr=>{const x={};$$("[data-k]",tr).forEach(i=>x[i.dataset.k]=i.value);return {desc:x.desc,qty:+x.qty||1,rate:+x.rate||0}}).filter(x=>x.desc&&x.rate>0);if(!c.length)return toast("Enter at least one charge with a rate");otSave({charges:c},"Charges added to the inpatient bill")})}
 }
 
+// ================= menu, notifications, modules =================
+let PLANF=null;
+const has=(f)=>!PLANF||PLANF[f]!==false;
+const MENU=[["","Dashboard",["doctor","staff","billing"],null],["beds","Beds",["doctor","staff","billing"],"ip"],["ot","Theatre",["doctor","staff","billing"],"ot"],["followups","Follow-ups",["doctor","staff","billing"],null],
+ ["pharmacy","Pharmacy",["pharmacy"],null],["lab","Lab & scans",["lab","diagnostics"],null],["insurance","Insurance",["billing"],"insurance"],["homecare","Home care",["doctor","staff","billing"],"homecare"],
+ ["camps","Camps",["doctor","staff","billing"],"mobileunit"],["accounts","Accounts",["billing"],"reports"],["messages","Messages",["doctor","staff","billing"],"chat"]];
+const canSee=(roles)=>ME.role==="admin"||roles.includes(ME.role);
+async function ensureMe(){
+ if(!ME.role){const m=await api("/api/me");ME={name:m.user?.name,role:m.role,branch:m.user?.branch||""};$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role}
+ if(!PLANF){try{PLANF=(await api("/api/plan")).plan.features}catch{PLANF={}}}
+ drawMenu();
+}
+function drawMenu(){
+ let nav=$("#nav");if(!nav){nav=document.createElement("nav");nav.id="nav";nav.className="nav";$(".top").after(nav)}
+ const cur=(location.hash.replace("#","").split("-")[0])||"";
+ nav.innerHTML=MENU.filter(([,,r,f])=>canSee(r)&&(!f||has(f))).map(([h,l])=>'<a href="#'+h+'" class="'+(cur===h||(h===""&&["v","ip"].includes(cur))||(h==="ot"&&cur==="ot")?"on":"")+'">'+l+'</a>').join("")+'<span class="sp"></span><button id="bell" title="Notifications">🔔<b id="bn"></b></button>';
+ $("#bell").onclick=showBell;bellCount();
+}
+async function bellCount(){try{const r=await api("/api/notify/list");$("#bn").textContent=r.unread||"";$("#bn").style.display=r.unread?"inline-block":"none";window._notes=r.items}catch{}}
+setInterval(()=>{if(document.visibilityState==="visible"&&ME.role)bellCount()},60000);
+function showBell(){const items=window._notes||[];const m=document.createElement("div");m.className="modal";
+ m.innerHTML='<div><h3 style="margin-top:0">Notifications</h3>'+(items.length?items.map(n=>'<div class="note" style="margin-bottom:6px;cursor:pointer;'+(n.read?"opacity:.6":"")+'" data-l="'+esc(n.link)+'"><h5>'+esc(n.title)+'</h5><div>'+esc(n.body)+'</div><div class="m">'+tm(n.at)+'</div></div>').join(""):'<div class="empty">Nothing new.</div>')+'<div class="acts"><button class="btn p" id="nc">Close</button></div></div>';
+ document.body.appendChild(m);$("#nc",m).onclick=()=>m.remove();
+ $$("[data-l]",m).forEach(d=>d.onclick=()=>{m.remove();if(d.dataset.l)location.hash=d.dataset.l});
+ const ids=items.filter(n=>!n.read).map(n=>n.id);if(ids.length)api("/api/notify/read",{ids}).then(bellCount).catch(()=>{});}
+const shell=(title,tabs,cur,cb)=>'<div class="bar2"><h1>'+esc(title)+'</h1><div class="sp"></div></div>'+(tabs?'<div class="sub">'+tabs.map(([k,l])=>'<button data-tb="'+k+'" class="'+(cur===k?"on":"")+'">'+l+'</button>').join("")+'</div>':"")+'<div id="mb"></div>';
+function bindTabs(set){$$("[data-tb]").forEach(b=>b.onclick=()=>set(b.dataset.tb))}
+const tiles=(arr)=>'<div class="tiles" style="grid-template-columns:repeat('+Math.min(arr.length,5)+',minmax(0,1fr))">'+arr.map(([l,v,c,s])=>'<div class="tile" style="background:var(--'+(c||"t4")+');cursor:default"><b style="grid-column:1/-1">'+esc(v)+'</b><span class="n" style="grid-column:1/-1">'+esc(l)+'</span>'+(s?'<div class="s">'+esc(s)+'</div>':"")+'</div>').join("")+'</div>';
+const bars=(rows,max)=>'<div style="display:grid;gap:6px">'+rows.map(([l,v,t])=>'<div style="display:grid;grid-template-columns:120px 1fr 110px;gap:8px;align-items:center;font-size:12.5px"><span>'+esc(l)+'</span><span style="background:#e4ecee;border-radius:4px;height:12px;overflow:hidden"><i style="display:block;height:100%;background:var(--accent);width:'+(max?Math.round(v/max*100):0)+'%"></i></span><b style="text-align:right">'+esc(t??v)+'</b></div>').join("")+'</div>';
+async function findPatient(q){const r=await api("/api/patients/search",{q});if(!r.patients.length)throw new Error("No patient found");return r.patients[0]}
+async function waSend(phone,text){if(!phone)return toast("No mobile number");try{const r=await api("/api/wa/send",{phone,text});if(r.sent)toast("WhatsApp message sent");else window.open(r.link,"_blank")}catch(e){toast(e.message)}}
+
+// ---------- pharmacy ----------
+let PTAB="alerts";
+async function pagePharmacy(){
+ $("#app").innerHTML=shell("Pharmacy",[["alerts","Alerts"],["purchase","Purchases"],["stock","Stock"]],PTAB);bindTabs(t=>{PTAB=t;pagePharmacy()});const mb=$("#mb");
+ if(PTAB==="alerts"){const a=await api("/api/pharmacy/alerts");
+  mb.innerHTML=tiles([["Low stock",a.low.length,"t2"],["Expiring in 90 days",a.expiring.length,"t5"],["Expired",a.expired.length,"t5"],["Items in stock list",a.stock,"t3"]])+'<div class="grid2">'+
+  panel("Low stock (at or below reorder level)",["Item","Stock","Reorder at","Type"],a.low.map(x=>'<tr><td>'+esc(x.name)+'</td><td style="color:var(--red);font-weight:700">'+x.stock+'</td><td>'+x.reorder+'</td><td>'+esc(x.category)+'</td></tr>'),"All items are above their reorder level")+
+  panel("Expiring soon",["Item","Batch","Expiry","Qty"],a.expiring.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.batch)+'</td><td style="color:var(--amber);font-weight:600">'+esc(x.expiry)+'</td><td>'+x.qty+'</td></tr>'),"Nothing expires in the next 90 days")+
+  panel("Expired: remove from shelves",["Item","Batch","Expiry","Qty"],a.expired.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.batch)+'</td><td style="color:var(--red);font-weight:700">'+esc(x.expiry)+'</td><td>'+x.qty+'</td></tr>'),"No expired stock")+'</div>'}
+ else if(PTAB==="purchase"){let sup=[];try{sup=(await api("/api/rec/list",{coll:"suppliers"})).items}catch{}const pu=(await api("/api/pharmacy/purchases")).purchases;
+  const row='<tr><td><select data-k="category"><option value="drug">Drug</option><option value="non-drug">Non-drug</option></select></td><td><input data-k="generic" placeholder="Generic / item"></td><td><input data-k="strength"></td><td><input data-k="form" value="Tab"></td><td><input data-k="brand"></td><td><input data-k="batch"></td><td><input data-k="expiry" type="month"></td><td><input data-k="qty" inputmode="numeric"></td><td><input data-k="cost" inputmode="decimal"></td><td><input data-k="mrp" inputmode="decimal"></td><td><button class="btn d" data-x>✕</button></td></tr>';
+  mb.innerHTML='<div class="panel" style="margin-bottom:12px"><h3>New purchase (stock in)</h3><div class="pb" id="pf"><div class="fr">'+fld("supplier","Supplier",{list:"sups"})+fld("invoice","Invoice no")+fld("date","Invoice date",{type:"date",v:today()})+fld("paid","Paid?",{opts:["Not paid","Paid"]})+'</div><datalist id="sups">'+sup.map(x=>'<option value="'+esc(x.name)+'">').join("")+'</datalist>'+
+  '<div style="overflow:auto"><table class="rx" style="min-width:1100px"><thead><tr><th>Type</th><th>Item</th><th>Strength</th><th>Form</th><th>Brand</th><th>Batch</th><th>Expiry</th><th>Qty</th><th>Cost/unit</th><th>MRP/unit</th><th></th></tr></thead><tbody id="pb">'+row+row+'</tbody></table></div><div><button class="btn" id="pa">+ Row</button></div><div class="acts"><button class="btn p" id="ps">Save purchase and add to stock</button></div></div></div>'+
+  '<div class="grid2" style="grid-template-columns:minmax(0,1.6fr) minmax(0,1fr)">'+panel("Purchases",["No","Date","Supplier","Invoice","Items","Total"],pu.map(x=>'<tr><td>'+esc(x.no)+'</td><td>'+dt(x.date)+'</td><td>'+esc(x.supplier)+'</td><td>'+esc(x.invoice)+'</td><td>'+x.lines.length+'</td><td>'+inr(x.total)+(x.paid?"":' <span class="pill amb">Unpaid</span>')+'</td></tr>'),"No purchases yet")+
+  '<div class="panel"><h3>Suppliers</h3><div class="pb" id="sf"><div class="fr">'+fld("name","Name")+fld("phone","Phone")+fld("gstin","GSTIN")+'</div><div class="acts"><button class="btn p" id="ss">Add supplier</button></div>'+sup.map(x=>'<div>'+esc(x.name)+' · '+esc(x.phone||"")+' '+esc(x.gstin||"")+'</div>').join("")+'</div></div></div>';
+  const bindX=()=>$$("[data-x]").forEach(b=>b.onclick=()=>b.closest("tr").remove());bindX();
+  $("#pa").onclick=()=>{$("#pb").insertAdjacentHTML("beforeend",row);bindX()};
+  $("#ps").onclick=async()=>{const f=readForm($("#pf"));const items=$$("#pb tr").map(tr=>{const o={};$$("[data-k]",tr).forEach(x=>o[x.dataset.k]=x.value.trim());return o}).filter(x=>x.generic&&+x.qty>0);
+   if(!items.length)return toast("Enter at least one item with quantity");try{const r=await api("/api/pharmacy/purchase",{supplier:f.supplier,invoice:f.invoice,date:f.date,paid:f.paid==="Paid",items});toast("Purchase "+r.purchase.no+" saved: "+r.purchase.lines.length+" items added to stock");pagePharmacy()}catch(e){toast(e.message)}};
+  $("#ss").onclick=async()=>{const f=readForm($("#sf"));if(!f.name)return toast("Enter the supplier name");try{await api("/api/rec/save",{coll:"suppliers",item:f});pagePharmacy()}catch(e){toast(e.message)}}}
+ else{const st=(await api("/api/pharmacy/stock")).stock;let q="",cat="all";
+  const draw=()=>{const L=st.filter(s=>(cat==="all"||(s.category||"drug")===cat)&&(!q||(s.generic+" "+(s.brand||"")).toLowerCase().includes(q)));
+   $("#sl").innerHTML='<table><thead><tr><th>Item</th><th>Type</th><th>Stock</th><th>Reorder at</th><th>MRP</th><th>Batches (expiry · qty)</th><th></th></tr></thead><tbody>'+L.map(s=>'<tr data-id="'+s.id+'"><td><b>'+esc([s.form,s.generic,s.strength].filter(Boolean).join(" "))+'</b><br><small>'+esc(s.brand||"")+'</small></td><td><select data-k="category"><option value="drug"'+((s.category||"drug")==="drug"?" selected":"")+'>Drug</option><option value="non-drug"'+(s.category==="non-drug"?" selected":"")+'>Non-drug</option></select></td><td><input data-k="stock" value="'+(s.stock||0)+'" style="width:70px"></td><td><input data-k="reorder" value="'+(s.reorder??10)+'" style="width:60px"></td><td><input data-k="price" value="'+(s.price||0)+'" style="width:70px"></td><td style="font-size:12px">'+(s.batches||[]).map(b=>esc((b.batch||"–")+" · "+(b.expiry||"–")+" · "+b.qty)).join("<br>")+'</td><td><button class="btn" data-sv>Save</button></td></tr>').join("")+'</tbody></table>';
+   $$("[data-sv]").forEach(b=>b.onclick=async()=>{const tr=b.closest("tr"),s=st.find(x=>x.id===tr.dataset.id),o={};$$("[data-k]",tr).forEach(x=>o[x.dataset.k]=x.value);
+    try{await api("/api/pharmacy/stock/save",{item:Object.assign({},s,{stock:+o.stock,reorder:+o.reorder,price:+o.price,category:o.category})});toast("Saved")}catch(e){toast(e.message)}})};
+  mb.innerHTML='<div class="bar2"><input id="sq" class="chip" placeholder="Search"><button class="chip on" data-c="all">All</button><button class="chip" data-c="drug">Drugs</button><button class="chip" data-c="non-drug">Non-drug</button></div><div class="tbl-wrap" id="sl"></div>';
+  $("#sq").oninput=(e)=>{q=e.target.value.toLowerCase();draw()};$$("[data-c]").forEach(b=>b.onclick=()=>{cat=b.dataset.c;$$("[data-c]").forEach(x=>x.classList.toggle("on",x===b));draw()});draw()}
+}
+
+// ---------- files ----------
+function pickFile(){return new Promise(res=>{const i=document.createElement("input");i.type="file";i.accept="image/*,application/pdf";i.onchange=()=>res(i.files[0]);i.click()})}
+async function toB64(file){
+ if(file.type.startsWith("image/")){const img=await createImageBitmap(file);const s=Math.min(1,1600/Math.max(img.width,img.height));const c=document.createElement("canvas");c.width=Math.round(img.width*s);c.height=Math.round(img.height*s);c.getContext("2d").drawImage(img,0,0,c.width,c.height);return {type:"image/jpeg",data:c.toDataURL("image/jpeg",.75).split(",")[1]}}
+ if(file.size>850000)throw new Error("PDF is too large. Keep it under 850 KB.");
+ const u=new Uint8Array(await file.arrayBuffer());let bin="";for(let i=0;i<u.length;i+=8192)bin+=String.fromCharCode(...u.subarray(i,i+8192));return {type:"application/pdf",data:btoa(bin)}}
+async function uploadFor(meta){const f=await pickFile();if(!f)return false;try{const b=await toB64(f);await api("/api/files/upload",Object.assign({name:f.name,type:b.type,data:b.data},meta));toast("Uploaded");return true}catch(e){toast(e.message);return false}}
+async function viewFile(id){try{const f=await api("/api/files/get",{id});const url="data:"+f.type+";base64,"+f.data;
+ const m=document.createElement("div");m.className="modal";m.innerHTML='<div style="max-width:900px"><h3 style="margin-top:0">'+esc(f.name)+'</h3>'+(f.type==="application/pdf"?'<iframe src="'+url+'" style="width:100%;height:70vh;border:1px solid var(--line)"></iframe>':'<img src="'+url+'" style="max-width:100%">')+'<div class="acts"><a class="btn" download="'+esc(f.name)+'" href="'+url+'">Download</a><button class="btn p" id="fc">Close</button></div></div>';
+ document.body.appendChild(m);$("#fc",m).onclick=()=>m.remove()}catch(e){toast(e.message)}}
+
+// ---------- lab and diagnostics ----------
+async function pageLab(){
+ const kind=ME.role==="diagnostics"?"imaging":"lab";const o=(await api("/api/orders/list",{kind})).orders;
+ $("#app").innerHTML=shell(ME.role==="diagnostics"?"Diagnostics":"Lab")+'';
+ $("#mb").innerHTML='<div class="tbl-wrap"><table><thead><tr><th>Test</th><th>Patient</th><th>Ordered</th><th>Status</th><th>Files</th><th></th></tr></thead><tbody>'+(o.length?o.map(x=>'<tr data-id="'+x.id+'"><td><b>'+esc(x.test)+'</b><br><small>'+esc(x.modality||"Lab")+'</small></td><td>'+esc(x.patient?.name)+'<br><small>'+esc(x.patient?.id||"")+' · token '+esc(x.token)+'</small></td><td>'+tm(x.orderedAt)+'</td><td>'+(x.status==="reported"?'<span class="pill grn">Reported</span>':'<span class="pill amb">'+esc(x.status)+'</span>')+'</td><td>'+(x.files||[]).map((f,i)=>'<button class="btn" data-f="'+f+'">File '+(i+1)+'</button>').join(" ")+'</td><td style="white-space:nowrap"><button class="btn" data-up>Upload photo/PDF</button> '+(x.status!=="reported"?'<button class="btn p" data-rep>Enter report</button>':"")+'</td></tr>').join(""):'<tr><td colspan="6" class="empty">No orders.</td></tr>')+'</tbody></table></div>';
+ $$("[data-f]").forEach(b=>b.onclick=()=>viewFile(b.dataset.f));
+ $$("[data-up]").forEach(b=>b.onclick=async()=>{const x=o.find(y=>y.id===b.closest("tr").dataset.id);if(await uploadFor({orderId:x.id,patientId:x.patient?.id,visitId:x.visitId}))pageLab()});
+ $$("[data-rep]").forEach(b=>b.onclick=()=>{const x=o.find(y=>y.id===b.closest("tr").dataset.id);const m=document.createElement("div");m.className="modal";
+  m.innerHTML='<div><h3 style="margin-top:0">'+esc(x.test)+' · '+esc(x.patient?.name)+'</h3><div id="rf">'+fld("result",kind==="imaging"?"Findings":"Results (values with units and ranges)",{rows:8})+fld("impression",kind==="imaging"?"Impression":"Comment",{rows:2})+'</div><div class="acts"><button class="btn" id="rc">Cancel</button><button class="btn p" id="rs">Send report</button></div></div>';
+  document.body.appendChild(m);$("#rc",m).onclick=()=>m.remove();$("#rs",m).onclick=async()=>{const f=readForm($("#rf",m));try{await api("/api/orders/update",{id:x.id,status:"reported",result:f.result,impression:f.impression});m.remove();toast("Report sent to the doctor");pageLab()}catch(e){toast(e.message)}}});
+}
+
+// ---------- accounts ----------
+let ATAB="sales",AF={from:today().slice(0,8)+"01",to:today(),g:"day"};
+const EXPCAT=["Salary","Rent","Electricity","Water","Internet & phone","Consumables","Medicines purchase","Equipment","Maintenance","Marketing","Bank charges","Taxes","Other"];
+async function pageAccounts(){
+ const tabs=[["sales","Sales"],["doctors","Doctor revenue"],["dues","Dues"],["expenses","Expenses"],["goals","Goals"],["appts","Appointments"],["branches","Branches"]];
+ $("#app").innerHTML=shell("Accounts",tabs,ATAB);bindTabs(t=>{ATAB=t;pageAccounts()});const mb=$("#mb");
+ const range='<div class="bar2">From <input type="date" id="af" class="chip" value="'+AF.from+'"> to <input type="date" id="at" class="chip" value="'+AF.to+'">'+(ATAB==="sales"?' <select id="ag" class="chip"><option value="day"'+(AF.g==="day"?" selected":"")+'>By day</option><option value="month"'+(AF.g==="month"?" selected":"")+'>By month</option></select>':"")+' <button class="chip" data-q="m">This month</button><button class="chip" data-q="y">This year</button><button class="chip" data-q="l">Last month</button></div>';
+ const bindRange=()=>{$("#af")&&($("#af").onchange=e=>{AF.from=e.target.value;pageAccounts()});$("#at")&&($("#at").onchange=e=>{AF.to=e.target.value;pageAccounts()});$("#ag")&&($("#ag").onchange=e=>{AF.g=e.target.value;pageAccounts()});
+  $$("[data-q]").forEach(b=>b.onclick=()=>{const t=today();if(b.dataset.q==="m"){AF.from=t.slice(0,8)+"01";AF.to=t;AF.g="day"}else if(b.dataset.q==="y"){AF.from=t.slice(0,5)+"01-01";AF.to=t;AF.g="month"}else{const d=new Date(t.slice(0,8)+"01T00:00:00Z");d.setUTCDate(0);AF.to=d.toISOString().slice(0,10);AF.from=AF.to.slice(0,8)+"01";AF.g="day"}pageAccounts()})};
+ if(["sales","doctors","branches","goals"].includes(ATAB)){
+  const r=await api("/api/reports/sales",{from:AF.from,to:AF.to,groupBy:AF.g});
+  if(ATAB==="sales"){const mx=Math.max(1,...r.byPeriod.map(p=>p.billed));
+   mb.innerHTML=range+tiles([["Billed",inr(r.billed),"t4"],["Collected",inr(r.collected),"t3"],["Expenses",inr(r.expenses),"t2"],["Net (collected − expenses)",inr(r.net),r.net>=0?"t3":"t5"],["Bills",r.bills,"t1"]])+
+   '<div class="grid2"><div class="panel"><h3>Billed by '+(AF.g==="month"?"month":"day")+'</h3><div class="pb">'+(r.byPeriod.length?bars(r.byPeriod.map(p=>[p.period,p.billed,inr(p.billed)]),mx):'<div class="empty">No bills in this period</div>')+'</div></div>'+
+   '<div class="panel"><h3>By department</h3><div class="pb">'+bars(Object.entries(r.byDept).map(([k,v])=>[{opd:"OPD",pharmacy:"Pharmacy",lab:"Lab",diagnostics:"Diagnostics",ip:"Inpatient"}[k]||k,v,inr(v)]),Math.max(1,...Object.values(r.byDept)))+'</div></div></div>'+
+   '<div class="tbl-wrap" style="margin-top:12px"><table><thead><tr><th>Period</th><th>OPD</th><th>Pharmacy</th><th>Lab</th><th>Diagnostics</th><th>Inpatient</th><th>Billed</th><th>Collected</th></tr></thead><tbody>'+r.byPeriod.map(p=>'<tr><td>'+esc(p.period)+'</td>'+["opd","pharmacy","lab","diagnostics","ip","billed","collected"].map(k=>'<td>'+inr(p[k])+'</td>').join("")+'</tr>').join("")+'</tbody></table></div>'+
+   (Object.keys(r.expByCat).length?'<div class="panel" style="margin-top:12px"><h3>Expenses by category</h3><div class="pb">'+bars(Object.entries(r.expByCat).map(([k,v])=>[k,v,inr(v)]),Math.max(...Object.values(r.expByCat)))+'</div></div>':"")}
+  else if(ATAB==="doctors"){const mx=Math.max(1,...r.byDoctor.map(d=>d.revenue));mb.innerHTML=range+'<div class="panel"><h3>Doctor-wise revenue</h3><div class="pb">'+(r.byDoctor.length?bars(r.byDoctor.map(d=>[d.doctor,d.revenue,inr(d.revenue)+" · "+d.patients+" pts"]),mx):'<div class="empty">No data</div>')+'</div></div><p class="m" style="color:var(--muted)">Revenue counts bills linked to each doctor\\'s OPD visits and inpatient final bills.</p>'}
+  else if(ATAB==="branches"){let br=[];try{br=(await api("/api/rec/list",{coll:"branches"})).items}catch{}
+   mb.innerHTML=range+'<div class="grid2"><div class="panel"><h3>Revenue by branch</h3><div class="pb">'+bars(Object.entries(r.byBranch).map(([k,v])=>[k,v,inr(v)]),Math.max(1,...Object.values(r.byBranch)))+'</div></div>'+
+   '<div class="panel"><h3>Branches</h3><div class="pb">'+br.map(b=>'<div>'+esc(b.name)+' · '+esc(b.address||"")+'</div>').join("")+(ME.role==="admin"?'<div id="bf" class="fr">'+fld("name","Branch name")+fld("address","Address")+'</div><div class="acts"><button class="btn p" id="ba">Add branch</button></div><p class="m" style="color:var(--muted)">Set each person\\'s branch in the app: Admin → Staff logins. Their bills are counted under that branch.</p>':"")+'</div></div></div>';
+   $("#ba")&&($("#ba").onclick=async()=>{const f=readForm($("#bf"));if(!f.name)return toast("Enter the name");try{await api("/api/rec/save",{coll:"branches",item:f});pageAccounts()}catch(e){toast(e.message)}})}
+  else{let G=[];try{G=(await api("/api/rec/list",{coll:"goals"})).items}catch{}
+   const mth=AF.to.slice(0,7);const g=G.find(x=>x.month===mth)||{};const m=await api("/api/reports/sales",{from:mth+"-01",to:AF.to,groupBy:"month"});
+   const prog=(l,t,v)=>t>0?'<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between"><b>'+l+'</b><span>'+inr(v)+' of '+inr(t)+' · '+Math.round(v/t*100)+'%</span></div><div style="background:#e4ecee;border-radius:6px;height:14px;overflow:hidden"><i style="display:block;height:100%;width:'+Math.min(100,Math.round(v/t*100))+'%;background:'+(v>=t?"var(--green)":"var(--accent)")+'"></i></div></div>':"";
+   mb.innerHTML='<div class="bar2">Month <input type="month" id="gm" class="chip" value="'+mth+'"></div><div class="grid2"><div class="panel"><h3>Progress · '+mth+'</h3><div class="pb">'+(g.total?prog("Total",+g.total,m.billed)+["opd","pharmacy","lab","diagnostics","ip"].map(k=>prog({opd:"OPD",pharmacy:"Pharmacy",lab:"Lab",diagnostics:"Diagnostics",ip:"Inpatient"}[k],+g[k]||0,m.byDept[k]||0)).join(""):'<div class="empty">No goal set for this month.</div>')+'</div></div>'+
+   (ME.role==="admin"?'<div class="panel"><h3>Set goals for '+mth+'</h3><div class="pb" id="gf"><div class="fr">'+[["total","Total ₹"],["opd","OPD ₹"],["pharmacy","Pharmacy ₹"],["lab","Lab ₹"],["diagnostics","Diagnostics ₹"],["ip","Inpatient ₹"]].map(([k,l])=>fld(k,l,{v:g[k]||""})).join("")+'</div><div class="acts"><button class="btn p" id="gs">Save goals</button></div></div></div>':"")+'</div>';
+   $("#gm").onchange=e=>{AF.to=e.target.value+"-28";AF.from=e.target.value+"-01";pageAccounts()};
+   $("#gs")&&($("#gs").onclick=async()=>{const f=readForm($("#gf"));Object.keys(f).forEach(k=>f[k]=+f[k]||0);f.month=mth;try{await api("/api/rec/save",{coll:"goals",id:g.id,item:f});toast("Goals saved");pageAccounts()}catch(e){toast(e.message)}})}
+  bindRange()}
+ else if(ATAB==="dues"){const r=await api("/api/reports/dues");
+  mb.innerHTML=tiles([["Total outstanding",inr(r.total),"t5"],...Object.entries(r.ageing).map(([k,v])=>[k,inr(v),"t2"])])+
+  '<div class="tbl-wrap"><table><thead><tr><th>Bill</th><th>Patient</th><th>Date</th><th>Age</th><th>Total</th><th>Balance</th><th></th></tr></thead><tbody>'+(r.bills.map(b=>'<tr data-id="'+b.id+'"><td>'+esc(b.no)+'<br><small>'+esc(b.dept)+'</small></td><td>'+esc(b.patient?.name)+'<br><small>'+esc(b.patient?.id||"")+' '+esc(b.patient?.phone||"")+'</small></td><td>'+dt(b.date)+'</td><td>'+b.days+' d</td><td>'+inr(b.total)+'</td><td style="color:var(--red);font-weight:700">'+inr(b.balance)+'</td><td style="white-space:nowrap"><button class="btn" data-wa>WhatsApp reminder</button> <button class="btn p" data-pay>Collect online</button></td></tr>').join("")||'<tr><td colspan="7" class="empty">No pending dues</td></tr>')+'</tbody></table></div>'+
+  (r.inpatients.length?panel("Running inpatient balances",["IP no","Patient","Ward","Total","Advance","Due"],r.inpatients.map(x=>'<tr class="r" onclick="location.hash=\\'ip-'+x.id+'\\'"><td>'+esc(x.no)+'</td><td>'+esc(x.patient?.name)+'</td><td>'+esc(x.ward)+'</td><td>'+inr(x.total)+'</td><td>'+inr(x.advance)+'</td><td style="color:var(--red)">'+inr(x.due)+'</td></tr>')):"");
+  $$("[data-wa]").forEach(b=>b.onclick=()=>{const x=r.bills.find(y=>y.id===b.closest("tr").dataset.id);waSend(x.patient?.phone,"Dear "+x.patient?.name+", a balance of "+inr(x.balance)+" is pending on your "+x.dept+" bill "+x.no+". Please pay at the clinic or by UPI. Thank you.")});
+  $$("[data-pay]").forEach(b=>b.onclick=()=>payOnline(b.closest("tr").dataset.id,r.bills.find(y=>y.id===b.closest("tr").dataset.id)))}
+ else if(ATAB==="expenses"){const L=(await api("/api/rec/list",{coll:"expenses",from:AF.from,to:AF.to})).items;const tot=L.reduce((x,e)=>x+(+e.amount||0),0);
+  mb.innerHTML=range+'<div class="grid2" style="grid-template-columns:minmax(0,.8fr) minmax(0,1.5fr)"><div class="panel"><h3>Add expense</h3><div class="pb" id="ef"><div class="fr">'+fld("date","Date",{type:"date",v:today()})+fld("category","Category",{opts:EXPCAT})+fld("amount","Amount ₹")+fld("mode","Paid by",{opts:["Cash","UPI","Bank transfer","Card","Cheque"]})+'</div>'+fld("paidTo","Paid to")+fld("note","Note")+'<div class="acts"><button class="btn p" id="es">Save</button></div></div></div>'+
+  panel("Expenses · total "+inr(tot),["Date","Category","Paid to","Mode","Amount",""],L.map(e=>'<tr><td>'+dt(e.date)+'</td><td>'+esc(e.category)+'</td><td>'+esc(e.paidTo||"")+'<br><small>'+esc(e.note||"")+'</small></td><td>'+esc(e.mode)+'</td><td>'+inr(e.amount)+'</td><td><button class="btn d" data-del="'+e.id+'">✕</button></td></tr>'),"No expenses in this period")+'</div>';
+  bindRange();$("#es").onclick=async()=>{const f=readForm($("#ef"));f.amount=+f.amount;if(!(f.amount>0))return toast("Enter the amount");try{await api("/api/rec/save",{coll:"expenses",item:f});toast("Expense saved");pageAccounts()}catch(e){toast(e.message)}};
+  $$("[data-del]").forEach(b=>b.onclick=async()=>{try{await api("/api/rec/delete",{coll:"expenses",id:b.dataset.del});pageAccounts()}catch(e){toast(e.message)}})}
+ else{const a=await api("/api/reports/appointments",{from:AF.from,to:AF.to});const wk=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  mb.innerHTML=range+tiles([["Appointments",a.total,"t1"],["Completed",a.completed,"t3"],["No-show",a.noShow+" ("+a.noShowRate+"%)","t5"],["Cancelled",a.cancelled,"t2"],["Check-ins (all visits)",a.walkIns,"t4"]])+
+  '<div class="grid2"><div class="panel"><h3>By weekday</h3><div class="pb">'+bars(wk.map(d=>[d,a.byWeekday[d]||0]),Math.max(1,...Object.values(a.byWeekday)))+'</div></div><div class="panel"><h3>By hour</h3><div class="pb">'+bars(Object.keys(a.byHour).sort().map(h=>[h,a.byHour[h]]),Math.max(1,...Object.values(a.byHour)))+'</div></div>'+
+  '<div class="panel"><h3>Clinic or video</h3><div class="pb">'+bars(Object.entries(a.byMode).map(([k,v])=>[k==="tele"?"Video":"Clinic",v]),Math.max(1,...Object.values(a.byMode)))+'</div></div><div class="panel"><h3>How they booked</h3><div class="pb">'+bars(Object.entries(a.bySource),Math.max(1,...Object.values(a.bySource)))+'</div></div></div>';bindRange()}
+}
+let QRLIB=null;
+async function payOnline(id,b){try{const r=await api("/api/pay/link",{billId:id});
+ const m=document.createElement("div");m.className="modal";m.innerHTML='<div style="max-width:420px;text-align:center"><h3 style="margin-top:0">Collect '+inr(r.amount)+'</h3><p>Bill '+esc(r.no)+'</p><div id="qr" style="display:inline-block;padding:8px;background:#fff"></div>'+(r.upi?'<p class="m">Patient scans with any UPI app (GPay, PhonePe, Paytm).</p>':'<p class="m">Add your clinic UPI ID in the app: Admin → Clinic details.</p>')+(r.link?'<p><a href="'+esc(r.link)+'" target="_blank">'+esc(r.link)+'</a></p>':"")+'<div class="acts">'+(r.link||r.upi?'<button class="btn" id="qw">Send on WhatsApp</button>':"")+'<button class="btn p" id="qc">Close</button></div></div>';
+ document.body.appendChild(m);$("#qc",m).onclick=()=>m.remove();
+ if(r.upi){if(!QRLIB){await new Promise((ok,no)=>{const s=document.createElement("script");s.src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";s.onload=ok;s.onerror=no;document.head.appendChild(s)});QRLIB=1}new QRCode($("#qr",m),{text:r.upi,width:220,height:220})}
+ $("#qw",m)&&($("#qw",m).onclick=()=>waSend(b?.patient?.phone,"Please pay "+inr(r.amount)+" for bill "+r.no+". "+(r.link?"Pay online: "+r.link:"UPI: "+r.upi)))}catch(e){toast(e.message)}}
+
+// ---------- bed board ----------
+async function pageBeds(){
+ const d=await api("/api/beds");
+ $("#app").innerHTML=shell("Bed board")+'';
+ const mb=$("#mb");
+ mb.innerHTML=tiles([["Beds",d.totals.beds,"t4"],["Occupied",d.totals.occupied,"t5"],["Free",d.totals.free,"t3"],["Admitted without a matching bed",d.unassigned.length,"t2"]])+
+ d.wards.map(w=>'<div class="panel" style="margin-bottom:12px"><h3>'+esc(w.name)+' <small>'+w.occupied+' occupied · '+w.free+' free</small></h3><div class="pb" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px">'+
+  w.beds.map(b=>b.admission?'<a href="#ip-'+b.admission.id+'" style="text-decoration:none;color:inherit;border:1px solid #f1b8b0;background:#fde7e5;border-radius:8px;padding:8px"><b>'+esc(b.bed)+'</b><br>'+esc(b.admission.patient?.name)+'<br><small>'+esc(b.admission.no)+' · day '+b.admission.day+'</small></a>'
+   :'<div style="border:1px solid #bfe3cf;background:#e2f4ec;border-radius:8px;padding:8px"><b>'+esc(b.bed)+'</b><br><span style="color:var(--green)">'+(b.blocked?"Blocked":"Free")+'</span></div>').join("")+'</div></div>').join("")+
+ (d.unassigned.length?panel("Admitted, bed not on the board",["IP no","Patient","Ward","Bed"],d.unassigned.map(a=>'<tr class="r" onclick="location.hash=\\'ip-'+a.id+'\\'"><td>'+esc(a.no)+'</td><td>'+esc(a.patient?.name)+'</td><td>'+esc(a.ward)+'</td><td>'+esc(a.bed||"–")+'</td></tr>')):"")+
+ (ME.role==="admin"?'<div class="panel" style="margin-top:12px"><h3>Set up wards and beds</h3><div class="pb" id="wf"><div class="fr">'+fld("name","Ward name",{ph:"Private rooms, 2nd floor"})+fld("match","Room type (from price list)",{ph:"Private room"})+fld("order","Order",{v:"1"})+'</div>'+fld("beds","Bed numbers, separated by commas",{rows:2,ph:"P-201, P-202, P-203"})+'<div class="acts"><button class="btn p" id="ws">Add ward</button></div>'+d.wards.map(w=>'<div style="display:flex;gap:8px;align-items:center">'+esc(w.name)+' · '+w.beds.length+' beds <button class="btn d" data-wd="'+w.id+'">Remove</button></div>').join("")+'</div></div>':(d.wards.length?"":'<div class="empty">No wards set up yet. The admin adds wards and beds here.</div>'));
+ $("#ws")&&($("#ws").onclick=async()=>{const f=readForm($("#wf"));if(!f.name||!f.beds)return toast("Enter the ward name and beds");f.order=+f.order||1;try{await api("/api/rec/save",{coll:"wards",item:f});pageBeds()}catch(e){toast(e.message)}});
+ $$("[data-wd]").forEach(b=>b.onclick=async()=>{try{await api("/api/rec/delete",{coll:"wards",id:b.dataset.wd});pageBeds()}catch(e){toast(e.message)}});
+}
+
+// ---------- insurance ----------
+let ITB="claims",ISF="open";
+const SCHEMES=["Private insurance","PM-JAY (Ayushman Bharat)","CMCHIS (Tamil Nadu)","CGHS","ECHS","ESI","Corporate","Other"];
+const CST={"draft":"amb","pre-auth sent":"amb","query":"red","approved":"grn","enhancement sent":"amb","final claim sent":"amb","settled":"grn","rejected":"red","closed":"gry"};
+async function pageInsurance(){
+ $("#app").innerHTML=shell("Insurance desk",[["claims","Claims"],["policies","Patient policies"],["corporates","Corporates"]],ITB);bindTabs(t=>{ITB=t;pageInsurance()});const mb=$("#mb");
+ if(ITB==="claims"){const L=(await api("/api/rec/list",{coll:"claims"})).items;const open=(c)=>!["settled","rejected","closed"].includes(c.status);const S=L.filter(c=>ISF==="all"||(ISF==="open"?open(c):!open(c)));
+  mb.innerHTML=tiles([["Open claims",L.filter(open).length,"t2"],["Approved amount",inr(L.reduce((x,c)=>x+(c.approved||0),0)),"t3"],["Settled",inr(L.reduce((x,c)=>x+(c.settled||0),0)),"t4"],["Deductions",inr(L.reduce((x,c)=>x+(c.deduction||0),0)),"t5"]])+
+  '<div class="bar2">'+[["open","Open"],["done","Closed"],["all","All"]].map(([k,l])=>'<button class="chip'+(ISF===k?" on":"")+'" data-f="'+k+'">'+l+'</button>').join(" ")+'<div class="sp"></div><button class="btn p" id="nc">New claim</button></div>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Claim</th><th>Patient</th><th>Insurer / TPA</th><th>Scheme</th><th>Requested</th><th>Approved</th><th>Settled</th><th>Status</th></tr></thead><tbody>'+(S.map(c=>'<tr class="r" data-id="'+c.id+'"><td>'+esc(c.no)+'<br><small>'+dt(c.date)+'</small></td><td>'+esc(c.patientName)+'<br><small>'+esc(c.patientId)+' '+esc(c.admissionNo||"")+'</small></td><td>'+esc(c.insurer||"")+'<br><small>'+esc(c.tpa||"")+'</small></td><td>'+esc(c.scheme||"")+'</td><td>'+inr(c.requested)+'</td><td>'+inr(c.approved)+'</td><td>'+inr(c.settled)+'</td><td><span class="pill '+(CST[c.status]||"")+'">'+esc(c.status||"draft")+'</span></td></tr>').join("")||'<tr><td colspan="8" class="empty">No claims</td></tr>')+'</tbody></table></div>';
+  $$("[data-f]").forEach(b=>b.onclick=()=>{ISF=b.dataset.f;pageInsurance()});$$("tr[data-id]").forEach(t=>t.onclick=()=>claimView(L.find(c=>c.id===t.dataset.id)));$("#nc").onclick=newClaim}
+ else if(ITB==="policies"){const L=(await api("/api/rec/list",{coll:"policies"})).items;
+  mb.innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.5fr)"><div class="panel"><h3>Add a policy</h3><div class="pb" id="pf">'+fld("pid","Patient ID or mobile")+'<div class="fr">'+fld("scheme","Scheme",{opts:SCHEMES})+fld("insurer","Insurer")+fld("tpa","TPA")+fld("policyNo","Policy / card no")+fld("memberId","Member ID")+fld("sumInsured","Sum insured ₹")+fld("validTill","Valid till",{type:"date"})+fld("corporate","Corporate (if any)")+'</div><div class="acts"><button class="btn p" id="ps">Save policy</button></div></div></div>'+
+  panel("Policies",["Patient","Scheme","Insurer / TPA","Policy","Sum insured","Valid till"],L.map(x=>'<tr><td>'+esc(x.patientName)+'<br><small>'+esc(x.patientId)+'</small></td><td>'+esc(x.scheme)+'</td><td>'+esc(x.insurer||"")+'<br><small>'+esc(x.tpa||"")+'</small></td><td>'+esc(x.policyNo||"")+'</td><td>'+inr(x.sumInsured)+'</td><td style="'+(x.validTill&&x.validTill<today()?"color:var(--red)":"")+'">'+dt(x.validTill)+'</td></tr>'),"No policies yet")+'</div>';
+  $("#ps").onclick=async()=>{const f=readForm($("#pf"));try{const p=await findPatient(f.pid);delete f.pid;f.patientId=p.id;f.patientName=p.name;f.phone=p.phone;f.sumInsured=+f.sumInsured||0;await api("/api/rec/save",{coll:"policies",item:f});toast("Policy saved for "+p.name);pageInsurance()}catch(e){toast(e.message)}}}
+ else{const L=(await api("/api/rec/list",{coll:"corporates"})).items;
+  mb.innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.5fr)"><div class="panel"><h3>Add a corporate or panel company</h3><div class="pb" id="cf"><div class="fr">'+fld("name","Company")+fld("contact","Contact person")+fld("phone","Phone")+fld("email","Email")+fld("credit","Credit limit ₹")+fld("discount","Discount %")+'</div>'+fld("notes","Agreement notes",{rows:2})+'<div class="acts"><button class="btn p" id="cs">Save</button></div></div></div>'+
+  panel("Corporates and panels",["Company","Contact","Credit limit","Discount"],L.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.contact||"")+'<br><small>'+esc(x.phone||"")+'</small></td><td>'+inr(x.credit)+'</td><td>'+esc(x.discount||0)+'%</td></tr>'),"None yet")+'</div>';
+  $("#cs").onclick=async()=>{const f=readForm($("#cf"));if(!f.name)return toast("Enter the company");f.credit=+f.credit||0;f.discount=+f.discount||0;try{await api("/api/rec/save",{coll:"corporates",item:f});pageInsurance()}catch(e){toast(e.message)}}}
+}
+function newClaim(){const m=document.createElement("div");m.className="modal";
+ m.innerHTML='<div><h3 style="margin-top:0">New claim</h3><div id="cf">'+fld("pid","Patient ID or mobile")+'<div class="fr">'+fld("scheme","Scheme",{opts:SCHEMES})+fld("insurer","Insurer")+fld("tpa","TPA")+fld("policyNo","Policy / card no")+'</div>'+fld("diagnosis","Diagnosis")+fld("procedure","Procedure / treatment")+'<div class="fr">'+fld("estimate","Estimated cost ₹")+fld("requested","Pre-auth amount requested ₹")+'</div></div><div class="acts"><button class="btn" id="cc">Cancel</button><button class="btn p" id="cs">Create claim</button></div></div>';
+ document.body.appendChild(m);$("#cc",m).onclick=()=>m.remove();
+ $("#cs",m).onclick=async()=>{const f=readForm($("#cf",m));try{const p=await findPatient(f.pid);delete f.pid;f.patientId=p.id;f.patientName=p.name;f.estimate=+f.estimate||0;f.requested=+f.requested||0;f.status="draft";
+  const ad=(await api("/api/ip/list",{status:"admitted"})).admissions.find(a=>a.patient?.id===p.id);if(ad){f.admissionId=ad.id;f.admissionNo=ad.no}
+  const pol=(await api("/api/rec/list",{coll:"policies",where:{patientId:p.id}})).items[0];if(pol){f.insurer=f.insurer||pol.insurer;f.tpa=f.tpa||pol.tpa;f.policyNo=f.policyNo||pol.policyNo;f.policyId=pol.id}
+  const r=await api("/api/rec/save",{coll:"claims",item:f});m.remove();toast("Claim "+r.item.no+" created");pageInsurance()}catch(e){toast(e.message)}}}
+function claimView(c){const m=document.createElement("div");m.className="modal";
+ const acts=[["submit","Send pre-auth"],["query","Query received"],["approve","Approved"],["enhance","Enhancement sent"],["final","Final claim sent"],["settle","Settled"],["reject","Rejected"],["close","Close"]];
+ m.innerHTML='<div><h3 style="margin-top:0">'+esc(c.no)+' · '+esc(c.patientName)+'</h3><p>'+esc(c.scheme||"")+' · '+esc(c.insurer||"")+' '+esc(c.tpa||"")+' · '+esc(c.policyNo||"")+'<br>'+esc(c.diagnosis||"")+' · '+esc(c.procedure||"")+'<br>Requested '+inr(c.requested)+' · Approved '+inr(c.approved)+' · Settled '+inr(c.settled)+(c.deduction?' · Deduction '+inr(c.deduction):"")+(c.admissionNo?'<br>Admission '+esc(c.admissionNo):"")+'</p>'+
+ '<div id="af" class="fr">'+fld("amount","Amount ₹")+fld("deduction","Deduction ₹ (on settlement)")+fld("utr","UTR / reference")+'</div>'+fld("note","Note (query details, documents sent…)",{rows:2})+'<div class="cks">'+acts.map(([k,l])=>'<button class="chip" data-a="'+k+'">'+l+'</button>').join("")+'</div>'+
+ '<h4>History</h4>'+((c.log||[]).slice().reverse().map(l=>'<div class="m" style="font-size:12.5px">'+tm(l.at)+' · <b>'+esc(l.step)+'</b>'+(l.amount?' · '+inr(l.amount):"")+(l.note?' · '+esc(l.note):"")+' · '+esc(l.by)+'</div>').join("")||'<div class="m">Created '+tm(c.created)+'</div>')+'<div class="acts"><button class="btn p" id="xc">Close</button></div></div>';
+ document.body.appendChild(m);$("#xc",m).onclick=()=>m.remove();
+ $$("[data-a]",m).forEach(b=>b.onclick=async()=>{const f=readForm($("#af",m));f.note=$('textarea[name=note]',m).value;
+  try{if(b.dataset.a==="final"&&c.admissionId){const g=await api("/api/ip/get",{id:c.admissionId});if(g.finalBill){await api("/api/rec/save",{coll:"claims",id:c.id,item:{billId:g.finalBill.id}})}}
+  await api("/api/claims/action",{id:c.id,action:b.dataset.a,amount:+f.amount||0,deduction:+f.deduction||0,utr:f.utr,note:f.note});m.remove();toast("Claim updated");pageInsurance()}catch(e){toast(e.message)}})}
+
+// ---------- home care ----------
+let HCD=today();
+const HCS=["Doctor visit","Nursing care","Physiotherapy","Sample collection","Wound dressing","Injection / IV","Catheter care","Elderly care","Palliative care"];
+async function pageHomecare(){
+ const L=(await api("/api/rec/list",{coll:"homevisits",from:HCD,to:new Date(new Date(HCD+"T00:00:00Z").getTime()+6*864e5).toISOString().slice(0,10)})).items.sort((a,b)=>(a.date+(a.time||"")).localeCompare(b.date+(b.time||"")));
+ $("#app").innerHTML=shell("Home care");const mb=$("#mb");
+ mb.innerHTML='<div class="bar2">From <input type="date" id="hd" class="chip" value="'+HCD+'"> · 7 days<div class="sp"></div><button class="btn p" id="hn">Book a home visit</button></div>'+tiles([["Visits",L.length,"t4"],["Done",L.filter(x=>x.status==="done").length,"t3"],["Pending",L.filter(x=>x.status!=="done"&&x.status!=="cancelled").length,"t2"],["Billed",L.filter(x=>x.billNo).length,"t1"]])+
+ '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Patient</th><th>Address</th><th>Service</th><th>Staff</th><th>Fee</th><th>Status</th><th></th></tr></thead><tbody>'+(L.map(x=>'<tr data-id="'+x.id+'"><td>'+dt(x.date)+'<br><small>'+esc(x.time||"")+'</small></td><td>'+esc(x.patientName)+'<br><small>'+esc(x.patientId||"")+' '+esc(x.phone||"")+'</small></td><td style="max-width:220px">'+esc(x.address||"")+'</td><td>'+esc(x.service)+'</td><td>'+esc(x.staff||"")+'</td><td>'+inr(x.fee)+'</td><td><span class="pill '+(x.status==="done"?"grn":x.status==="cancelled"?"gry":"amb")+'">'+esc(x.status||"booked")+'</span>'+(x.billNo?'<br><small>'+esc(x.billNo)+'</small>':"")+'</td><td style="white-space:nowrap"><button class="btn" data-o>Open</button></td></tr>').join("")||'<tr><td colspan="8" class="empty">No home visits in these 7 days</td></tr>')+'</tbody></table></div>';
+ $("#hd").onchange=e=>{HCD=e.target.value;pageHomecare()};$("#hn").onclick=()=>hvForm();
+ $$("[data-o]").forEach(b=>b.onclick=()=>hvForm(L.find(x=>x.id===b.closest("tr").dataset.id)));
+}
+function hvForm(x){const v=x||{};const m=document.createElement("div");m.className="modal";
+ m.innerHTML='<div><h3 style="margin-top:0">'+(x?"Home visit "+esc(v.no||""):"Book a home visit")+'</h3><div id="hf">'+(x?'<p><b>'+esc(v.patientName)+'</b> · '+esc(v.patientId||"")+' · '+esc(v.phone||"")+'</p>':fld("pid","Patient ID or mobile (registered patients)")+'<div class="fr">'+fld("patientName","Or name")+fld("phone","Mobile")+'</div>')+
+ fld("address","Address",{rows:2,v:v.address})+'<div class="fr">'+fld("service","Service",{opts:HCS,v:v.service})+fld("date","Date",{type:"date",v:v.date||today()})+fld("time","Time",{type:"time",v:v.time})+fld("staff","Assigned to",{v:v.staff})+fld("fee","Fee ₹",{v:v.fee||""})+fld("status","Status",{opts:["booked","on the way","done","cancelled"],v:v.status||"booked"})+'</div>'+
+ (x?'<div class="fr">'+fld("bp","BP",{v:v.bp})+fld("pulse","Pulse",{v:v.pulse})+fld("temp","Temp",{v:v.temp})+fld("spo2","SpO₂",{v:v.spo2})+fld("rbs","RBS",{v:v.rbs})+'</div>'+fld("notes","Visit notes",{rows:3,v:v.notes}):"")+'</div>'+
+ '<div class="acts">'+(x?'<button class="btn" id="hw">WhatsApp patient</button>'+(!v.billNo&&(isBill()||ME.role==="staff")?'<button class="btn" id="hb">Make bill</button>':""):"")+'<button class="btn" id="hc">Close</button><button class="btn p" id="hs">Save</button></div></div>';
+ document.body.appendChild(m);$("#hc",m).onclick=()=>m.remove();
+ $("#hs",m).onclick=async()=>{const f=readForm($("#hf",m));try{if(!x){if(f.pid){const p=await findPatient(f.pid);f.patientId=p.id;f.patientName=p.name;f.phone=p.phone;if(!f.address)f.address=p.address||""}delete f.pid;if(!f.patientName)return toast("Choose or enter the patient")}
+  f.fee=+f.fee||0;await api("/api/rec/save",{coll:"homevisits",id:x?.id,item:f});m.remove();toast("Saved");pageHomecare()}catch(e){toast(e.message)}};
+ $("#hw",m)&&($("#hw",m).onclick=()=>waSend(v.phone,"Dear "+v.patientName+", your "+v.service+" home visit is on "+dt(v.date)+" "+(v.time||"")+". Our "+(v.staff?v.staff:"team")+" will reach you. Thank you."));
+ $("#hb",m)&&($("#hb",m).onclick=async()=>{try{const b=await api("/api/bills/save",{bill:{dept:"opd",patient:{id:v.patientId||"",name:v.patientName,phone:v.phone},items:[{desc:"Home visit · "+v.service,qty:1,rate:+v.fee||0}]}});await api("/api/rec/save",{coll:"homevisits",id:v.id,item:{billNo:b.bill.no,billId:b.bill.id}});m.remove();toast("Bill "+b.bill.no+" made · collect it in Billing");pageHomecare()}catch(e){toast(e.message)}})}
+
+// ---------- mobile medical units: camps ----------
+let CAMP=null;
+async function pageCamps(id){
+ if(id){return campView(id)}
+ const L=(await api("/api/rec/list",{coll:"camps"})).items;
+ $("#app").innerHTML=shell("Mobile units and health camps");const mb=$("#mb");
+ mb.innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.5fr)"><div class="panel"><h3>Plan a camp or van trip</h3><div class="pb" id="cf">'+fld("name","Camp name",{ph:"Diabetes and BP screening"})+'<div class="fr">'+fld("type","Type",{opts:["General screening","Diabetes & BP","Eye camp","Dental camp","Women's health","Child health","School health","Elderly care"]})+fld("date","Date",{type:"date",v:today()})+fld("place","Village / place")+fld("vehicle","Vehicle / van no")+'</div>'+fld("team","Team (names and roles)",{rows:2})+fld("notes","Notes",{rows:2})+'<div class="acts"><button class="btn p" id="cs">Save camp</button></div></div></div>'+
+ panel("Camps",["No","Date","Camp","Place","Team"],L.map(c=>'<tr class="r" onclick="location.hash=\\'camps-'+c.id+'\\'"><td>'+esc(c.no)+'</td><td>'+dt(c.date)+'</td><td>'+esc(c.name)+'<br><small>'+esc(c.type)+'</small></td><td>'+esc(c.place||"")+'<br><small>'+esc(c.vehicle||"")+'</small></td><td style="font-size:12px">'+esc(c.team||"")+'</td></tr>'),"No camps yet")+'</div>';
+ $("#cs").onclick=async()=>{const f=readForm($("#cf"));if(!f.name)return toast("Enter the camp name");try{const r=await api("/api/rec/save",{coll:"camps",item:f});location.hash="camps-"+r.item.id}catch(e){toast(e.message)}};
+}
+async function campView(id){
+ const c=(await api("/api/rec/list",{coll:"camps"})).items.find(x=>x.id===id);if(!c){$("#app").innerHTML='<div class="empty">Camp not found</div>';return}
+ const R=(await api("/api/rec/list",{coll:"campregs",where:{campId:id}})).items.sort((a,b)=>(a.created||0)-(b.created||0));
+ const hiBP=(b)=>{const m=String(b||"").match(/(\\d+)\\s*\\/\\s*(\\d+)/);return m&&(+m[1]>=140||+m[2]>=90)},hiS=(s)=>+s>=200;
+ $("#app").innerHTML=shell(c.name+" · "+dt(c.date));const mb=$("#mb");
+ mb.innerHTML='<div class="bar2"><button class="btn" onclick="location.hash=\\'camps\\'">‹ All camps</button><span>'+esc(c.place||"")+' · '+esc(c.vehicle||"")+' · '+esc(c.team||"")+'</span><div class="sp"></div><button class="btn" id="cp">Print camp report</button></div>'+
+ tiles([["Registered",R.length,"t4"],["High BP (≥140/90)",R.filter(r=>hiBP(r.bp)).length,"t5"],["High sugar (≥200)",R.filter(r=>hiS(r.sugar)).length,"t2"],["Referred to hospital",R.filter(r=>r.refer==="Yes").length,"t1"]])+
+ '<div class="panel" style="margin-bottom:12px"><h3>Register and screen</h3><div class="pb" id="rf"><div class="fr">'+fld("name","Name")+fld("age","Age")+fld("sex","Sex",{opts:["Female","Male","Other"]})+fld("phone","Mobile")+fld("village","Village / street")+'</div><div class="fr">'+fld("complaint","Complaint")+fld("bp","BP")+fld("sugar","RBS mg/dL")+fld("weight","Weight kg")+fld("height","Height cm")+fld("refer","Refer to hospital?",{opts:["No","Yes"]})+'</div>'+fld("advice","Advice / medicines given")+'<div class="acts"><button class="btn p" id="rs">Save and next</button></div></div></div>'+
+ '<div class="tbl-wrap"><table><thead><tr><th>#</th><th>Name</th><th>Age/Sex</th><th>Mobile</th><th>Complaint</th><th>BP</th><th>RBS</th><th>BMI</th><th>Refer</th><th></th></tr></thead><tbody>'+R.map((r,i)=>{const bmi=+r.weight&&+r.height?(r.weight/((r.height/100)**2)).toFixed(1):"";return '<tr data-id="'+r.id+'"><td>'+(i+1)+'</td><td>'+esc(r.name)+'<br><small>'+esc(r.village||"")+'</small></td><td>'+esc(r.age||"")+' '+esc((r.sex||"")[0]||"")+'</td><td>'+esc(r.phone||"")+'</td><td>'+esc(r.complaint||"")+'</td><td style="'+(hiBP(r.bp)?"color:var(--red);font-weight:700":"")+'">'+esc(r.bp||"")+'</td><td style="'+(hiS(r.sugar)?"color:var(--red);font-weight:700":"")+'">'+esc(r.sugar||"")+'</td><td>'+bmi+'</td><td>'+(r.refer==="Yes"?'<span class="pill red">Yes</span>':"")+'</td><td>'+(r.patientId?'<small>'+esc(r.patientId)+'</small>':(r.refer==="Yes"?'<button class="btn" data-reg>Register as patient</button>':""))+'</td></tr>'}).join("")+'</tbody></table></div>';
+ $("#rs").onclick=async()=>{const f=readForm($("#rf"));if(!f.name)return toast("Enter the name");f.campId=id;f.date=c.date;try{await api("/api/rec/save",{coll:"campregs",item:f});toast("Saved");campView(id)}catch(e){toast(e.message)}};
+ $$("[data-reg]").forEach(b=>b.onclick=async()=>{const r=R.find(x=>x.id===b.closest("tr").dataset.id);try{const p=(await api("/api/patients/register",{name:r.name,age:r.age,sex:r.sex,phone:r.phone,address:r.village})).patient;await api("/api/rec/save",{coll:"campregs",id:r.id,item:{patientId:p.id}});toast("Registered "+p.id);campView(id)}catch(e){toast(e.message)}});
+ $("#cp").onclick=()=>modal('<div class="rep"><h2>'+esc(c.name)+'</h2><p>'+dt(c.date)+' · '+esc(c.place||"")+' · '+esc(c.type||"")+'<br>Team: '+esc(c.team||"")+'</p><p><b>'+R.length+'</b> people screened · <b>'+R.filter(r=>hiBP(r.bp)).length+'</b> high BP · <b>'+R.filter(r=>hiS(r.sugar)).length+'</b> high sugar · <b>'+R.filter(r=>r.refer==="Yes").length+'</b> referred</p><table><thead><tr><th>#</th><th>Name</th><th>Age/Sex</th><th>BP</th><th>RBS</th><th>Complaint</th><th>Referred</th></tr></thead><tbody>'+R.map((r,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(r.name)+'</td><td>'+esc(r.age||"")+' '+esc(r.sex||"")+'</td><td>'+esc(r.bp||"")+'</td><td>'+esc(r.sugar||"")+'</td><td>'+esc(r.complaint||"")+'</td><td>'+esc(r.refer||"")+'</td></tr>').join("")+'</tbody></table></div>');
+}
+
+// ---------- follow-ups with WhatsApp ----------
+async function pageFollowups(){
+ const t=today(),r=await api("/api/followups",{from:new Date(new Date(t+"T00:00:00Z").getTime()-60*864e5).toISOString().slice(0,10),to:new Date(new Date(t+"T00:00:00Z").getTime()+7*864e5).toISOString().slice(0,10)});
+ const L=r.followups.filter(f=>!["came","booked","not-coming"].includes(f.follow?.status));
+ $("#app").innerHTML=shell("Follow-ups");$("#mb").innerHTML=tiles([["Overdue",L.filter(f=>f.review<t).length,"t5"],["Due today",L.filter(f=>f.review===t).length,"t2"],["Next 7 days",L.filter(f=>f.review>t).length,"t4"]])+
+ '<div class="tbl-wrap"><table><thead><tr><th>Review</th><th>Patient</th><th>Diagnosis</th><th>Note</th><th>Status</th><th></th></tr></thead><tbody>'+(L.map(f=>'<tr data-id="'+f.visitId+'"><td style="'+(f.review<t?"color:var(--red);font-weight:700":"")+'">'+dt(f.review)+'</td><td>'+esc(f.patient?.name)+'<br><small>'+esc(f.patient?.id||"")+' '+esc(f.patient?.phone||"")+'</small></td><td>'+esc(f.dx)+'</td><td>'+esc(f.reviewNote||"")+'</td><td><span class="pill amb">'+esc(f.follow?.status||"due")+'</span></td><td style="white-space:nowrap"><button class="btn p" data-wa>WhatsApp reminder</button> <select data-st class="chip"><option value="">Mark…</option><option value="called">Called</option><option value="no-answer">No answer</option><option value="booked">Booked</option><option value="not-coming">Not coming</option></select></td></tr>').join("")||'<tr><td colspan="6" class="empty">No reviews due.</td></tr>')+'</tbody></table></div>';
+ $$("[data-wa]").forEach(b=>b.onclick=()=>{const f=L.find(x=>x.visitId===b.closest("tr").dataset.id);waSend(f.patient?.phone,"Dear "+f.patient?.name+", this is a reminder of your review visit on "+dt(f.review)+(f.reviewNote?" ("+f.reviewNote+")":"")+". Please reply to book a time. Thank you.");api("/api/followups/update",{visitId:f.visitId,status:"called",note:"WhatsApp reminder"}).catch(()=>{})});
+ $$("[data-st]").forEach(s=>s.onchange=async()=>{if(!s.value)return;try{await api("/api/followups/update",{visitId:s.closest("tr").dataset.id,status:s.value});pageFollowups()}catch(e){toast(e.message)}});
+}
+
+// ---------- messages ----------
+async function pageMessages(pid){
+ const th=(await api("/api/chat/threads")).threads;
+ $("#app").innerHTML=shell("Messages");const mb=$("#mb");
+ mb.innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.8fr) minmax(0,1.6fr)"><div class="panel"><h3>Patients</h3><div class="pb"><div style="display:flex;gap:6px"><input id="np" placeholder="Patient ID or mobile to start" style="flex:1;border:1px solid var(--line);border-radius:5px;padding:7px"><button class="btn" id="ns">Start</button></div>'+
+ (th.map(t=>'<a href="#msg-'+esc(t.patientId)+'" style="display:block;text-decoration:none;color:inherit;padding:8px;border-radius:6px;'+(t.patientId===pid?"background:var(--soft)":"")+'"><b>'+esc(t.name)+'</b>'+(t.unread?' <span class="pill red">'+t.unread+'</span>':"")+'<br><small style="color:var(--muted)">'+esc((t.last.from==="clinic"?"You: ":"")+t.last.text.slice(0,60))+' · '+tm(t.last.at)+'</small></a>').join("")||'<div class="empty">No conversations yet</div>')+'</div></div><div class="panel" id="cv"><h3>Conversation</h3><div class="empty">Choose a patient.</div></div></div>';
+ $("#ns").onclick=async()=>{try{const p=await findPatient($("#np").value.trim());location.hash="msg-"+p.id}catch(e){toast(e.message)}};
+ if(!pid)return;const r=await api("/api/chat/get",{patientId:pid});const name=(th.find(t=>t.patientId===pid)||{}).name||pid;
+ $("#cv").innerHTML='<h3>'+esc(name)+' <small>'+esc(pid)+'</small></h3><div class="pb"><div id="ml" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column;gap:6px">'+r.messages.map(m=>'<div style="align-self:'+(m.from==="clinic"?"flex-end":"flex-start")+';max-width:78%;background:'+(m.from==="clinic"?"var(--soft)":"#f1f3f4")+';border-radius:10px;padding:7px 10px"><div style="white-space:pre-wrap">'+esc(m.text)+'</div><small style="color:var(--muted)">'+esc(m.from==="clinic"?m.by:"Patient")+' · '+tm(m.at)+'</small></div>').join("")+'</div><div style="display:flex;gap:6px"><textarea id="mt" rows="2" style="flex:1;border:1px solid var(--line);border-radius:6px;padding:7px" placeholder="Write a message"></textarea><button class="btn p" id="ms">Send</button></div><small style="color:var(--muted)">The patient sees this in the Rx Clinic app under My Patient ID → Messages.</small></div>';
+ const ml=$("#ml");ml.scrollTop=ml.scrollHeight;
+ $("#ms").onclick=async()=>{const t=$("#mt").value.trim();if(!t)return;try{await api("/api/chat/send",{patientId:pid,text:t});pageMessages(pid)}catch(e){toast(e.message)}};
+}
+
+// ---------- speciality templates (Gold and Platinum) ----------
+const SPEC={
+ "General surgery":{f:[["cc","Chief complaints",2],["hpi","History of present illness",3],["local","Local examination (site, size, tenderness, swelling, lymph nodes)",3],["pr","Per rectal / hernial orifices / genitalia",2]],ck:[["Abdomen",["Soft","Distended","Guarding","Rigidity","Rebound tenderness","Bowel sounds present","Free fluid","Palpable mass"]]],f2:[["impression","Provisional diagnosis",2],["plan","Plan (conservative / surgery, investigations)",3]]},
+ "Obstetrics & gynaecology":{f:[["lmp","LMP and EDD",1],["obs","Obstetric score (G P L A) and past deliveries",2],["menstrual","Menstrual history",2],["complaints","Complaints",2],["pa","Per abdomen (fundal height, lie, presentation, FHR)",2],["pv","Per speculum / per vaginal",2]],ck:[["Antenatal checks",["BP normal","No pedal oedema","Fetal movements felt","Iron & folic acid","Tetanus toxoid","Anomaly scan done","GDM screen done"]]],f2:[["plan","Plan",3]]},
+ "Paediatrics":{f:[["complaints","Complaints (from parent)",2],["birth","Birth history",2],["immunisation","Immunisation status",1],["development","Developmental milestones",2],["feeding","Feeding / diet",1],["growth","Weight, height, head circumference, centile",1]],ck:[["Danger signs",["Unable to feed","Lethargy","Convulsions","Chest indrawing","Dehydration","Fever > 5 days"]]],f2:[["plan","Plan (doses by weight)",3]]},
+ "Orthopaedics":{f:[["injury","Mode of injury / onset",2],["look","Look (swelling, deformity, wound)",2],["feel","Feel (tenderness, warmth, crepitus)",2],["move","Move (range of motion, power)",2],["neuro","Distal neurovascular status",1],["xray","X-ray findings",2]],ck:[],f2:[["plan","Plan (POP, splint, surgery, physiotherapy)",3]]},
+ "ENT":{f:[["ear","Ear (otoscopy, tuning fork)",2],["nose","Nose and sinuses",2],["throat","Throat and neck",2]],ck:[["Symptoms",["Hearing loss","Ear discharge","Tinnitus","Vertigo","Nasal block","Epistaxis","Sore throat","Dysphagia","Hoarseness"]]],f2:[["plan","Plan",2]]},
+ "Ophthalmology":{f:[["va","Visual acuity (RE / LE, with pinhole)",1],["iop","IOP (RE / LE)",1],["anterior","Anterior segment",2],["fundus","Fundus",2],["refraction","Refraction",1]],ck:[],f2:[["plan","Plan (glasses, drops, surgery)",2]]},
+ "Dermatology":{f:[["lesion","Lesion: site, type, size, distribution, colour",3],["duration","Duration and progression",1],["itch","Itching, triggers, contacts",1]],ck:[["Findings",["Macule","Papule","Plaque","Vesicle","Pustule","Scaling","Nail involvement","Hair involvement","Mucosal involvement"]]],f2:[["plan","Plan",2]]},
+ "Cardiology":{f:[["cp","Chest pain (site, radiation, exertional)",2],["nyha","Breathlessness / NYHA class",1],["cvs","CVS examination (JVP, apex, murmurs)",2],["ecg","ECG",2],["echo","Echo",2]],ck:[["Risk factors",["Hypertension","Diabetes","Smoking","Dyslipidaemia","Family history","Obesity"]]],f2:[["plan","Plan",3]]},
+ "Psychiatry":{f:[["complaints","Presenting complaints",2],["mse","Mental status examination",4],["risk","Risk assessment (self-harm, harm to others)",2]],ck:[],f2:[["plan","Plan (medicines, therapy, follow-up)",3]]},
+};
+
+// ---------- report files in the OPD Results tab ----------
+const _paneResults=paneResults;
+paneResults=async function(){_paneResults();const p=C.patient||C.visit.patient||{};if(!p.id)return;
+ let files=[];try{files=(await api("/api/files/list",{patientId:p.id})).files}catch{}
+ const box=document.createElement("div");box.className="panel";box.style.marginTop="12px";
+ box.innerHTML='<h3>Report files (photos and PDFs) <small>'+files.length+'</small></h3><div class="pb"><div class="acts" style="justify-content:flex-start"><button class="btn p" id="up">Upload a report (photo or PDF)</button></div>'+files.map(f=>'<div style="display:flex;gap:10px;align-items:center"><button class="btn" data-fv="'+f.id+'">View</button>'+esc(f.name)+' · <small>'+tm(f.at)+' · '+esc(f.by)+'</small></div>').join("")+'</div>';
+ $("#pane").appendChild(box);$$("[data-fv]",box).forEach(b=>b.onclick=()=>viewFile(b.dataset.fv));
+ $("#up",box).onclick=async()=>{if(await uploadFor({patientId:p.id,visitId:C.visit.id}))chart(C.visit.id,true)}};
+
+// ---------- routing ----------
+route=async function(){
+ const h=location.hash;let m;
+ try{await ensureMe()}catch(e){$("#app").innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
+ if(has("templates")&&!TPL["General surgery"])Object.assign(TPL,SPEC);
+ drawMenu();
+ try{
+ if((m=h.match(/^#v-(.+)$/)))return await chart(m[1]);if((m=h.match(/^#ip-(.+)$/)))return await ipChart(m[1]);if((m=h.match(/^#ot-(.+)$/)))return await otRecord(m[1]);if(h==="#ot")return await otList();
+ if(h==="#beds")return await pageBeds();if(h==="#followups")return await pageFollowups();if(h==="#pharmacy")return await pagePharmacy();if(h==="#lab")return await pageLab();
+ if(h==="#insurance")return await pageInsurance();if(h==="#homecare")return await pageHomecare();if(h==="#accounts")return await pageAccounts();
+ if((m=h.match(/^#camps-(.+)$/)))return await campView(m[1]);if(h==="#camps")return await pageCamps();
+ if((m=h.match(/^#msg-(.+)$/)))return await pageMessages(m[1]);if(h==="#messages")return await pageMessages();
+ if(ME.role==="pharmacy")return await pagePharmacy();if(ME.role==="lab"||ME.role==="diagnostics")return await pageLab();
+ return await dashboard()}catch(e){$("#app").innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+};
+
 route();
+</script></body></html>`;
+}
+
+
+// Razorpay calls this when a payment link is paid; the bill gets the payment.
+async function razorpayWebhook(request, env) {
+  if (!env.RAZORPAY_WEBHOOK_SECRET) return json({ error: "Not set up" }, 404);
+  const raw = await request.text();
+  const sig = request.headers.get("x-razorpay-signature") || "";
+  const mac = [...new Uint8Array(await hmac(env.RAZORPAY_WEBHOOK_SECRET, raw))].map((x) => x.toString(16).padStart(2, "0")).join("");
+  if (!safeEqual(mac, sig)) return json({ error: "Bad signature" }, 401);
+  const e = JSON.parse(raw);
+  if (e.event !== "payment_link.paid") return json({ ok: true });
+  const pl = e.payload?.payment_link?.entity || {}, pay = e.payload?.payment?.entity || {};
+  const id = String(pl.reference_id || "");
+  const b = await getDoc(env, "bills", id);
+  if (b && b.status !== "cancelled" && !(b.payments || []).some((p) => p.ref === pay.id)) {
+    b.payments.push({ amount: Math.min(b.balance, money((pay.amount || pl.amount_paid || 0) / 100)), mode: "UPI", ref: pay.id || "razorpay", at: Date.now(), by: "Online payment" });
+    computeBill(b); await putDoc(env, "bills", id, b);
+    await notify(env, { to: "role:billing", title: "Online payment received", body: `${b.no} · ${b.patient?.name} · ₹${money((pay.amount || 0) / 100)}`, link: "" });
+  }
+  return json({ ok: true });
+}
+
+
+// ---------- patient web portal (/me): records, bills, reports and messages ----------
+function mePage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>My Patient ID · Rx Clinic</title>
+<style>${WEB_CSS}main{max-width:680px;margin:0 auto;padding:16px max(16px,env(safe-area-inset-left)) 40px;display:flex;flex-direction:column;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}.id{background:var(--teal);color:#fff;border-radius:14px;padding:16px}.id b{font:600 28px ui-monospace,monospace;display:block}
+input,textarea{width:100%;padding:12px;border:1px solid var(--line);border-radius:8px;font:inherit;background:var(--card);color:var(--fg)}button{background:var(--teal);color:#fff;border:0;border-radius:8px;padding:12px 16px;font-weight:600}
+.tabs{display:flex;gap:6px;overflow-x:auto}.tabs button{background:var(--soft);color:var(--fg)}.tabs button.on{background:var(--teal);color:#fff}.m{color:var(--muted);font-size:13px}.msg{max-width:80%;border-radius:10px;padding:8px 10px;margin:4px 0}
+.err{color:var(--red)}</style></head><body><main id="app"></main><script>
+const $=(s)=>document.querySelector(s);const esc=(s)=>String(s??"").replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+(()=>{const m=location.hash.match(/^#s=([^&]+)/);if(m){try{sessionStorage.setItem("rx_psession",decodeURIComponent(m[1]))}catch{}history.replaceState(null,"","/me"+(location.hash.includes("chat")?"#chat":""))}})();
+let S=(()=>{try{return sessionStorage.getItem("rx_psession")||localStorage.getItem("rx_psession")}catch{return null}})();
+const tm=(ms)=>new Date(ms).toLocaleString("en-IN",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"});const inr=(x)=>"₹"+Math.round(x||0).toLocaleString("en-IN");
+async function api(p,b={}){const r=await fetch(p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({session:S,...b})});const j=await r.json();if(r.status===401&&S){try{localStorage.removeItem("rx_psession");sessionStorage.removeItem("rx_psession")}catch{};S=null;login();throw new Error("Please sign in")}if(!r.ok)throw new Error(j.error||"Error");return j}
+function login(){$("#app").innerHTML='<div class="logo"><span class="rx">℞</span>Rx Clinic</div><div class="card"><h2 style="margin-top:0">My Patient ID</h2><p class="m">Sign in with your Patient ID, mobile or Aadhaar and your password.</p><input id="l" placeholder="Patient ID, mobile or Aadhaar"><br><br><input id="p" type="password" placeholder="Password"><p class="err" id="e"></p><button id="go">Sign in</button><p class="m">New here? Register in the Rx Clinic app, or ask the reception desk.</p></div>';
+ $("#go").onclick=async()=>{try{const r=await fetch("/api/patient/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({login:$("#l").value,password:$("#p").value})});const j=await r.json();if(!r.ok)throw new Error(j.error);S=j.session;try{localStorage.setItem("rx_psession",S)}catch{};show("visits")}catch(err){$("#e").textContent=err.message}}}
+let D=null;
+async function show(tab){try{D=D||await api("/api/patient/me")}catch(e){return}const p=D.patient;
+ $("#app").innerHTML='<div class="id"><small>PATIENT ID</small><b>'+esc(p.id)+'</b>'+esc(p.name)+' · '+esc([p.age?p.age+" y":"",p.sex].filter(Boolean).join(" · "))+'</div><div class="tabs">'+[["visits","Visits & prescriptions"],["bills","Bills"],["chat","Messages"]].map(([k,l])=>'<button data-t="'+k+'" class="'+(tab===k?"on":"")+'">'+l+'</button>').join("")+'<button id="so" style="background:none;color:var(--muted)">Sign out</button></div><div id="pane"></div>';
+ document.querySelectorAll("[data-t]").forEach(b=>b.onclick=()=>show(b.dataset.t));$("#so").onclick=()=>{try{localStorage.removeItem("rx_psession");sessionStorage.removeItem("rx_psession")}catch{};S=null;D=null;login()};
+ const pane=$("#pane");
+ if(tab==="visits")pane.innerHTML=(D.visits.map(v=>'<div class="card"><b>'+esc(v.date)+'</b> · '+esc(v.doctor||"")+'<div>'+esc(v.diagnosis||v.complaint||"")+'</div>'+((v.rx&&v.rx.items)||[]).map(i=>'<div class="m">• '+esc([i.form,i.generic,i.strength,i.dose,i.frequency,i.timing,i.duration].filter(Boolean).join(" "))+'</div>').join("")+(v.reports||[]).filter(r=>r.status==="reported").map(r=>'<div class="m"><b>'+esc(r.test)+':</b> '+esc(r.impression||r.result)+'</div>').join("")+'</div>').join("")||'<div class="card m">No visits yet.</div>');
+ else if(tab==="bills")pane.innerHTML=(D.bills.map(b=>'<div class="card"><b>'+esc(b.deptName)+' · '+esc(b.no)+'</b> · '+esc(b.date)+'<div>'+inr(b.total)+(b.balance>0?' · <span class="err">due '+inr(b.balance)+'</span>':' · paid')+'</div></div>').join("")||'<div class="card m">No bills.</div>');
+ else{const r=await api("/api/chat/get");pane.innerHTML='<div class="card"><div id="ml" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column">'+(r.messages.map(m=>'<div class="msg" style="align-self:'+(m.from==="patient"?"flex-end":"flex-start")+';background:'+(m.from==="patient"?"var(--soft)":"var(--band)")+'">'+esc(m.text)+'<div class="m">'+(m.from==="patient"?"You":esc(m.by))+' · '+tm(m.at)+'</div></div>').join("")||'<p class="m">Send a message to the clinic. The staff will reply here.</p>')+'</div><br><textarea id="t" rows="2" placeholder="Write a message"></textarea><br><br><button id="s">Send</button></div>';
+  const ml=$("#ml");ml.scrollTop=ml.scrollHeight;$("#s").onclick=async()=>{const t=$("#t").value.trim();if(!t)return;try{await api("/api/chat/send",{text:t});show("chat")}catch(e){alert(e.message)}}}}
+if(S)show(location.hash==="#chat"?"chat":"visits");else login();
 </script></body></html>`;
 }

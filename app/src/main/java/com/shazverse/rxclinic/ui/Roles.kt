@@ -297,7 +297,7 @@ internal fun AccountButton(vm: CallViewModel, onSignedOut: () -> Unit) {
 // ---------------- Nursing staff: OPD triage vitals ----------------
 
 @Composable
-fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onHmis: () -> Unit, onSignedOut: () -> Unit) {
+fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onHmis: (String) -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("staff") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
@@ -324,7 +324,11 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
             add("Patients" to onPatients)
             if (vm.prefs.has("ip")) add("Inpatients" to onInpatients)
             add("Follow-ups" to onFollowUps)
-            add("HMIS" to onHmis)
+            add("HMIS" to { onHmis("hmis") })
+            if (vm.prefs.has("ip")) add("Bed board" to { onHmis("hmis:beds") })
+            if (vm.prefs.has("homecare")) add("Home care" to { onHmis("hmis:homecare") })
+            if (vm.prefs.has("mobileunit")) add("Camps" to { onHmis("hmis:camps") })
+            if (vm.prefs.has("chat")) add("Messages" to { onHmis("hmis:messages") })
         })
         Text("Today's checked-in patients. Record vitals before they see the doctor; they appear on the doctor's case sheet. Mark emergencies so they go to the top of the doctor's queue.",
             color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
@@ -392,7 +396,7 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
 // ---------------- Pharmacy: dispensing and stock ----------------
 
 @Composable
-fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Unit) {
+fun PharmacyScreen(vm: CallViewModel, onHmis: (String) -> Unit = {}, onBack: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("pharmacy") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
@@ -425,6 +429,7 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
             AccountButton(vm, onSignedOut)
         }
+        QuickLinks(listOf("Alerts: low stock & expiry" to { onHmis("hmis:pharmacy") }, "Purchases & batches" to { onHmis("hmis:pharmacy") }))
         Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Choice("To dispense (${queue.count { it.str("status") == "sent" }})", tab == "dispense", modifier = Modifier.weight(1f)) { tab = "dispense" }
             Choice("Bills", tab == "bills", modifier = Modifier.weight(1f)) { tab = "bills" }
@@ -573,7 +578,7 @@ private fun StockRow(d: JSONObject, onSave: (Int, Double) -> Unit, onDelete: () 
 // ---------------- Lab, and Diagnostics (USG, CT, MRI, PET-CT, X-ray) ----------------
 
 @Composable
-fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOut: () -> Unit) {
+fun OrdersScreen(vm: CallViewModel, role: String, onHmis: (String) -> Unit = {}, onBack: () -> Unit, onSignedOut: () -> Unit) {
     val imaging = role == "diagnostics"
     val session = vm.prefs.sessionFor(role) ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
@@ -611,6 +616,7 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
             AccountButton(vm, onSignedOut)
         }
+        QuickLinks(listOf("Upload report photos / PDFs" to { onHmis("hmis:lab") }))
         Text(if (imaging) "Scan orders from the doctors. Schedule the scan, then enter findings and impression; the report reaches the doctor's case sheet."
             else "Test orders from the doctors. Mark the sample collected, then enter the report; it reaches the doctor's case sheet.",
             color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
@@ -793,7 +799,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             item {
                 BoxCard {
                     Text("Clinic details (prescription letterhead)", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
-                    listOf("name" to "Clinic name", "doctor" to "Doctor", "qual" to "Qualification", "reg" to "Registration number", "phone" to "Phone", "hours" to "OPD hours", "address" to "Address").forEach { (k, l) ->
+                    listOf("name" to "Clinic name", "doctor" to "Doctor", "qual" to "Qualification", "reg" to "Registration number", "phone" to "Phone", "hours" to "OPD hours", "address" to "Address", "upi" to "UPI ID for payments (e.g. clinic@okhdfc)", "gstin" to "GSTIN (optional)").forEach { (k, l) ->
                         OutlinedTextField(clinic[k].orEmpty(), { clinic[k] = it.take(200) }, label = { Text(l) }, singleLine = k != "address", modifier = Modifier.fillMaxWidth())
                     }
                     Button(onClick = {
@@ -828,6 +834,7 @@ private fun UserDialog(vm: CallViewModel, session: String, start: JSONObject, on
     var reg by remember { mutableStateOf(start.str("reg")) }
     var phone by remember { mutableStateOf(start.str("phone")) }
     var active by remember { mutableStateOf(start.optBoolean("active", true)) }
+    var branch by remember { mutableStateOf(start.str("branch")) }
     var password by remember { mutableStateOf("") }
     var err by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -849,6 +856,7 @@ private fun UserDialog(vm: CallViewModel, session: String, start: JSONObject, on
                 }
                 OutlinedTextField(phone, { phone = it.filter(Char::isDigit).take(10) }, label = { Text("Mobile (optional)") }, singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(branch, { branch = it.take(40) }, label = { Text("Branch (if you have several)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 PasswordField(password, { password = it }, if (isNew) "Starting password (at least 6)" else "New password (leave empty to keep)")
                 Text("They will be asked to choose their own password at first sign-in.", color = Ui.Muted, fontSize = 12.sp)
                 if (!isNew) Row(verticalAlignment = Alignment.CenterVertically) {
@@ -864,7 +872,7 @@ private fun UserDialog(vm: CallViewModel, session: String, start: JSONObject, on
                 scope.launch {
                     try {
                         val u = JSONObject().put("name", name.trim()).put("username", username).put("role", role).put("qual", qual).put("reg", reg)
-                            .put("phone", phone).put("active", active)
+                            .put("phone", phone).put("active", active).put("branch", branch)
                         if (!isNew) u.put("id", start.str("id"))
                         if (password.isNotBlank()) u.put("password", password)
                         Api(vm.prefs.serverUrl).call("/api/admin/users/save", JSONObject().put("session", session).put("user", u))

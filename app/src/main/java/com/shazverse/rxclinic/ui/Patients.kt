@@ -183,6 +183,7 @@ private fun PatientRecord(vm: CallViewModel, onBack: () -> Unit, onSignedOut: ()
     var refresh by remember { mutableIntStateOf(0) }
     var editing by remember { mutableStateOf(false) }
     var changingPw by remember { mutableStateOf(false) }
+    var messages by remember { mutableStateOf(false) }
 
     LaunchedEffect(refresh) {
         try { data = api.call("/api/patient/me", JSONObject().put("session", vm.prefs.patientSession.orEmpty())) }
@@ -200,6 +201,7 @@ private fun PatientRecord(vm: CallViewModel, onBack: () -> Unit, onSignedOut: ()
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { editing = true }) { Text("Edit details") }
                     OutlinedButton(onClick = { changingPw = true }) { Text("Change password") }
+                    Button(onClick = { messages = true }) { Text("Messages") }
                 }
                 Text("Show this Patient ID at the clinic desk, or type it when you check in.", color = Ui.Muted, fontSize = 13.sp)
             }
@@ -250,6 +252,7 @@ private fun PatientRecord(vm: CallViewModel, onBack: () -> Unit, onSignedOut: ()
         })
     }
     if (changingPw) ChangePasswordDialog(vm, patient = true, onDone = { changingPw = false })
+    if (messages) WebDialog(vm.prefs.serverUrl.trimEnd('/') + "/me#s=" + android.net.Uri.encode(vm.prefs.patientSession.orEmpty()) + "&chat", "Messages to the clinic", onDismiss = { messages = false })
 }
 
 @Composable

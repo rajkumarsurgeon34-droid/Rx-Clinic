@@ -6,6 +6,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Text
@@ -45,5 +46,23 @@ fun HmisWebScreen(vm: CallViewModel, start: String = "", onBack: () -> Unit) {
                 }
             },
         )
+    }
+}
+
+/** A web page shown full screen over the app (used for the patient's messages). */
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun WebDialog(url: String, title: String, onDismiss: () -> Unit) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss, properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(Modifier.fillMaxSize().background(Ui.Bg)) {
+            TopBar(title, onDismiss)
+            AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
+                WebView(ctx).apply {
+                    settings.javaScriptEnabled = true; settings.domStorageEnabled = true
+                    webViewClient = WebViewClient(); webChromeClient = WebChromeClient()
+                    loadUrl(url)
+                }
+            })
+        }
     }
 }
