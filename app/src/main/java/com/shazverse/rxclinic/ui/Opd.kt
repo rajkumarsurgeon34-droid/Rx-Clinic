@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.EventRepeat
+import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.EventAvailable
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Refresh
@@ -127,7 +128,7 @@ private val QUICK_ADVICE = listOf(
 // ---------- Doctor home ----------
 
 @Composable
-fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
+fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onHmis: () -> Unit, onSignedOut: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         TopBar(vm.prefs.doctorName.ifBlank { "Doctor" }, onBack) {
             AccountButton(vm, onSignedOut)
@@ -138,6 +139,7 @@ fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppoi
             RoleCard("Patient records", "Find by Patient ID, mobile, Aadhaar or name; register; past visits", Icons.Filled.Badge, onPatients)
             if (vm.prefs.has("ip")) RoleCard("Inpatients", "Admitted patients, admit, ward charges", Icons.Filled.LocalHospital, onInpatients)
             RoleCard("Follow-ups", "Reviews due, missed reviews, call-back list", Icons.Filled.EventRepeat, onFollowUps)
+            RoleCard("HMIS workspace", "Dashboard and full patient chart: assessment, monitoring, results, orders, medicines, requests", Icons.Filled.Dashboard, onHmis)
         }
     }
 }

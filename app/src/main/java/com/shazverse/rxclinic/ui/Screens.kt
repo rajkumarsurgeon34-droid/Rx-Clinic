@@ -98,7 +98,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry, Billing, Inpatients, PriceList, FollowUps, Plan }
+private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry, Billing, Inpatients, PriceList, FollowUps, Plan, Hmis }
 
 private fun roleScreen(role: String) = when (role) {
     "doctor" -> Screen.DoctorHome; "staff" -> Screen.Nurse; "pharmacy" -> Screen.Pharmacy
@@ -118,6 +118,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
         if (role == "patients") { screen = Screen.Registry; return }
         if (role == "prices") { screen = Screen.PriceList; return }
         if (role == "plan") { screen = Screen.Plan; return }
+        if (role == "hmis") { screen = Screen.Hmis; return }
         val has = if (role == "admin") prefs.session("admin") != null else prefs.sessionFor(role) != null
         if (has) screen = roleScreen(role) else { loginRole = role; screen = Screen.StaffLogin }
     }
@@ -141,13 +142,14 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
             Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { r -> screen = roleScreen(r) })
             Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = signedOut("doctor"))
-            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("doctor"))
+            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onHmis = { screen = Screen.Hmis }, onSignedOut = signedOut("doctor"))
             Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = signedOut("doctor"))
             Screen.Case -> CaseScreen(vm, caseId, onBack = { screen = Screen.OpdQueue })
             Screen.Checkin -> CheckinScreen(vm, onBack = { screen = Screen.PatientHome })
-            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("staff"))
+            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onHmis = { screen = Screen.Hmis }, onSignedOut = signedOut("staff"))
             Screen.FollowUps -> FollowUpsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.Plan -> PlanScreen(vm, onBack = { screen = Screen.Admin })
+            Screen.Hmis -> HmisWebScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home })
             Screen.Billing -> BillingScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("billing"))
             Screen.Inpatients -> InpatientsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.PriceList -> PriceListScreen(vm, onBack = { screen = Screen.Admin })

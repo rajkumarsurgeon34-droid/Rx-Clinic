@@ -727,8 +727,8 @@ async function handle(request, env) {
       try { await db(env); database = true; } catch { /* reported below */ }
       return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
     }
-    if (path === "/login" || path === "/portal" || path === "/terms") {
-      const page = path === "/login" ? loginPage : path === "/portal" ? portalPage : termsPage;
+    if (path === "/login" || path === "/portal" || path === "/terms" || path === "/hmis") {
+      const page = path === "/login" ? loginPage : path === "/portal" ? portalPage : path === "/hmis" ? hmisPage : termsPage;
       return new Response(page(), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     }
     if (path === "/api/license") {
@@ -1309,6 +1309,138 @@ async function handle(request, env) {
       });
     }
 
+    // ----- HMIS web: doctor's dashboard and patient chart -----
+    case "/api/hmis/dashboard": {
+      const me = await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(body.date || "") ? body.date : clinicNow(env).date;
+      const visits = await listDocs(env, "visits", "json_extract(data, '$.date') = ?", [date]);
+      const appts = (await D.prepare("SELECT mode, status, source FROM appointments WHERE date = ? AND status != 'cancelled'").bind(date).all()).results || [];
+      const admitted = await listDocs(env, "admissions", "json_extract(data, '$.status') = 'admitted'");
+      const orders = await listDocs(env, "orders", "json_extract(data, '$.date') = ?", [date]);
+      const ots = (await listDocs(env, "requests", "json_extract(data, '$.type') = 'surgery'")).filter((r) => r.date >= date);
+      const seen = new Set();
+      const rows = [];
+      for (const v of visits) {
+        const pid = v.patient?.id || "";
+        let review = false;
+        if (pid) review = (await listDocs(env, "visits", "json_extract(data, '$.patient.id') = ? AND json_extract(data, '$.date') < ?", [pid, date])).length > 0;
+        const os = orders.filter((o) => o.visitId === v.id);
+        rows.push({ id: v.id, kind: "OP", regNo: pid, token: v.token, at: v.createdAt, patient: v.patient, urgent: !!v.urgent, status: v.status || "waiting",
+          review, complaint: visitSummary(v.id, v).complaint, orders: { total: os.length, done: os.filter((o) => o.status === "reported").length }, doctor: v.doctor?.name || "" });
+        if (pid) seen.add(pid);
+      }
+      for (const a of admitted) rows.push({ id: "", admissionId: a.id, kind: "IP", regNo: a.patient?.id || "", token: a.no, at: a.admittedAt, patient: a.patient, status: "admitted", ward: `${a.ward} ${a.bed}`.trim(), doctor: a.doctor, orders: { total: 0, done: 0 } });
+      rows.sort((a, b) => (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0) || (a.kind === b.kind ? (a.at || 0) - (b.at || 0) : a.kind === "OP" ? -1 : 1));
+      const today = date === clinicNow(env).date;
+      return json({ date, me: { name: me.user.name, role: me.role },
+        tiles: {
+          appointment: { total: appts.length, phone: appts.filter((a) => a.source !== "patient").length, online: appts.filter((a) => a.source === "patient").length, video: appts.filter((a) => a.mode === "tele").length },
+          outpatient: { total: visits.length, new: rows.filter((r) => r.kind === "OP" && !r.review).length, review: rows.filter((r) => r.kind === "OP" && r.review).length, emergency: visits.filter((v) => v.urgent).length },
+          inpatient: { total: admitted.length, today: admitted.filter((a) => new Date(a.admittedAt + 330 * 60000).toISOString().slice(0, 10) === date).length, existing: admitted.filter((a) => new Date(a.admittedAt + 330 * 60000).toISOString().slice(0, 10) !== date).length },
+          investigation: { total: orders.length, inProgress: orders.filter((o) => o.status !== "reported").length, completed: orders.filter((o) => o.status === "reported").length },
+          surgery: { total: ots.length, scheduled: ots.filter((r) => r.status !== "done").length, completed: ots.filter((r) => r.status === "done").length },
+        }, rows, today });
+    }
+
+    case "/api/hmis/chart": {
+      await requireUser(env, body.session, ["doctor", "staff"]);
+      const id = String(body.visitId || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Visit not found");
+      const pid = v.patient?.id || "";
+      const p = pid ? await getDoc(env, "patients", pid) : null;
+      const orders = await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [id]);
+      const history = pid ? (await patientHistory(env, pid)) : [];
+      const letters = pid ? await listDocs(env, "letters", "json_extract(data, '$.patient.id') = ?", [pid]) : [];
+      const requests = await listDocs(env, "requests", "json_extract(data, '$.visitId') = ?", [id]);
+      const adm = pid ? await activeAdmission(env, pid) : null;
+      return json({ visit: Object.assign({ id }, v), patient: p ? publicPatient(pid, p) : null, flags: { allergy: p?.allergy || "", remarks: p?.remarks || "", photo: "" },
+        orders: orders.sort((a, b) => a.orderedAt - b.orderedAt), history, letters: letters.sort((a, b) => b.created - a.created).slice(0, 30),
+        requests: requests.sort((a, b) => b.created - a.created), admission: adm ? { id: adm.id, no: adm.no, ward: adm.ward, bed: adm.bed } : null });
+    }
+
+    case "/api/hmis/vitals": {
+      const me = await requireUser(env, body.session, ["doctor", "staff"]);
+      const id = String(body.visitId || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Visit not found");
+      const vit = {};
+      for (const k of ["temp", "pulse", "bp", "rr", "spo2", "o2", "height", "weight", "bmi", "rbs", "pain"]) vit[k] = clean(body.vitals?.[k], 12);
+      const h = Number(vit.height), w = Number(vit.weight);
+      if (!vit.bmi && h > 0 && w > 0) vit.bmi = (w / ((h / 100) ** 2)).toFixed(1);
+      const entry = { at: Date.now(), by: me.user.name || me.role, vitals: vit, note: clean(body.note, 300) };
+      v.vitalsLog = (v.vitalsLog || []).concat([entry]).slice(-100);
+      v.triage = { vitals: Object.assign({}, v.triage?.vitals || {}, Object.fromEntries(Object.entries(vit).filter(([, x]) => x))), note: v.triage?.note || "", at: Date.now() };
+      await putDoc(env, "visits", id, v);
+      return json({ ok: true, vitalsLog: v.vitalsLog });
+    }
+
+    case "/api/hmis/note": {
+      const me = await requireUser(env, body.session, ["doctor", "staff"]);
+      const id = String(body.visitId || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Visit not found");
+      const fields = {};
+      for (const [k, x] of Object.entries(body.fields || {}).slice(0, 60)) fields[clean(k, 60)] = Array.isArray(x) ? x.slice(0, 40).map((y) => clean(y, 80)) : clean(x, 4000);
+      const note = { id: randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 8), template: clean(body.template, 60), fields, icd: clean(body.icd, 120), at: Date.now(), by: me.user.name || me.role, role: me.role };
+      v.notes = (v.notes || []).concat([note]).slice(-50);
+      if (note.icd) v.icd = (v.icd || []).concat([{ text: note.icd, at: note.at, by: note.by }]).slice(-20);
+      await putDoc(env, "visits", id, v);
+      return json({ note });
+    }
+
+    case "/api/hmis/flags": {
+      await requireUser(env, body.session, ["doctor", "staff"]);
+      const pid = String(body.patientId || "").toUpperCase();
+      const p = await getDoc(env, "patients", pid);
+      if (!p) throw new HttpError(404, "Patient not found");
+      if ("allergy" in body) p.allergy = clean(body.allergy, 300);
+      if ("remarks" in body) p.remarks = clean(body.remarks, 500);
+      await putDoc(env, "patients", pid, p);
+      return json({ ok: true });
+    }
+
+    case "/api/hmis/doctors": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      return json({ doctors: (await listDocs(env, "users")).filter((u) => u.role === "doctor" && u.active !== false).map((u) => ({ id: u.id, name: u.name, qual: u.qual || "" })) });
+    }
+
+    case "/api/hmis/request": {
+      // Cross consultation, surgery booking or diet advice raised from the patient chart.
+      const me = await requireUser(env, body.session, ["doctor"]);
+      const type = String(body.type || "");
+      if (!["consult", "surgery", "diet"].includes(type)) throw new HttpError(400, "Unknown request");
+      if (type === "surgery") await needFeature(env, "ot");
+      const v = await getDoc(env, "visits", String(body.visitId || ""));
+      if (!v) throw new HttpError(404, "Visit not found");
+      const f = {};
+      for (const [k, x] of Object.entries(body.fields || {}).slice(0, 30)) f[clean(k, 40)] = clean(x, 1500);
+      const r = { type, visitId: String(body.visitId), patient: billPatient(v.patient || {}), fields: f, toDoctor: clean(body.toDoctor, 80), status: "open",
+        date: /^\d{4}-\d{2}-\d{2}$/.test(f.date || "") ? f.date : clinicNow(env).date, created: Date.now(), by: me.user.name || me.role, byId: me.uid };
+      const id = crypto.randomUUID();
+      await putDoc(env, "requests", id, r);
+      return json({ request: Object.assign({ id }, r) });
+    }
+
+    case "/api/hmis/inbox": {
+      // Cross consultations sent to me, and surgery list.
+      const me = await requireUser(env, body.session, ["doctor", "staff"]);
+      const list = (await listDocs(env, "requests", "json_extract(data, '$.status') = 'open'"))
+        .filter((r) => (r.type === "consult" && (r.toDoctor === me.user.name || me.role === "admin")) || r.type === "surgery");
+      return json({ requests: list.sort((a, b) => a.date.localeCompare(b.date)) });
+    }
+
+    case "/api/hmis/request/update": {
+      const me = await requireUser(env, body.session, ["doctor"]);
+      const id = String(body.id || "");
+      const r = await getDoc(env, "requests", id);
+      if (!r) throw new HttpError(404, "Request not found");
+      if (["open", "done", "declined"].includes(body.status)) r.status = body.status;
+      if (body.reply) r.reply = { text: clean(body.reply, 1500), by: me.user.name || me.role, at: Date.now() };
+      await putDoc(env, "requests", id, r);
+      return json({ ok: true });
+    }
+
     // ----- free trial requests from the website -----
     case "/api/trial": {
       if (body.website) return json({ ok: true }); // hidden field: only bots fill it
@@ -1879,7 +2011,9 @@ h1{font:600 30px/1.2 "Segoe UI",system-ui;text-align:center;margin:4px 0 4px}
 </div><script>
 const $=(i)=>document.getElementById(i);
 const store=()=>{try{return localStorage.getItem("rx_remember")==="0"?sessionStorage:localStorage}catch{return null}};
-try{const s=localStorage.getItem("rx_session")||sessionStorage.getItem("rx_session");if(s&&!location.hash.includes("new"))location.replace("/portal")}catch{}
+const NEXT=(new URLSearchParams(location.search).get("next")||"").replace(/[^a-z/]/g,"");
+const dest=(role)=>NEXT||(["doctor","staff","admin"].includes(role)?"/hmis":"/portal");
+try{const s=localStorage.getItem("rx_session")||sessionStorage.getItem("rx_session");if(s&&!location.hash.includes("new"))location.replace(dest(localStorage.getItem("rx_role")||sessionStorage.getItem("rx_role")))}catch{}
 try{$("u").value=localStorage.getItem("rx_user")||""}catch{}
 $("eye").onclick=()=>{const t=$("p").type==="password";$("p").type=t?"text":"password";$("eye").textContent=t?"Hide":"Show"};
 fetch("/api/license").then(r=>r.json()).then(l=>{
@@ -1893,7 +2027,7 @@ $("f").onsubmit=async(e)=>{e.preventDefault();$("err").textContent="";$("go").di
  const j=await r.json();if(!r.ok)throw new Error(j.error||"Couldn't sign in");
  try{localStorage.setItem("rx_remember",$("rem").checked?"1":"0");if($("rem").checked)localStorage.setItem("rx_user",$("u").value.trim().toLowerCase());else localStorage.removeItem("rx_user");
  const s=store();s.setItem("rx_session",j.session);s.setItem("rx_role",j.role);s.setItem("rx_name",(j.user&&j.user.name)||"");if(j.user&&j.user.mustChange)s.setItem("rx_must","1");else s.removeItem("rx_must")}catch{}
- location.href="/portal"}catch(err){$("err").textContent=err.message}finally{$("go").disabled=false}};
+ location.href=dest(j.role)}catch(err){$("err").textContent=err.message}finally{$("go").disabled=false}};
 </script></body></html>`;
 }
 
@@ -1922,7 +2056,7 @@ h1{font:600 26px/1.2 Georgia,serif;margin:0}.muted{color:var(--muted)}
 <header><div class="bar"><div class="logo"><span class="rx">℞</span>Rx Clinic</div><div class="sp"></div><div class="me"><b id="nm"></b><span id="rl"></span></div><button class="out" id="out">Sign out</button></div></header>
 <main><div class="lic" id="lic"></div><div><h1 id="hi"></h1><div class="muted" id="sub"></div></div>
 <div class="stats" id="stats"></div><div id="listWrap"></div>
-<div class="app"><div>Case sheets, prescribing, billing and video calls are in the Rx Clinic app. The web portal shows today's work.</div><a href="/login#new">Switch user</a></div>
+<div class="app"><div>Case sheets, prescribing, billing and video calls are in the Rx Clinic app. The web portal shows today's work.</div><span style="display:flex;gap:8px"><a href="/hmis">Open HMIS</a><a href="/login#new">Switch user</a></span></div>
 </main><script>
 const $=(i)=>document.getElementById(i);
 const get=(k)=>{try{return localStorage.getItem(k)||sessionStorage.getItem(k)}catch{return null}};
@@ -2156,5 +2290,294 @@ f.onsubmit=async(e)=>{e.preventDefault();m.className="msg";m.textContent="";b.di
  try{const r=await fetch("/api/trial",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(d)});const j=await r.json();
  if(!r.ok)throw new Error(j.error||"Couldn't send. Please try again.");f.reset();m.className="msg ok";m.textContent="Thank you. We'll call you within one working day to set up your free trial."}
  catch(err){m.className="msg err";m.textContent=err.message}finally{b.disabled=false}};
+</script></body></html>`;
+}
+
+// ---------- HMIS web: doctor's dashboard and patient chart (/hmis) ----------
+function hmisPage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rx Clinic HMIS</title><style>
+:root{--top:#0f5f6b;--top2:#0b4c56;--bg:#f3f6f7;--card:#fff;--fg:#17242a;--muted:#5d6d74;--line:#dbe4e7;--head:#1d6f86;--accent:#0e8a7d;--soft:#e6f2f1;--red:#c0392b;--amber:#b7791f;--green:#23855a;--banner:#f6c343;
+--t1:#ece9fb;--t1i:#5b4fcf;--t2:#fbe8f1;--t2i:#c2457f;--t3:#e2f4ec;--t3i:#23855a;--t4:#e0f3f8;--t4i:#1d7f9b;--t5:#fde7e5;--t5i:#c0392b}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 "Segoe UI",Roboto,system-ui,sans-serif}
+button,input,select,textarea{font:inherit;color:inherit}button{cursor:pointer}:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.top{background:var(--top);color:#fff;display:flex;align-items:center;gap:12px;padding:8px max(14px,env(safe-area-inset-left));position:sticky;top:0;z-index:20}
+.logo{font:700 21px Georgia,serif;display:flex;gap:6px;align-items:center;white-space:nowrap;cursor:pointer}.logo b{color:#ffb4ab}.logo small{font:600 10px system-ui;letter-spacing:.2em;opacity:.8;margin-left:4px}
+.top .sp{flex:1}.top input{border:0;border-radius:6px;padding:7px 10px;width:min(320px,38vw);color:#17242a}.top .u{font-size:13px;text-align:right;line-height:1.2}.top .u span{opacity:.8}
+.top button{background:var(--top2);border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:6px;padding:6px 10px}
+main{padding:12px max(14px,env(safe-area-inset-left)) 40px}
+.bar2{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}.bar2 h1{font-size:15px;margin:0;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bar2 .sp{flex:1}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 12px;font-size:13px}.chip.on{background:var(--head);color:#fff;border-color:var(--head)}
+.tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.tile{border-radius:8px;padding:10px 12px;display:grid;grid-template-columns:auto 1fr;gap:2px 10px;align-items:center;cursor:pointer;border:1px solid transparent}.tile:hover{border-color:var(--line)}
+.tile svg{width:26px;height:26px;grid-row:span 2}.tile b{font-size:20px;line-height:1}.tile .n{font-size:13px;font-weight:600}.tile .s{grid-column:1/-1;display:flex;gap:10px;font-size:12px;color:var(--muted);margin-top:4px}
+.tile .s i{font-style:normal;background:rgba(255,255,255,.75);border-radius:4px;padding:0 5px;font-weight:600;color:var(--fg)}
+.tbl-wrap{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:auto}
+table{border-collapse:collapse;width:100%;min-width:900px}th{background:var(--head);color:#fff;text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.03em;padding:8px 10px;white-space:nowrap;font-weight:600}
+td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}tr.r:hover td{background:#f5fafa;cursor:pointer}
+.pn b{display:block}.pn small{color:var(--muted)}.pill{display:inline-block;font-size:11.5px;font-weight:600;border-radius:999px;padding:2px 8px;background:var(--soft);color:var(--accent);white-space:nowrap}
+.pill.red{background:#fde7e5;color:var(--red)}.pill.amb{background:#fdf1dc;color:var(--amber)}.pill.grn{background:#e2f4ec;color:var(--green)}.pill.gry{background:#eef1f2;color:var(--muted)}
+.prog{width:80px;height:6px;background:#e4ecee;border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:6px}.prog i{display:block;height:100%;background:var(--accent)}
+.btn{border:1px solid var(--line);background:var(--card);border-radius:6px;padding:6px 12px}.btn.p{background:var(--accent);color:#fff;border-color:var(--accent)}.btn.d{color:var(--red)}.btn:disabled{opacity:.55}
+.empty{padding:24px;text-align:center;color:var(--muted)}
+/* chart */
+.chart{display:grid;grid-template-columns:230px minmax(0,1fr);gap:12px;align-items:start}.chart>section,.side{min-width:0}.rx td:nth-child(2){min-width:170px}.rx td:nth-child(8){min-width:150px}
+.side{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:hidden;position:sticky;top:58px}
+.side .ban{background:var(--banner);font-weight:700;padding:6px 10px;text-transform:uppercase;font-size:13px}
+.side .id{display:flex;gap:10px;padding:10px;align-items:center;border-bottom:1px solid var(--line)}.av{width:52px;height:52px;border-radius:8px;background:#dfe7ea;display:grid;place-items:center;font:700 20px Georgia,serif;color:var(--head);flex:none}
+.side dl{margin:0;padding:8px 10px;display:grid;gap:6px;border-bottom:1px solid var(--line)}.side dt{font-size:11px;color:var(--muted)}.side dd{margin:0;font-weight:600;font-size:12.5px}
+.side h4{margin:0;padding:7px 10px;font-size:12px;display:flex;justify-content:space-between;align-items:center;background:#f6f9fa;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.04em}
+.side h4 button{border:0;background:none;color:var(--accent);font-size:18px;line-height:1;padding:0 2px}
+.vit{padding:6px 10px;display:grid;grid-template-columns:1fr auto;gap:3px 8px;font-size:12.5px;border-bottom:1px solid var(--line)}.vit span{color:var(--muted)}.vit b.hi{color:var(--red)}
+.side p{margin:0;padding:6px 10px 10px;font-size:12.5px;border-bottom:1px solid var(--line);white-space:pre-wrap}
+.tabs{display:flex;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px;overflow-x:auto;margin-bottom:10px}
+.tabs button{border:0;background:none;padding:7px 12px;border-radius:5px;white-space:nowrap;color:var(--muted);font-weight:600;font-size:13px;display:flex;gap:6px;align-items:center}.tabs button.on{background:var(--head);color:#fff}
+.tabs svg{width:15px;height:15px}
+.sub{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:10px;overflow-x:auto}.sub button{border:0;background:none;padding:8px 14px;color:var(--muted);font-weight:600;border-bottom:2px solid transparent;white-space:nowrap}.sub button.on{color:var(--head);border-color:var(--head)}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:hidden;min-width:0}.panel>h3{margin:0;background:var(--head);color:#fff;font-size:12px;text-transform:uppercase;letter-spacing:.04em;padding:7px 10px;display:flex;justify-content:space-between;align-items:center}
+.panel>h3 small{text-transform:none;letter-spacing:0;opacity:.85;font-weight:400}.panel table{min-width:0}.panel th{background:#f1f6f7;color:var(--muted);font-size:11px}.panel td{font-size:12.5px}.pb{padding:12px;display:grid;gap:10px}
+label.f{display:grid;gap:4px;font-size:12px;color:var(--muted);font-weight:600}label.f input,label.f select,label.f textarea{border:1px solid var(--line);border-radius:5px;padding:7px 9px;background:#fff;color:var(--fg);font-weight:400;font-size:13.5px;width:100%}
+.fr{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.cks{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px}.cks label{display:flex;gap:5px;align-items:center}.cks b{width:100%;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:4px}
+.acts{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.note{border:1px solid var(--line);border-radius:6px;padding:10px;font-size:13px}.note h5{margin:0 0 4px;font-size:13px}.note .m{color:var(--muted);font-size:12px}.note dl{margin:6px 0 0;display:grid;grid-template-columns:160px 1fr;gap:3px 10px}.note dt{color:var(--muted)}.note dd{margin:0;white-space:pre-wrap}
+.slots{display:flex;flex-wrap:wrap;gap:6px}.slots button{border:1px solid var(--line);background:#fff;border-radius:5px;padding:5px 9px;font-size:12.5px}.slots button.on{background:var(--head);color:#fff;border-color:var(--head)}.slots button:disabled{opacity:.35}
+.days{display:flex;gap:6px;overflow-x:auto}.days button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:6px 10px;text-align:center;min-width:64px;font-size:12px}.days button.on{border-color:var(--head);background:var(--soft)}.days b{display:block;font-size:15px}
+.cat{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px}.cat label{display:flex;gap:8px;padding:6px 10px;border-bottom:1px solid var(--line);font-size:13px;align-items:center}.cat label span{margin-left:auto;color:var(--muted);font-size:12px}
+.rx td input,.rx td select{width:100%;border:1px solid var(--line);border-radius:4px;padding:5px 6px;font-size:12.5px}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#17242a;color:#fff;padding:10px 16px;border-radius:8px;z-index:50;font-size:14px;max-width:90vw}
+.modal{position:fixed;inset:0;background:rgba(10,25,30,.45);display:grid;place-items:center;z-index:40;padding:16px}.modal>div{background:#fff;border-radius:10px;max-width:760px;width:100%;max-height:88vh;overflow:auto;padding:18px}
+.rep h2{margin:0 0 4px;font:700 18px Georgia,serif;color:var(--head)}.rep table{min-width:0}
+@media(max-width:1000px){.tiles{grid-template-columns:repeat(3,minmax(0,1fr))}.grid2{grid-template-columns:1fr}}
+@media(max-width:760px){.chart{grid-template-columns:1fr}.side{position:static}.side dl{grid-template-columns:1fr 1fr}.vit{grid-template-columns:auto 1fr auto 1fr}.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.top input{display:none}.logo small{display:none}}
+@media print{.top,.tabs,.side,.acts,.btn,.sub{display:none!important}.chart{display:block}body{background:#fff}}
+</style></head><body>
+<div class="top"><div class="logo" id="home"><b>℞</b>Rx Clinic<small>HMIS</small></div><input id="q" placeholder="Search patient: name, Patient ID, mobile"><div class="sp"></div>
+<div class="u"><b id="me"></b><br><span id="role"></span></div><button id="out">Sign out</button></div>
+<main id="app"><div class="empty">Loading…</div></main>
+<script>
+const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+// The Rx Clinic app opens /hmis#s=<session> so the signed-in user doesn't sign in again.
+(()=>{const m=location.hash.match(/^#s=([^&]+)(?:&r=(\w+))?/);if(m){try{sessionStorage.setItem("rx_session",decodeURIComponent(m[1]));if(m[2])sessionStorage.setItem("rx_role",m[2])}catch{}history.replaceState(null,"","/hmis")}})();
+const store=(()=>{try{return sessionStorage.getItem("rx_session")?sessionStorage:localStorage.getItem("rx_session")?localStorage:sessionStorage}catch{return null}})();
+const session=store&&store.getItem("rx_session");if(!session)location.replace("/login?next=/hmis");
+const esc=(s)=>String(s??"").replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const tm=(ms)=>ms?new Date(ms).toLocaleString("en-IN",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}):"";
+const dt=(d)=>d?new Date(d+"T00:00").toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"}):"";
+const today=()=>{const d=new Date();return new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10)};
+function toast(m){const t=document.createElement("div");t.className="toast";t.textContent=m;document.body.appendChild(t);setTimeout(()=>t.remove(),3200)}
+async function api(p,b={}){const r=await fetch(p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({session,...b})});const j=await r.json().catch(()=>({}));
+ if(r.status===401){try{store.removeItem("rx_session")}catch{};location.replace("/login?next=/hmis");throw new Error("Signed out")}if(!r.ok)throw new Error(j.error||"Something went wrong");return j}
+$("#out").onclick=()=>{try{["rx_session","rx_role","rx_name"].forEach(k=>{localStorage.removeItem(k);sessionStorage.removeItem(k)})}catch{};location.replace("/login")};
+$("#home").onclick=()=>{location.hash="";route()};
+const ROLE={doctor:"Doctor",staff:"Nursing",billing:"Billing",admin:"Admin"};
+const IC={cal:'<path d="M3 5h18v16H3zM3 10h18M8 3v4M16 3v4"/>',op:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6M18 8v6M15 11h6"/>',ip:'<path d="M3 18V6M3 14h18v4M21 14v-3a3 3 0 0 0-3-3h-7v6"/><circle cx="7" cy="10" r="2"/>',inv:'<path d="M9 3h6M10 3v6L4.5 18.5A2 2 0 0 0 6.2 21h11.6a2 2 0 0 0 1.7-2.5L14 9V3"/>',sx:'<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M8.1 8.1 20 20M8.1 15.9 20 4"/>',
+ asmt:'<path d="M9 3h6v3H9zM6 5h3M15 5h3v16H6V5"/><path d="M9 12h6M9 16h4"/>',home:'<path d="m3 11 9-7 9 7M5 10v10h14V10"/>',hist:'<path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 3"/>',mon:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',res:'<path d="M4 20V4M4 20h16M8 16v-5M12 16V8M16 16v-8"/>',ord:'<path d="M6 6h15l-2 9H8L6 3H3"/><circle cx="9" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/>',med:'<rect x="3" y="9" width="18" height="6" rx="3" transform="rotate(-45 12 12)"/>',req:'<path d="M4 12h12M12 6l6 6-6 6M20 4v16"/>'};
+const ic=(k,c="currentColor")=>'<svg viewBox="0 0 24 24" fill="none" stroke="'+c+'" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+IC[k]+'</svg>';
+let ME={},DASH=null,FILTER="all";
+
+async function route(){const m=location.hash.match(/^#v-(.+)$/);if(m)return chart(m[1]);return dashboard()}
+window.onhashchange=route;
+
+// ---------- dashboard ----------
+async function dashboard(date){
+ const app=$("#app");
+ try{DASH=await api("/api/hmis/dashboard",{date})}catch(e){app.innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
+ ME=DASH.me;$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role;
+ const t=DASH.tiles;
+ const tile=(cls,i,n,label,sub,f)=>'<div class="tile" data-f="'+f+'" style="background:var(--'+cls+')">'+ic(i,"var(--"+cls+"i)")+'<b>'+n+'</b><span class="n">'+label+'</span><div class="s">'+sub.map(([k,v])=>k+' <i>'+v+'</i>').join("")+'</div></div>';
+ app.innerHTML='<div class="bar2"><h1>'+esc(ME.name||"")+'</h1><div class="sp"></div><input type="date" id="dd" class="chip" value="'+DASH.date+'"><button class="chip" id="rf">Refresh</button></div>'+
+ '<div class="tiles">'+tile("t1","cal",t.appointment.total,"Appointment",[["Phone",t.appointment.phone],["Online",t.appointment.online],["Video",t.appointment.video]],"appt")+
+ tile("t2","op",t.outpatient.total,"Outpatient",[["New",t.outpatient.new],["Review",t.outpatient.review],["Emergency",t.outpatient.emergency]],"OP")+
+ tile("t3","ip",t.inpatient.total,"Inpatients",[["Today",t.inpatient.today],["Existing",t.inpatient.existing]],"IP")+
+ tile("t4","inv",t.investigation.total,"Investigation",[["In progress",t.investigation.inProgress],["Completed",t.investigation.completed]],"inv")+
+ tile("t5","sx",t.surgery.total,"Surgery",[["Scheduled",t.surgery.scheduled],["Completed",t.surgery.completed]],"sx")+'</div>'+
+ '<div class="bar2"><div id="fl"></div><div class="sp"></div><input id="ps" class="chip" placeholder="My patient search" style="min-width:200px"></div><div class="tbl-wrap" id="tw"></div>';
+ $$(".tile").forEach(x=>x.onclick=()=>{const f=x.dataset.f;FILTER=f==="OP"||f==="IP"?f:f==="inv"?"inv":"all";drawRows()});
+ $("#dd").onchange=(e)=>dashboard(e.target.value);$("#rf").onclick=()=>dashboard($("#dd").value);$("#ps").oninput=drawRows;drawRows();
+}
+function drawRows(){
+ const q=($("#ps")?.value||"").toLowerCase();
+ $("#fl").innerHTML=[["all","All"],["OP","Outpatient"],["IP","Inpatient"],["urgent","Emergency"],["inv","Investigation"]].map(([k,l])=>'<button class="chip'+(FILTER===k?" on":"")+'" data-k="'+k+'">'+l+'</button>').join(" ");
+ $$("#fl button").forEach(b=>b.onclick=()=>{FILTER=b.dataset.k;drawRows()});
+ const rows=DASH.rows.filter(r=>(FILTER==="all"||(FILTER==="urgent"?r.urgent:FILTER==="inv"?r.orders.total>0:r.kind===FILTER))&&(!q||(r.patient?.name+" "+r.regNo+" "+(r.patient?.phone||"")).toLowerCase().includes(q)));
+ const st=(r)=>r.urgent?'<span class="pill red">Emergency</span>':r.status==="admitted"?'<span class="pill">Admitted</span>':r.status==="sent"?'<span class="pill grn">Seen · Rx sent</span>':r.status==="dispensed"?'<span class="pill grn">Seen · dispensed</span>':r.status==="seen"||r.status==="done"?'<span class="pill grn">Seen</span>':'<span class="pill amb">Not seen</span>';
+ $("#tw").innerHTML='<table><thead><tr><th>Reg no</th><th>Token / IP no</th><th>Encounter</th><th>Patient name</th><th>Complaint</th><th>Status</th><th>Ward</th><th>Order status</th><th>Action</th></tr></thead><tbody>'+
+ (rows.length?rows.map(r=>'<tr class="r" data-v="'+esc(r.id)+'" data-a="'+esc(r.admissionId||"")+'"><td>'+esc(r.regNo||"—")+' · '+r.kind+'</td><td>'+esc(r.token)+'</td><td>'+tm(r.at)+'</td><td class="pn"><b>'+esc(r.patient?.name)+'</b><small>'+esc([r.patient?.age?r.patient.age+"Y":"",r.patient?.sex].filter(Boolean).join(" / "))+(r.review?" · Review":r.kind==="OP"?" · New":"")+'</small></td><td>'+esc(r.complaint||"")+'</td><td>'+st(r)+'</td><td>'+esc(r.ward||"")+'</td><td>'+(r.orders.total?'<span class="prog"><i style="width:'+Math.round(r.orders.done/r.orders.total*100)+'%"></i></span>'+r.orders.done+'/'+r.orders.total:"")+'</td><td><button class="btn">Open</button></td></tr>').join(""):'<tr><td colspan="9" class="empty">No patients'+(DASH.today?" yet today":"")+'.</td></tr>')+'</tbody></table><div style="padding:8px 10px;color:var(--muted);font-size:12px">Showing '+rows.length+' of '+DASH.rows.length+' records</div>';
+ $$("#tw tr.r").forEach(tr=>tr.onclick=()=>{if(tr.dataset.v)location.hash="v-"+tr.dataset.v;else toast("Open inpatient accounts in the Rx Clinic app (Billing → Inpatients).")});
+}
+$("#q").onkeydown=async(e)=>{if(e.key!=="Enter")return;const q=e.target.value.trim();if(q.length<2)return;
+ try{const r=await api("/api/patients/search",{q});if(!r.patients.length)return toast("No patient found");
+ const p=r.patients[0];const g=await api("/api/patients/get",{id:p.id});const last=g.visits[0];if(last)location.hash="v-"+last.id;else toast(p.name+" ("+p.id+") has no visits yet")}catch(err){toast(err.message)}};
+
+// ---------- patient chart ----------
+let C=null,TAB="home",SUB="consult";
+async function chart(id,keepTab){
+ try{C=await api("/api/hmis/chart",{visitId:id})}catch(e){$("#app").innerHTML='<div class="empty">'+esc(e.message)+' <button class="btn" onclick="location.hash=\\'\\'">Back</button></div>';return}
+ if(!ME.name){try{const m=await api("/api/me");ME={name:m.user?.name,role:m.role};$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role}catch{}}
+ if(!keepTab)TAB="home";drawChart();
+}
+function latestVitals(){const v=C.visit;const log=v.vitalsLog||[];return log.length?log[log.length-1].vitals:(v.triage?.vitals||{})}
+function hi(k,x){const n=parseFloat(x);if(isNaN(n))return false;return (k==="temp"&&n>=99.5)||(k==="pulse"&&(n>100||n<55))||(k==="spo2"&&n<94)||(k==="rr"&&(n>22||n<10))||(k==="rbs"&&n>200)}
+function drawChart(){
+ const v=C.visit,p=C.patient||v.patient||{},vit=latestVitals();
+ const side='<aside class="side"><div class="ban">'+esc(p.name)+'</div><div class="id"><div class="av">'+esc((p.name||"?").trim()[0]||"?")+'</div><div><b>'+esc(p.id||v.patient?.id||"")+'</b><br><small>'+esc([p.age?p.age+"Y":"",p.sex].filter(Boolean).join(" / "))+'</small><br><span class="pill">'+(C.admission?"IP":"OP")+'</span></div></div>'+
+ '<dl><dt>Registration</dt><dd>'+tm(p.created)+'</dd><dt>Encounter</dt><dd>'+tm(v.createdAt)+' · Token '+esc(v.token)+'</dd><dt>Primary consultant</dt><dd>'+esc(v.doctor?.name||ME.name||"")+'</dd><dt>Patient type</dt><dd>'+(C.admission?"Inpatient · "+esc(C.admission.no+" "+C.admission.ward+" "+C.admission.bed):"Outpatient")+'</dd><dt>Visit type</dt><dd>'+(C.history.length>1?"Review":"New")+'</dd><dt>Mobile</dt><dd>'+esc(p.phone||v.patient?.phone||"")+'</dd></dl>'+
+ '<h4>Vitals <button data-go="monitor" title="Add vitals">+</button></h4><div class="vit">'+[["temp","Body temp","°F"],["pulse","Pulse","/min"],["bp","Blood pressure",""],["rr","Resp. rate","/min"],["spo2","SpO₂","%"],["height","Height","cm"],["weight","Weight","kg"],["bmi","BMI",""]].map(([k,l,u])=>'<span>'+l+'</span><b class="'+(hi(k,vit[k])?"hi":"")+'">'+(vit[k]?esc(vit[k])+(u?" "+u:""):"–")+'</b>').join("")+'</div>'+
+ '<h4>Allergy <button data-flag="allergy" title="Edit allergy">+</button></h4><p style="color:'+(C.flags.allergy?"var(--red)":"inherit")+'">'+esc(C.flags.allergy||"–")+'</p>'+
+ '<h4>Remarks <button data-flag="remarks" title="Edit remarks">+</button></h4><p>'+esc(C.flags.remarks||"–")+'</p><div style="padding:8px 10px"><button class="btn" onclick="location.hash=\\'\\'">‹ All patients</button></div></aside>';
+ const tabs=[["asmt","Assessment"],["home","Home"],["hist","Visit History"],["monitor","Monitoring","mon"],["res","Results"],["ord","Orders"],["med","Medicines"],["req","Requests"]];
+ $("#app").innerHTML='<div class="chart">'+side+'<section><div class="tabs">'+tabs.map(([k,l,i])=>'<button data-t="'+k+'" class="'+(TAB===k?"on":"")+'">'+ic(i||k)+l+'</button>').join("")+'</div><div id="pane"></div></section></div>';
+ $$(".tabs button").forEach(b=>b.onclick=()=>{TAB=b.dataset.t;drawChart()});
+ $$("[data-go]").forEach(b=>b.onclick=()=>{TAB=b.dataset.go;drawChart()});
+ $$("[data-flag]").forEach(b=>b.onclick=async()=>{const k=b.dataset.flag;const pid=p.id||v.patient?.id;if(!pid)return toast("This patient has no Patient ID yet");
+  const x=prompt2(k==="allergy"?"Allergies (drugs, food)":"Remarks",C.flags[k],async(val)=>{await api("/api/hmis/flags",{patientId:pid,[k]:val});C.flags[k]=val;drawChart();toast("Saved")})});
+ ({asmt:paneAssessment,home:paneHome,hist:paneHistory,monitor:paneMonitor,res:paneResults,ord:paneOrders,med:paneMeds,req:paneRequests}[TAB])();
+}
+function prompt2(title,val,onOk){const m=document.createElement("div");m.className="modal";m.innerHTML='<div><h3 style="margin-top:0">'+esc(title)+'</h3><textarea id="pv" rows="4" style="width:100%;border:1px solid var(--line);border-radius:6px;padding:8px">'+esc(val||"")+'</textarea><div class="acts" style="margin-top:10px"><button class="btn" id="pc">Cancel</button><button class="btn p" id="po">Save</button></div></div>';
+ document.body.appendChild(m);$("#pc",m).onclick=()=>m.remove();$("#po",m).onclick=async()=>{try{await onOk($("#pv",m).value);m.remove()}catch(e){toast(e.message)}}}
+const panel=(title,head,rows,empty="No data available",extra="")=>'<div class="panel"><h3>'+title+extra+'</h3><table><thead><tr>'+head.map(h=>'<th>'+h+'</th>').join("")+'</tr></thead><tbody>'+(rows.length?rows.join(""):'<tr><td colspan="'+head.length+'" class="empty">'+empty+'</td></tr>')+'</tbody></table></div>';
+
+function paneHome(){
+ const H=C.history,v=C.visit;
+ const notes=[];H.forEach(h=>{});(v.notes||[]).forEach(n=>notes.push('<tr><td>'+tm(n.at).slice(0,10)+'</td><td>'+esc(n.template)+'</td><td>'+esc(n.by)+'</td></tr>'));
+ const icd=(v.icd||[]).map(i=>'<tr><td>'+tm(i.at).slice(0,10)+'</td><td>'+esc(i.text)+'</td><td>'+esc(i.by)+'</td></tr>');
+ const labs=[];H.forEach(h=>(h.reports||[]).forEach(r=>labs.push('<tr><td>'+dt(r.date)+'</td><td>'+esc(r.test)+'</td><td>'+(r.status==="reported"?'<span class="pill grn">Reported</span>':'<span class="pill amb">'+esc(r.status)+'</span>')+'</td></tr>')));
+ const rx=[];H.forEach(h=>((h.rx&&h.rx.items)||[]).forEach(i=>rx.push('<tr><td>'+dt(h.date)+'</td><td>'+esc([i.form,i.generic,i.strength].filter(Boolean).join(" "))+'</td><td>'+esc(i.frequency)+'</td><td>'+esc(i.duration)+'</td></tr>')));
+ const dx=H.filter(h=>h.diagnosis).map(h=>'<tr><td>'+dt(h.date)+'</td><td>'+esc(h.diagnosis)+'</td><td>'+esc(h.doctor)+'</td></tr>');
+ const svc=C.letters.map(l=>'<tr><td>'+dt(l.date)+'</td><td>'+esc(l.title)+' '+esc(l.no)+'</td><td>'+esc(l.doctor?.name)+'</td></tr>');
+ $("#pane").innerHTML='<div class="grid2">'+panel("Visit history",["Date","Visit type","Doctor","Diagnosis"],H.slice(0,8).map(h=>'<tr><td>'+dt(h.date)+'</td><td>OP</td><td>'+esc(h.doctor)+'</td><td>'+esc(h.diagnosis||h.complaint)+'</td></tr>'))+
+ panel("Diagnosis",["Date","Diagnosis","Doctor"],dx)+panel("Lab & scan history",["Date","Test","Status"],labs)+panel("ICD history",["Date","ICD / diagnosis","Doctor"],icd)+
+ panel("Notes history",["Date","Notes","Doctor"],notes)+panel("Prescription history",["Date","Medicine","Frequency","Days"],rx.slice(0,15))+panel("Certificates & letters",["Date","Document","Doctor"],svc)+'</div>';
+}
+
+// ---------- assessment templates ----------
+const TPL={
+ "OPD assessment":{f:[["cc","Chief complaints",3],["hpi","History of present illness",4],["past","Past history (medical, surgical)",2],["drug","Drug history",2],["family","Family history",1],["social","Social history",1]],
+  ck:[["Individual history",["Smoker","Alcohol","Tobacco chewing","Vegetarian","Mixed diet","Sleep normal","Bowel normal","Bladder normal"]],["General examination",["Conscious","Oriented","Pallor","Icterus","Cyanosis","Clubbing","Lymphadenopathy","Pedal oedema"]],["Systems",["CVS: S1 S2 heard","RS: B/L air entry equal","P/A: soft, non-tender","CNS: no focal deficit"]]],
+  f2:[["local","Local examination",3],["impression","Clinical impression",2],["plan","Plan",3]]},
+ "Doctor's progress note":{f:[["subj","Subjective",2],["obj","Objective / examination",3],["assess","Assessment",2],["plan","Plan",3]],ck:[],f2:[]},
+ "Pre-anaesthetic check":{f:[["airway","Airway (Mallampati, mouth opening, neck)",2],["cvsrs","Cardio-respiratory",2],["inv","Investigations reviewed",2]],ck:[["Risk",["ASA I","ASA II","ASA III","ASA IV","Difficult airway","NBM confirmed","Consent taken"]]],f2:[["plan","Anaesthesia plan",2]]},
+ "Post-operative note":{f:[["proc","Procedure done",2],["find","Findings",3],["anaes","Anaesthesia",1],["ebl","Blood loss / drains / specimens",2]],ck:[["Status",["Stable","Shifted to ward","Shifted to ICU","Specimen sent for HPE"]]],f2:[["orders","Post-op orders",4]]},
+ "Discharge summary":{f:[["dx","Final diagnosis",2],["course","Course in hospital",4],["proc","Procedures done",2],["cond","Condition at discharge",1],["meds","Medicines on discharge",4],["advice","Advice and review",3]],ck:[],f2:[]},
+};
+let TP="OPD assessment";
+function paneAssessment(){
+ const v=C.visit,cs=v.caseSheet||{},t=TPL[TP];
+ const pre={cc:(cs.chiefComplaints||[]).map(c=>c.complaint+(c.duration?" – "+c.duration:"")).join("; "),hpi:cs.hpi||"",past:[cs.past?.medical,cs.past?.surgical].filter(Boolean).join("; "),drug:cs.past?.drugs||"",family:cs.family||"",social:[cs.habits?.smoking,cs.habits?.alcohol].filter(Boolean).join("; "),dx:v.rx?.dx||"",meds:((v.rx&&v.rx.items)||[]).map(i=>[i.form,i.generic,i.strength,i.dose,i.frequency,i.timing,i.duration].filter(Boolean).join(" ")).join("\\n")};
+ const fld=([k,l,r])=>'<label class="f">'+l+'<textarea name="'+k+'" rows="'+r+'">'+esc(pre[k]||"")+'</textarea></label>';
+ $("#pane").innerHTML='<div class="panel"><h3>Assessment <small>Choose a template; the check-in answers are filled in.</small></h3><div class="pb"><div class="fr"><label class="f">Template<select id="tp">'+Object.keys(TPL).map(k=>'<option'+(k===TP?" selected":"")+'>'+k+'</option>').join("")+'</select></label><label class="f">Diagnosis / ICD-10 (optional)<input id="icd" placeholder="e.g. K30 Functional dyspepsia"></label></div>'+
+ t.f.map(fld).join("")+t.ck.map(([g,items])=>'<div class="cks"><b>'+g+'</b>'+items.map(x=>'<label><input type="checkbox" data-g="'+esc(g)+'" value="'+esc(x)+'">'+esc(x)+'</label>').join("")+'</div>').join("")+t.f2.map(fld).join("")+
+ '<div class="acts"><button class="btn" onclick="window.print()">Print</button><button class="btn p" id="sv">Save note</button></div></div></div><h3 style="margin:16px 0 8px;font-size:14px">Saved notes</h3><div style="display:grid;gap:8px">'+
+ ((v.notes||[]).slice().reverse().map(n=>'<div class="note"><h5>'+esc(n.template)+'</h5><div class="m">'+tm(n.at)+' · '+esc(n.by)+(n.icd?" · "+esc(n.icd):"")+'</div><dl>'+Object.entries(n.fields).filter(([,x])=>x&&x.length).map(([k,x])=>'<dt>'+esc(k)+'</dt><dd>'+esc(Array.isArray(x)?x.join(", "):x)+'</dd>').join("")+'</dl></div>').join("")||'<div class="empty">No notes yet.</div>')+'</div>';
+ $("#tp").onchange=(e)=>{TP=e.target.value;paneAssessment()};
+ $("#sv").onclick=async()=>{const fields={};const labels={};[...t.f,...t.f2].forEach(([k,l])=>labels[k]=l);
+  $$("#pane textarea").forEach(x=>{if(x.value.trim())fields[labels[x.name]||x.name]=x.value.trim()});
+  t.ck.forEach(([g])=>{const on=$$('#pane input[data-g="'+g+'"]:checked').map(x=>x.value);if(on.length)fields[g]=on});
+  try{await api("/api/hmis/note",{visitId:v.id,template:TP,fields,icd:$("#icd").value});toast("Note saved");chart(v.id,true)}catch(e){toast(e.message)}};
+}
+function paneHistory(){
+ $("#pane").innerHTML=panel("Visit history",["Date","Visit","Doctor","Diagnosis","Prescription","Results"],C.history.map((h,i)=>'<tr><td>'+dt(h.date)+'</td><td>OP · token '+esc(h.token)+'</td><td>'+esc(h.doctor)+'</td><td>'+esc(h.diagnosis||h.complaint)+'</td><td>'+(h.rx&&h.rx.items&&h.rx.items.length?'<button class="btn" data-h="'+i+'">View ('+h.rx.items.length+')</button>':"–")+'</td><td>'+(h.reports||[]).filter(r=>r.status==="reported").length+'/'+(h.reports||[]).length+'</td></tr>'));
+ $$("[data-h]").forEach(b=>b.onclick=()=>{const h=C.history[+b.dataset.h];modal('<div class="rep"><h2>Prescription · '+dt(h.date)+'</h2><p>'+esc(h.diagnosis)+'</p>'+rxTable(h.rx.items)+'</div>')});
+}
+function rxTable(items){return '<table><thead><tr><th>#</th><th>Medicine</th><th>Dose</th><th>Frequency</th><th>Food</th><th>Duration</th></tr></thead><tbody>'+items.map((i,n)=>'<tr><td>'+(n+1)+'</td><td><b>'+esc([i.form,i.generic,i.strength].filter(Boolean).join(" "))+'</b>'+(i.instructions?'<br><small>'+esc(i.instructions)+'</small>':"")+'</td><td>'+esc(i.dose)+'</td><td>'+esc(i.frequency)+'</td><td>'+esc(i.timing)+'</td><td>'+esc(i.duration)+'</td></tr>').join("")+'</tbody></table>'}
+function modal(html){const m=document.createElement("div");m.className="modal";m.innerHTML='<div>'+html+'<div class="acts" style="margin-top:12px"><button class="btn" id="mp">Print</button><button class="btn p" id="mc">Close</button></div></div>';document.body.appendChild(m);
+ $("#mc",m).onclick=()=>m.remove();m.onclick=(e)=>{if(e.target===m)m.remove()};$("#mp",m).onclick=()=>{const w=window.open("","_blank");if(!w){toast("Allow pop-ups to print");return}w.document.write('<html><head><title>Rx Clinic</title><style>body{font:14px system-ui;padding:20px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px;text-align:left}</style></head><body>'+m.firstChild.innerHTML.replace(/<div class="acts"[\\s\\S]*$/,"")+'</body></html>');w.document.close();w.print()}}
+
+// ---------- monitoring ----------
+function paneMonitor(){
+ const log=(C.visit.vitalsLog||[]).slice().reverse();
+ const F=[["temp","Body temp (°F)"],["pulse","Pulse (/min)"],["bp","Blood pressure (mmHg)"],["rr","Resp. rate (/min)"],["spo2","SpO₂ (%)"],["o2","O₂ support (L/min)"],["height","Height (cm)"],["weight","Weight (kg)"],["rbs","RBS (mg/dL)"],["pain","Pain score (0–10)"]];
+ $("#pane").innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.4fr)"><div class="panel"><h3>Add vitals <small>'+tm(Date.now())+'</small></h3><div class="pb"><div class="fr">'+F.map(([k,l])=>'<label class="f">'+l+'<input name="'+k+'" inputmode="'+(k==="bp"?"text":"decimal")+'"></label>').join("")+'</div><label class="f">Note<input name="note"></label><div class="acts"><button class="btn p" id="vs">Save vitals</button></div></div></div>'+
+ panel("Vitals chart",["Time","Temp","Pulse","BP","RR","SpO₂","O₂","Wt","BMI","RBS","Pain","By"],log.map(e=>'<tr><td>'+tm(e.at)+'</td>'+["temp","pulse","bp","rr","spo2","o2","weight","bmi","rbs","pain"].map(k=>'<td style="'+(hi(k,e.vitals[k])?"color:var(--red);font-weight:700":"")+'">'+esc(e.vitals[k]||"")+'</td>').join("")+'<td>'+esc(e.by)+'</td></tr>'),"No vitals recorded yet")+'</div>';
+ $("#vs").onclick=async()=>{const vit={};$$("#pane .pb input").forEach(x=>{if(x.name!=="note")vit[x.name]=x.value.trim()});if(!Object.values(vit).some(Boolean))return toast("Enter at least one value");
+  try{await api("/api/hmis/vitals",{visitId:C.visit.id,vitals:vit,note:$('#pane input[name=note]').value});toast("Vitals saved");chart(C.visit.id,true)}catch(e){toast(e.message)}};
+}
+
+// ---------- results ----------
+function paneResults(){
+ const done=C.orders.filter(o=>o.status==="reported"),pend=C.orders.filter(o=>o.status!=="reported");
+ $("#pane").innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.8fr) minmax(0,1.6fr)">'+panel("Investigations",["Test","Status"],C.orders.map((o,i)=>'<tr class="r" data-o="'+i+'"><td><b>'+esc(o.test)+'</b><br><small>'+esc(o.modality||"Lab")+' · '+dt(o.date)+'</small></td><td>'+(o.status==="reported"?'<span class="pill grn">Reported</span>':'<span class="pill amb">'+esc(o.status)+'</span>')+'</td></tr>'),"No tests ordered for this visit")+'<div id="rv" class="panel"><h3>Result view</h3><div class="empty">'+(done.length?"Choose a report on the left.":pend.length?pend.length+" test(s) waiting for results.":"Order tests from the Orders tab.")+'</div></div></div>';
+ $$("[data-o]").forEach(tr=>tr.onclick=()=>{const o=C.orders[+tr.dataset.o],p=C.patient||C.visit.patient||{};
+  $("#rv").innerHTML='<h3>Result view <small>'+esc(o.status==="reported"?"Final report":"Pending")+'</small></h3><div class="pb rep" id="rep"><h2>'+esc(o.test)+'</h2><div class="m" style="color:var(--muted)">'+esc(p.name)+' · '+esc(p.id||"")+' · '+esc([p.age?p.age+"Y":"",p.sex].filter(Boolean).join(" / "))+' · ordered '+tm(o.orderedAt)+(o.reportedAt?" · reported "+tm(o.reportedAt):"")+'</div>'+
+  (o.status==="reported"?'<div style="white-space:pre-wrap;border:1px solid var(--line);border-radius:6px;padding:10px">'+esc(o.result||"")+'</div>'+(o.impression?'<p><b>Impression:</b> '+esc(o.impression)+'</p>':""):'<p>Status: '+esc(o.status)+'</p>')+'<div class="acts"><button class="btn" id="rp">Print report</button></div></div>';
+  $("#rp").onclick=()=>modal($("#rep").innerHTML.replace(/<div class="acts">[\\s\\S]*$/,""))});
+}
+
+// ---------- orders ----------
+let CAT=null;
+async function paneOrders(){
+ $("#pane").innerHTML='<div class="empty">Loading price list…</div>';
+ if(!CAT){try{const [l,d]=await Promise.all([api("/api/tariff/list",{dept:"lab"}),api("/api/tariff/list",{dept:"diagnostics"})]);CAT=[...l.tariff.map(t=>({...t,k:"Lab"})),...d.tariff.map(t=>({...t,k:"Imaging"}))]}catch{CAT=[]}}
+ const have=new Set(C.orders.map(o=>o.test.toLowerCase()));
+ $("#pane").innerHTML='<div class="grid2"><div class="panel"><h3>New orders</h3><div class="pb"><input id="os" placeholder="Search tests and scans" style="border:1px solid var(--line);border-radius:5px;padding:7px 9px"><div class="cat" id="oc"></div><label class="f">Other test (type and press Add)<div style="display:flex;gap:6px"><input id="ot" style="flex:1"><button class="btn" id="oa">Add</button></div></label><div id="sel" class="cks"></div><div class="acts"><button class="btn p" id="op">Place orders</button></div></div></div>'+
+ panel("Orders for this visit",["Test","Type","Status","Ordered"],C.orders.map(o=>'<tr><td>'+esc(o.test)+'</td><td>'+esc(o.modality||"Lab")+'</td><td>'+(o.status==="reported"?'<span class="pill grn">Reported</span>':'<span class="pill amb">'+esc(o.status)+'</span>')+'</td><td>'+tm(o.orderedAt)+'</td></tr>'),"No orders yet")+'</div>';
+ const pick=new Set();
+ const drawCat=()=>{const q=$("#os").value.toLowerCase();$("#oc").innerHTML=CAT.filter(t=>!q||t.name.toLowerCase().includes(q)).map(t=>'<label><input type="checkbox" value="'+esc(t.name)+'"'+(pick.has(t.name)?" checked":"")+(have.has(t.name.toLowerCase())?" disabled":"")+'>'+esc(t.name)+'<span>'+t.k+' · ₹'+Math.round(t.price).toLocaleString("en-IN")+'</span></label>').join("")||'<div class="empty">No match. Use "Other test".</div>';
+  $$("#oc input").forEach(c=>c.onchange=()=>{c.checked?pick.add(c.value):pick.delete(c.value);drawSel()})};
+ const drawSel=()=>{$("#sel").innerHTML=[...pick].map(x=>'<span class="pill">'+esc(x)+'</span>').join(" ")};
+ $("#os").oninput=drawCat;drawCat();
+ $("#oa").onclick=()=>{const x=$("#ot").value.trim();if(x){pick.add(x);$("#ot").value="";drawSel()}};
+ $("#op").onclick=async()=>{if(!pick.size)return toast("Choose at least one test");try{const r=await api("/api/orders/create",{visitId:C.visit.id,tests:[...pick]});toast(r.created+" order(s) sent to lab and diagnostics");chart(C.visit.id,true)}catch(e){toast(e.message)}};
+}
+
+// ---------- medicines ----------
+let STOCK=null;
+async function paneMeds(){
+ if(!STOCK){try{STOCK=(await api("/api/pharmacy/stock")).stock}catch{STOCK=[]}}
+ const v=C.visit,rx=JSON.parse(JSON.stringify(v.rx||{items:[]}));rx.items=rx.items||[];
+ const inStock=(g)=>{g=(g||"").toLowerCase();return STOCK.some(s=>s.generic.length>=4&&(s.stock||0)>0&&(g.includes(s.generic.toLowerCase())||s.generic.toLowerCase().includes(g)))};
+ const row=(i,n)=>'<tr data-n="'+n+'">'+["form","generic","strength","dose","frequency","timing","duration","instructions"].map(k=>k==="timing"?'<td><select data-k="timing">'+["After food","Before food","With food","Empty stomach","At bedtime","As needed"].map(o=>'<option'+(i.timing===o?" selected":"")+'>'+o+'</option>').join("")+'</select></td>':'<td><input data-k="'+k+'" value="'+esc(i[k]||"")+'"'+(k==="generic"?' list="stk"':"")+'></td>').join("")+'<td>'+(i.generic?(inStock(i.generic)?'<span class="pill grn">In pharmacy</span>':'<span class="pill red">Not in pharmacy</span>'):"")+'</td><td><button class="btn d" data-del="'+n+'">✕</button></td></tr>';
+ $("#pane").innerHTML='<div class="panel"><h3>Prescription <small>'+(v.status==="sent"||v.status==="dispensed"?"Sent to pharmacy":"Draft")+'</small></h3><div class="pb"><label class="f">Diagnosis<input id="dx" value="'+esc(rx.dx||"")+'"></label><div style="overflow:auto"><table class="rx" style="min-width:980px"><thead><tr><th>Form</th><th>Generic</th><th>Strength</th><th>Dose</th><th>Frequency</th><th>Food</th><th>Duration</th><th>Instructions</th><th>Stock</th><th></th></tr></thead><tbody id="rb">'+rx.items.map(row).join("")+'</tbody></table></div>'+
+ '<datalist id="stk">'+STOCK.map(s=>'<option value="'+esc(s.generic)+'">'+esc([s.strength,s.form,(s.stock||0)+" in stock"].filter(Boolean).join(" · "))+'</option>').join("")+'</datalist><div><button class="btn" id="add">+ Add medicine</button></div>'+
+ '<label class="f">Advice (one per line)<textarea id="adv" rows="3">'+esc((rx.advice||[]).join("\\n"))+'</textarea></label><div class="fr"><label class="f">Review date<input type="date" id="rvd" value="'+esc(rx.review||"")+'"></label><label class="f">Review note<input id="rvn" value="'+esc(rx.reviewNote||"")+'"></label></div>'+
+ '<div class="acts"><button class="btn" id="pr">Print</button><button class="btn" id="dr">Save draft</button><button class="btn p" id="snd">Finish & send to pharmacy</button></div></div></div>';
+ const read=()=>{rx.items=$$("#rb tr").map(tr=>{const o={};$$("[data-k]",tr).forEach(x=>o[x.dataset.k]=x.value.trim());return o}).filter(i=>i.generic);rx.dx=$("#dx").value.trim();rx.advice=$("#adv").value.split("\\n").map(x=>x.trim()).filter(Boolean);rx.review=$("#rvd").value;rx.reviewNote=$("#rvn").value.trim();return rx};
+ const redraw=()=>{$("#rb").innerHTML=rx.items.map(row).join("");$$("[data-del]").forEach(b=>b.onclick=()=>{read();rx.items.splice(+b.dataset.del,1);redraw()});$$('#rb input[data-k=generic]').forEach(x=>x.onchange=()=>{read();redraw()})};
+ redraw();
+ $("#add").onclick=()=>{read();rx.items.push({form:"Tab",dose:"1 tab",frequency:"1-0-1",timing:"After food",duration:"5 days"});redraw();$$('#rb input[data-k=generic]').slice(-1)[0].focus()};
+ const save=async(send)=>{read();if(send&&!rx.items.length)return toast("Add at least one medicine");
+  try{await api("/api/doctor/visit/save",{id:v.id,patch:Object.assign({rx},send?{status:"sent"}:{})});toast(send?"Prescription saved and sent to the pharmacy":"Draft saved");chart(v.id,true)}catch(e){toast(e.message)}};
+ $("#dr").onclick=()=>save(false);$("#snd").onclick=()=>save(true);
+ $("#pr").onclick=()=>{read();const p=C.patient||v.patient||{};modal('<div class="rep"><h2>℞ Prescription</h2><p><b>'+esc(p.name)+'</b> · '+esc(p.id||"")+' · '+esc([p.age?p.age+"Y":"",p.sex].filter(Boolean).join(" / "))+' · '+new Date().toLocaleDateString("en-GB")+'</p>'+(rx.dx?'<p><b>Diagnosis:</b> '+esc(rx.dx)+'</p>':"")+rxTable(rx.items)+(rx.advice.length?'<p><b>Advice</b></p><ul>'+rx.advice.map(a=>'<li>'+esc(a)+'</li>').join("")+'</ul>':"")+(rx.review?'<p><b>Review:</b> '+dt(rx.review)+' '+esc(rx.reviewNote)+'</p>':"")+'<p style="text-align:right;margin-top:30px">'+esc(ME.name||"")+'</p></div>')};
+}
+
+// ---------- requests ----------
+let DOCS=null;
+async function paneRequests(){
+ const subs=[["consult","Cross consultation"],["admit","Admission"],["surgery","Surgery"],["appt","Appointment"],["diet","Diet advice"]];
+ $("#pane").innerHTML='<div class="sub">'+subs.map(([k,l])=>'<button data-s="'+k+'" class="'+(SUB===k?"on":"")+'">'+l+'</button>').join("")+'</div><div class="grid2" style="grid-template-columns:minmax(0,1fr) minmax(0,1.2fr)"><div class="panel"><div class="pb" id="rf"></div></div>'+
+ panel("History",["Date","Request","Details","Status"],C.requests.map(r=>'<tr><td>'+tm(r.created)+'</td><td>'+esc({consult:"Cross consultation",surgery:"Surgery",diet:"Diet advice"}[r.type])+'</td><td>'+esc(r.toDoctor||r.fields.procedure||r.fields.diet||r.fields.remarks||"")+(r.reply?'<br><small>Reply: '+esc(r.reply.text)+'</small>':"")+'</td><td><span class="pill '+(r.status==="open"?"amb":"grn")+'">'+esc(r.status)+'</span></td></tr>'),"No requests yet")+'</div>';
+ $$(".sub button").forEach(b=>b.onclick=()=>{SUB=b.dataset.s;paneRequests()});
+ const f=$("#rf"),v=C.visit,p=C.patient||v.patient||{};
+ const send=async(type,fields,toDoctor)=>{try{await api("/api/hmis/request",{visitId:v.id,type,fields,toDoctor});toast("Request sent");chart(v.id,true)}catch(e){toast(e.message)}};
+ if(SUB==="consult"){if(!DOCS){try{DOCS=(await api("/api/hmis/doctors")).doctors}catch{DOCS=[]}}
+  f.innerHTML='<label class="f">Doctor<select id="cd"><option value="">Choose a doctor</option>'+DOCS.filter(d=>d.name!==ME.name).map(d=>'<option>'+esc(d.name)+'</option>').join("")+'</select></label><label class="f">Department / unit (optional)<input id="cu" placeholder="e.g. Cardiology"></label><label class="f">Reason and remarks<textarea id="cr" rows="4"></textarea></label><div class="acts"><button class="btn p" id="cs">Send request</button></div>';
+  $("#cs").onclick=()=>{if(!$("#cd").value&&!$("#cu").value)return toast("Choose a doctor or a unit");send("consult",{unit:$("#cu").value,remarks:$("#cr").value},$("#cd").value)}}
+ else if(SUB==="admit"){
+  if(C.admission){f.innerHTML='<p>Already admitted: <b>'+esc(C.admission.no)+'</b> · '+esc(C.admission.ward+" "+C.admission.bed)+'</p>';return}
+  let wards=[];try{wards=(await api("/api/tariff/list",{dept:"ip"})).tariff.filter(t=>t.unit==="per day"&&!/nursing|oxygen/i.test(t.name))}catch{}
+  f.innerHTML='<label class="f">Ward / room<select id="aw">'+wards.map(w=>'<option value="'+esc(w.name)+'">'+esc(w.name)+' · ₹'+Math.round(w.price).toLocaleString("en-IN")+'/day</option>').join("")+'</select></label><div class="fr"><label class="f">Bed<input id="ab"></label><label class="f">Expected stay (days)<input id="ad" inputmode="numeric"></label></div><label class="f">Reason / diagnosis<textarea id="ar" rows="3">'+esc(v.rx?.dx||"")+'</textarea></label><div class="acts"><button class="btn p" id="as">Admit</button></div>';
+  $("#as").onclick=async()=>{if(!p.id)return toast("Register the patient first");try{await api("/api/ip/admit",{patientId:p.id,ward:$("#aw").value,bed:$("#ab").value,doctor:ME.name,reason:$("#ar").value+($("#ad").value?" · expected "+$("#ad").value+" days":"")});toast("Patient admitted");chart(v.id,true)}catch(e){toast(e.message)}}}
+ else if(SUB==="surgery"){
+  f.innerHTML='<div class="fr"><label class="f">Surgery date<input type="date" id="sd" value="'+today()+'"></label><label class="f">Time<input type="time" id="st"></label></div><label class="f">Procedure<input id="sp" placeholder="e.g. Laparoscopic cholecystectomy"></label><div class="fr"><label class="f">Surgeon<input id="ss" value="'+esc(ME.name||"")+'"></label><label class="f">Anaesthetist<input id="sa"></label></div><div class="fr"><label class="f">Anaesthesia<select id="sn"><option>General</option><option>Spinal</option><option>Regional block</option><option>Local</option><option>Sedation</option></select></label><label class="f">Urgency<select id="su"><option>Elective</option><option>Urgent</option><option>Emergency</option></select></label></div><label class="f">Remarks / special equipment<textarea id="sr" rows="2"></textarea></label><div class="acts"><button class="btn p" id="sb">Book surgery</button></div>';
+  $("#sb").onclick=()=>{if(!$("#sp").value.trim())return toast("Enter the procedure");send("surgery",{date:$("#sd").value,time:$("#st").value,procedure:$("#sp").value,surgeon:$("#ss").value,anaesthetist:$("#sa").value,anaesthesia:$("#sn").value,urgency:$("#su").value,remarks:$("#sr").value})}}
+ else if(SUB==="appt"){
+  let day=today(),slot="",part="all";
+  const draw=async()=>{const days=[...Array(7)].map((_,i)=>{const d=new Date();d.setDate(d.getDate()+i+1);return new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10)});if(day===today())day=days[0];
+   let sl=[];try{sl=(await (await fetch("/api/slots?date="+day)).json()).slots||[]}catch{}
+   const inPart=(t)=>{const h=+t.slice(0,2);return part==="all"||(part==="m"&&h<12)||(part==="a"&&h>=12&&h<16)||(part==="e"&&h>=16)};
+   f.innerHTML='<b>Review appointment for '+esc(p.name)+'</b><div class="days">'+days.map(d=>{const x=new Date(d+"T00:00");return '<button data-d="'+d+'" class="'+(d===day?"on":"")+'">'+x.toLocaleDateString("en-GB",{weekday:"short"})+'<b>'+x.getDate()+'</b>'+x.toLocaleDateString("en-GB",{month:"short"})+'</button>'}).join("")+'</div><div class="sub">'+[["all","All"],["m","Morning"],["a","Afternoon"],["e","Evening"]].map(([k,l])=>'<button data-p="'+k+'" class="'+(part===k?"on":"")+'">'+l+'</button>').join("")+'</div><div class="slots">'+(sl.filter(s=>inPart(s.t)).map(s=>'<button data-t="'+s.t+'" '+(s.free?"":"disabled")+' class="'+(slot===s.t?"on":"")+'">'+s.t+'</button>').join("")||'<span style="color:var(--muted)">No slots</span>')+'</div><label class="f">Mode<select id="am"><option value="clinic">At the clinic</option><option value="tele">Video consultation</option></select></label><div class="acts"><button class="btn p" id="ab2">Save appointment</button></div>';
+   $$("[data-d]",f).forEach(b=>b.onclick=()=>{day=b.dataset.d;slot="";draw()});$$("[data-p]",f).forEach(b=>b.onclick=()=>{part=b.dataset.p;draw()});$$("[data-t]",f).forEach(b=>b.onclick=()=>{slot=b.dataset.t;$$("[data-t]",f).forEach(x=>x.classList.toggle("on",x===b))});
+   $("#ab2").onclick=async()=>{if(!slot)return toast("Choose a time");if(!(p.phone||v.patient?.phone))return toast("This patient has no mobile number");
+    try{const r=await fetch("/api/book",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:p.name,age:p.age,sex:p.sex,phone:p.phone||v.patient.phone,date:day,time:slot,mode:$("#am").value,reason:"Review",lang:v.lang||"en"})});const j=await r.json();if(!r.ok)throw new Error(j.error);toast("Booked "+dt(day)+" "+slot+" · code "+j.appointment.code)}catch(e){toast(e.message)}}};
+  draw()}
+ else{const T={"Diabetic":"Avoid sugar, sweets and fruit juices. Small meals every 3–4 hours. Whole grains, vegetables, dal. Walk 30 minutes daily.","Low salt (BP / heart)":"Less than 5 g salt a day. Avoid pickles, papad, chips and processed food. More fruits and vegetables.","Acid peptic":"Avoid spicy, sour and oily food, tea and coffee on an empty stomach. Eat on time. No smoking or alcohol. Do not lie down for 2 hours after food.","Soft / liquid diet":"Soft, easily digestible food: idli, kanji, curd rice, soups. Plenty of fluids.","High protein":"Eggs, dal, paneer, milk, fish or chicken daily. Helps healing after surgery and illness.","Renal":"Limit salt, potassium-rich fruits and protein as advised. Measure fluid intake."};
+  f.innerHTML='<label class="f">Quick templates</label><div class="cks">'+Object.keys(T).map(k=>'<button class="chip" data-tp="'+esc(k)+'">'+esc(k)+'</button>').join("")+'</div><label class="f">Diet advice<textarea id="dt" rows="6"></textarea></label><div class="acts"><button class="btn p" id="ds">Save diet advice</button></div>';
+  $$("[data-tp]",f).forEach(b=>b.onclick=()=>{$("#dt").value=($("#dt").value?$("#dt").value+"\\n":"")+T[b.dataset.tp]});
+  $("#ds").onclick=()=>{if(!$("#dt").value.trim())return toast("Write the advice");send("diet",{diet:$("#dt").value})}}
+}
+route();
 </script></body></html>`;
 }

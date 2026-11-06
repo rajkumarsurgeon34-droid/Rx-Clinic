@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.PriceChange
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Inbox
+import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.WorkspacePremium
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
@@ -296,7 +297,7 @@ internal fun AccountButton(vm: CallViewModel, onSignedOut: () -> Unit) {
 // ---------------- Nursing staff: OPD triage vitals ----------------
 
 @Composable
-fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
+fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onHmis: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("staff") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
@@ -323,6 +324,7 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
             add("Patients" to onPatients)
             if (vm.prefs.has("ip")) add("Inpatients" to onInpatients)
             add("Follow-ups" to onFollowUps)
+            add("HMIS" to onHmis)
         })
         Text("Today's checked-in patients. Record vitals before they see the doctor; they appear on the doctor's case sheet. Mark emergencies so they go to the top of the doctor's queue.",
             color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
@@ -758,6 +760,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             item { RoleCard("Plan", "Bronze, Silver, Gold or Platinum; add-ons; logins in use", Icons.Filled.WorkspacePremium) { onOpen("plan") } }
             item { RoleCard("Clinic QR code", "Patients scan to book; print a poster for the desk", Icons.Filled.QrCode2) { qr = true } }
             item { RoleCard("Free trial requests", "Clinics that asked for a trial on the website", Icons.Filled.Inbox) { leads = true } }
+            item { RoleCard("HMIS workspace", "Doctor's dashboard and patient charts, as on the website", Icons.Filled.Dashboard) { onOpen("hmis") } }
             item { RoleCard("Web portal", "Sign in from any computer or browser: ${vm.prefs.serverUrl.trimEnd('/')}/login", Icons.Filled.Language) {
                 runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.prefs.serverUrl.trimEnd('/') + "/login"))) }
             } }
