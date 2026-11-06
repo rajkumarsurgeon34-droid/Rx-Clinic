@@ -11,6 +11,7 @@ object Ui {
     val Surface = Color(0xFFFFFFFF)
     val Card = Color(0xFFFFFFFF)
     val CardHigh = Color(0xFFE8EFED)
+    val Rose = Color(0xFFC95C5C)
     val Line = Color(0xFFD6E0DD)
     val Blue = Color(0xFF0E6A64)     // primary: scrub green
     val Teal = Color(0xFF0E6A64)     // accent text

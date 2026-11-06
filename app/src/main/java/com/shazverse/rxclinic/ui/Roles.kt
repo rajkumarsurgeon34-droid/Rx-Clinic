@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.PriceChange
 import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.WorkspacePremium
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.LocalHospital
@@ -40,6 +41,15 @@ import androidx.compose.material.icons.filled.LocalPharmacy
 import androidx.compose.material.icons.filled.MedicalServices
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -95,41 +105,114 @@ private fun signedOutError(e: Exception) = e.message?.contains("Sign in", ignore
 @Composable
 fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (String) -> Unit) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var username by remember { mutableStateOf(vm.prefs.staffUsername) }
     var password by remember { mutableStateOf("") }
+    var show by remember { mutableStateOf(false) }
+    var remember by remember { mutableStateOf(true) }
     var err by remember { mutableStateOf<String?>(null) }
+    var info by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var lic by remember { mutableStateOf<JSONObject?>(null) }
     var mustChange by remember { mutableStateOf<String?>(null) } // role, while the first-sign-in password change is open
-    val title = ROLE_TITLES[role] ?: "Staff"
-    Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState())) {
-        TopBar("$title sign-in", onBack)
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Sign in with the username and password the admin gave you.", color = Ui.Muted)
-            OutlinedTextField(
-                username, { username = it.trim().lowercase().take(32) }, label = { Text("Username") }, singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), modifier = Modifier.fillMaxWidth(),
-            )
-            PasswordField(password, { password = it }, "Password")
-            ErrorText(err)
-            Button(
-                onClick = {
-                    busy = true; err = null
-                    scope.launch {
-                        try {
-                            val s = Api(vm.prefs.serverUrl).login(username, password)
-                            vm.prefs.saveSession(s.role, s.token)
-                            vm.prefs.staffUsername = s.username
-                            vm.prefs.doctorName = s.name
-                            vm.prefs.staffQual = s.qual; vm.prefs.staffReg = s.reg
-                            vm.prefs.clinicJson = s.clinic.toString()
-                            runCatching { Api(vm.prefs.serverUrl).call("/api/plan", JSONObject().put("session", s.token)).optJSONObject("plan") }.getOrNull()?.let { vm.prefs.planJson = it.toString() }
-                            if (s.mustChange) mustChange = s.role else onIn(s.role)
-                        } catch (e: Exception) { err = e.message } finally { busy = false }
+    LaunchedEffect(Unit) { lic = runCatching { Api(vm.prefs.serverUrl).license() }.getOrNull() }
+
+    fun login() {
+        busy = true; err = null; info = null
+        scope.launch {
+            try {
+                val s = Api(vm.prefs.serverUrl).login(username, password)
+                vm.prefs.saveSession(s.role, s.token)
+                vm.prefs.staffUsername = if (remember) s.username else ""
+                vm.prefs.doctorName = s.name
+                vm.prefs.staffQual = s.qual; vm.prefs.staffReg = s.reg
+                vm.prefs.clinicJson = s.clinic.toString()
+                runCatching { Api(vm.prefs.serverUrl).call("/api/plan", JSONObject().put("session", s.token)).optJSONObject("plan") }.getOrNull()?.let { vm.prefs.planJson = it.toString() }
+                if (s.mustChange) mustChange = s.role else onIn(s.role)
+            } catch (e: Exception) { err = e.message } finally { busy = false }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().background(Ui.Bg).imePadding()) {
+        Row(Modifier.padding(start = 4.dp, top = 4.dp)) { TextButton(onClick = onBack) { Text("‹ Back", color = Ui.Teal) } }
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(12.dp)),
+            ) {
+                Column(Modifier.padding(horizontal = 22.dp, vertical = 26.dp), verticalArrangement = Arrangement.spacedBy(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("℞", color = Ui.Red, fontSize = 40.sp, fontFamily = FontFamily.Serif, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Rx Clinic", color = Ui.Teal, fontSize = 34.sp, fontFamily = FontFamily.Serif, fontWeight = FontWeight.Bold)
                     }
-                },
-                enabled = username.length >= 3 && password.isNotBlank() && !busy, modifier = Modifier.fillMaxWidth().height(50.dp),
-            ) { Text(if (busy) "Signing in…" else "Sign in") }
-            Text("First time? The admin signs in as admin with password admin123, then creates a login for each person.", color = Ui.Muted, fontSize = 12.sp)
+                    Text("HOSPITAL & CLINIC SUITE", color = Ui.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 3.sp)
+                    Text("Sign in", color = Ui.Text, fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
+                    Text(ROLE_TITLES[role] ?: "Staff", color = Ui.Muted, fontSize = 14.sp)
+                    OutlinedTextField(
+                        username, { username = it.trim().lowercase().take(32) }, placeholder = { Text("Username") }, singleLine = true,
+                        trailingIcon = { Icon(Icons.Filled.Person, null, tint = Ui.Muted) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = androidx.compose.ui.text.input.ImeAction.Next), modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        password, { password = it.take(72) }, placeholder = { Text("Password") }, singleLine = true,
+                        visualTransformation = if (show) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = { show = !show }) { Text(if (show) "Hide" else "Show", fontSize = 12.sp, color = Ui.Muted) }
+                                Icon(Icons.Filled.Key, null, tint = Ui.Muted, modifier = Modifier.padding(end = 12.dp))
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { if (username.length >= 3 && password.isNotBlank() && !busy) login() }),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.weight(1f).clickable { remember = !remember }, verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = remember, onCheckedChange = { remember = it })
+                            Text("Remember me", color = Ui.Teal)
+                        }
+                        TextButton(onClick = {
+                            runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.prefs.serverUrl.trimEnd('/') + "/terms"))) }
+                        }) { Icon(Icons.Filled.Description, null, tint = Ui.Teal, modifier = Modifier.size(18.dp)); Text(" Terms", color = Ui.Teal) }
+                    }
+                    err?.let { Text(it, color = Ui.Red, fontSize = 14.sp) }
+                    info?.let { Text(it, color = Ui.Muted, fontSize = 14.sp) }
+                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Button(
+                            onClick = {
+                                vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }
+                                password = ""; err = null; info = "Started a new session. Sign in again."
+                            },
+                            shape = RoundedCornerShape(0.dp), colors = ButtonDefaults.buttonColors(containerColor = Ui.Rose, contentColor = androidx.compose.ui.graphics.Color.White),
+                            modifier = Modifier.fillMaxWidth(0.72f).height(50.dp),
+                        ) { Text("NEW SESSION", fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp); Spacer(Modifier.width(10.dp)); Icon(Icons.Filled.Schedule, null, modifier = Modifier.size(18.dp)) }
+                        Button(
+                            onClick = { login() }, enabled = username.length >= 3 && password.isNotBlank() && !busy,
+                            shape = RoundedCornerShape(0.dp), colors = ButtonDefaults.buttonColors(containerColor = Ui.Teal, contentColor = androidx.compose.ui.graphics.Color.White),
+                            modifier = Modifier.fillMaxWidth(0.8f).height(52.dp),
+                        ) { Text(if (busy) "SIGNING IN…" else "LOGIN", fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp); Spacer(Modifier.width(10.dp)); Icon(Icons.Filled.LockOpen, null, modifier = Modifier.size(18.dp)) }
+                    }
+                }
+                Column(Modifier.fillMaxWidth().background(Ui.CardHigh).padding(horizontal = 22.dp, vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Share, null, tint = Ui.Teal, modifier = Modifier.size(18.dp))
+                        Text("  LICENSED TO :", color = Ui.Teal, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+                    }
+                    val l = lic
+                    if (l == null) Text("Checking licence…", color = Ui.Muted)
+                    else {
+                        Text(l.str("licensedTo").ifBlank { "Rx Clinic" } + ",", color = Ui.Text)
+                        if (l.str("address").isNotBlank()) Text(l.str("address"), color = Ui.Text)
+                        Text(l.str("plan") + " plan" + if (l.optBoolean("trial")) " (trial)" else "", color = Ui.Text)
+                        val d = runCatching { java.time.LocalDate.parse(l.str("expires")).format(java.time.format.DateTimeFormatter.ofPattern("dd MMM yyyy", java.util.Locale.ENGLISH)).uppercase() }.getOrDefault(l.str("expires"))
+                        Text(androidx.compose.ui.text.buildAnnotatedString {
+                            append(if (l.optBoolean("expired")) "License expired on " else "License expires on ")
+                            pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)); append(d); pop()
+                        }, color = Ui.Red)
+                    }
+                }
+            }
+            Text("${java.time.Year.now()} © ShazVerse Technologies · Rx Clinic", color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 16.dp, bottom = 24.dp))
         }
     }
     mustChange?.let { r ->
@@ -672,6 +755,9 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             item { RoleCard("Price list", "Consultation, tests, scans, rooms and inpatient charges", Icons.Filled.PriceChange) { onOpen("prices") } }
             item { RoleCard("Plan", "Bronze, Silver, Gold or Platinum; add-ons; logins in use", Icons.Filled.WorkspacePremium) { onOpen("plan") } }
             item { RoleCard("Clinic QR code", "Patients scan to book; print a poster for the desk", Icons.Filled.QrCode2) { qr = true } }
+            item { RoleCard("Web portal", "Sign in from any computer or browser: ${vm.prefs.serverUrl.trimEnd('/')}/login", Icons.Filled.Language) {
+                runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.prefs.serverUrl.trimEnd('/') + "/login"))) }
+            } }
             item { RoleCard("Lab", "Test orders and reports", Icons.Filled.Biotech) { onOpen("lab") } }
             item { RoleCard("Diagnostics", "USG, CT, MRI, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onOpen("diagnostics") } }
             item {

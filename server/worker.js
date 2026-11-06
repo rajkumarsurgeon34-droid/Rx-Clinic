@@ -553,11 +553,13 @@ const FEATURE_NAMES = { lab: "Lab", diagnostics: "Diagnostics", ip: "Inpatient",
 
 async function planInfo(env) {
   const p = await getSetting(env, "plan", { tier: "platinum", addons: [] }); // new installs start on Platinum (trial) so every feature can be tried
+  if (!p.expires) { p.expires = addDays(clinicNow(env).date, 30); p.trial = true; await setSetting(env, "plan", p); }
   const tier = PLANS[p.tier] ? p.tier : "platinum";
   const def = PLANS[tier];
   const features = {};
   for (const [k, v] of Object.entries(def.f)) features[k] = v === true || (v === "addon" && (p.addons || []).includes(k));
-  return { tier, name: def.name, maxDoctors: def.maxDoctors, maxStaff: def.maxStaff, fee: def.fee, addons: p.addons || [], available: def.f, features };
+  return { tier, name: def.name, maxDoctors: def.maxDoctors, maxStaff: def.maxStaff, fee: def.fee, addons: p.addons || [], available: def.f, features,
+    expires: p.expires, trial: !!p.trial, expired: p.expires < clinicNow(env).date };
 }
 async function needFeature(env, key) {
   const pl = await planInfo(env);
@@ -721,6 +723,14 @@ async function handle(request, env) {
       let database = false;
       try { await db(env); database = true; } catch { /* reported below */ }
       return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
+    }
+    if (path === "/login" || path === "/portal" || path === "/terms") {
+      const page = path === "/login" ? loginPage : path === "/portal" ? portalPage : termsPage;
+      return new Response(page(), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    }
+    if (path === "/api/license") {
+      const pl = await planInfo(env), c = await clinicInfo(env);
+      return json({ licensedTo: c.name, address: c.address, plan: pl.name, expires: pl.expires, trial: pl.trial, expired: pl.expired });
     }
     if (path === "/book") return new Response(bookingPage(await clinicInfo(env)), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     if (path === "/api/slots") {
@@ -1312,7 +1322,9 @@ async function handle(request, env) {
       const docs = users.filter((u) => u.role === "doctor").length;
       if (docs > PLANS[tier].maxDoctors) throw new HttpError(409, `${PLANS[tier].name} allows ${PLANS[tier].maxDoctors} doctor login${PLANS[tier].maxDoctors > 1 ? "s" : ""}; you have ${docs} active. Disable some first, or choose a bigger plan.`);
       const addons = (Array.isArray(body.addons) ? body.addons : []).filter((a) => PLANS[tier].f[a] === "addon");
-      await setSetting(env, "plan", { tier, addons, changedAt: Date.now() });
+      const old = await getSetting(env, "plan", {});
+      const expires = /^\d{4}-\d{2}-\d{2}$/.test(body.expires || "") ? body.expires : old.expires;
+      await setSetting(env, "plan", { tier, addons, expires, trial: body.expires ? false : !!old.trial, changedAt: Date.now() });
       return json({ plan: await planInfo(env) });
     }
 
@@ -1777,4 +1789,163 @@ const j=await r.json();if(!r.ok)throw new Error(j.error||"Couldn't book");const 
 $("done").innerHTML="<b>Booked.</b><div>"+a.date+" at "+a.time+(a.mode==="tele"?" · video consultation":"")+"</div><div class=muted>Your booking code</div><div class=code>"+a.code+"</div><div class=muted>Keep this code. "+(a.mode==="tele"?"Open the Rx Clinic app at the time and join with this code and your mobile number.":"Show it at the desk when you arrive.")+"</div>";}
 catch(err){$("err").textContent=err.message}finally{$("go").disabled=false}};
 </script></body></html>`;
+}
+
+// ---------- web sign-in and portal ----------
+// Same look as the app's sign-in screen. Works in any browser and inside the app (WebView).
+
+const WEB_CSS = `
+:root{--bg:#eef3f2;--card:#fff;--fg:#14201f;--muted:#5a6b68;--line:#cfdcd9;--teal:#0e6a64;--teal2:#0a524d;--soft:#e3efed;--red:#b3261e;--rose:#c95c5c;--band:#eef1f1}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1514;--card:#16211f;--fg:#e6efed;--muted:#9db0ac;--line:#2b3b38;--teal:#5fc2b8;--teal2:#7fd3c9;--soft:#1b3330;--red:#f2867f;--rose:#d27272;--band:#1b2826}}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 "Segoe UI",Roboto,system-ui,-apple-system,sans-serif}
+a{color:var(--teal)}button{font:inherit;cursor:pointer}:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+.logo{display:flex;align-items:center;justify-content:center;gap:10px;font:700 40px/1 Georgia,"Times New Roman",serif;color:var(--teal);letter-spacing:-.5px}
+.logo .rx{color:var(--red);font-size:46px}.logo small{display:block;font:600 11px/1 system-ui;letter-spacing:.32em;color:var(--muted);text-transform:uppercase;margin-top:6px;text-align:center}
+`;
+
+function loginPage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sign in · Rx Clinic</title><style>${WEB_CSS}
+.wrap{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px max(16px,env(safe-area-inset-left))}
+.card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;box-shadow:0 18px 40px -28px rgba(10,40,36,.45)}
+.top{padding:36px 30px 26px;display:flex;flex-direction:column;gap:18px}
+h1{font:600 30px/1.2 "Segoe UI",system-ui;text-align:center;margin:4px 0 4px}
+.field{position:relative}.field input{width:100%;padding:15px 48px 15px 16px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;font-size:17px}
+.field input:focus{border-color:var(--teal);outline:0;box-shadow:0 0 0 3px var(--soft)}
+.field svg{position:absolute;right:14px;top:50%;transform:translateY(-50%);width:24px;height:24px;stroke:var(--muted);fill:none;stroke-width:1.7}
+.field .eye{position:absolute;right:46px;top:50%;transform:translateY(-50%);background:none;border:0;color:var(--muted);font-size:13px}
+.row{display:flex;justify-content:space-between;align-items:center;font-size:15px}
+.row label{display:flex;align-items:center;gap:8px;color:var(--teal);cursor:pointer}.row input{width:20px;height:20px;accent-color:var(--teal)}
+.row a{display:flex;align-items:center;gap:6px;text-decoration:none}
+.btns{display:flex;flex-direction:column;align-items:center;gap:0;margin-top:6px}
+.btn{width:78%;display:flex;align-items:center;justify-content:center;gap:12px;border:0;color:#fff;padding:14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;font-size:15px}
+.btn.new{background:var(--rose);width:72%}.btn.go{background:var(--teal)}.btn.go:hover{background:var(--teal2)}.btn:disabled{opacity:.6}
+.btn svg{width:18px;height:18px;stroke:#fff;fill:none;stroke-width:2}
+.err{color:var(--red);text-align:center;min-height:1.3em;font-size:14.5px}
+.lic{background:var(--band);padding:20px 30px 22px;font-size:16px;line-height:1.45}
+.lic b{color:var(--teal);letter-spacing:.04em;display:flex;align-items:center;gap:8px;font-size:15px}
+.lic .exp{color:var(--red)}.lic .exp strong{font-weight:700}
+.foot{margin-top:18px;color:var(--muted);font-size:14px;text-align:center}
+</style></head><body><div class="wrap">
+<form class="card" id="f" autocomplete="on">
+<div class="top">
+<div><div class="logo"><span class="rx">℞</span>Rx Clinic</div><div class="logo"><small>Hospital &amp; Clinic Suite</small></div></div>
+<h1>Sign in</h1>
+<div class="field"><input id="u" name="username" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/></svg></div>
+<div class="field"><input id="p" name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+<button type="button" class="eye" id="eye" aria-label="Show password">Show</button>
+<svg viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 20 3m-3 3 2.5 2.5M14.5 8.5 17 11"/></svg></div>
+<div class="row"><label><input type="checkbox" id="rem" checked>Remember me</label>
+<a href="/terms"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4"/></svg>Terms</a></div>
+<div class="err" id="err" role="alert"></div>
+<div class="btns">
+<button type="button" class="btn new" id="new">New session <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button>
+<button type="submit" class="btn go" id="go">Login <svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg></button>
+</div></div>
+<div class="lic" id="lic"><b><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.6M8.2 13.2l7.6 4.6"/></svg>LICENSED TO :</b>
+<div id="who">Loading…</div><div class="exp" id="exp"></div></div>
+</form>
+<div class="foot">${new Date().getFullYear()} © ShazVerse Technologies · Rx Clinic</div>
+</div><script>
+const $=(i)=>document.getElementById(i);
+const store=()=>{try{return localStorage.getItem("rx_remember")==="0"?sessionStorage:localStorage}catch{return null}};
+try{const s=localStorage.getItem("rx_session")||sessionStorage.getItem("rx_session");if(s&&!location.hash.includes("new"))location.replace("/portal")}catch{}
+try{$("u").value=localStorage.getItem("rx_user")||""}catch{}
+$("eye").onclick=()=>{const t=$("p").type==="password";$("p").type=t?"text":"password";$("eye").textContent=t?"Hide":"Show"};
+fetch("/api/license").then(r=>r.json()).then(l=>{
+ const d=new Date(l.expires+"T00:00:00");const ds=d.toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"}).toUpperCase();
+ $("who").innerHTML=(l.licensedTo||"Rx Clinic").replace(/</g,"&lt;")+",<br>"+(l.address||"").replace(/</g,"&lt;")+(l.address?"<br>":"")+l.plan+" plan"+(l.trial?" (trial)":"");
+ $("exp").innerHTML=(l.expired?"License expired on ":"License expires on ")+"<strong>"+ds+"</strong>";
+}).catch(()=>{$("who").textContent="Server not reachable"});
+$("new").onclick=()=>{try{["rx_session","rx_role"].forEach(k=>{localStorage.removeItem(k);sessionStorage.removeItem(k)})}catch{};$("p").value="";$("err").textContent="Started a new session. Sign in again.";$("u").focus()};
+$("f").onsubmit=async(e)=>{e.preventDefault();$("err").textContent="";$("go").disabled=true;
+ try{const r=await fetch("/api/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({username:$("u").value.trim().toLowerCase(),password:$("p").value})});
+ const j=await r.json();if(!r.ok)throw new Error(j.error||"Couldn't sign in");
+ try{localStorage.setItem("rx_remember",$("rem").checked?"1":"0");if($("rem").checked)localStorage.setItem("rx_user",$("u").value.trim().toLowerCase());else localStorage.removeItem("rx_user");
+ const s=store();s.setItem("rx_session",j.session);s.setItem("rx_role",j.role);s.setItem("rx_name",(j.user&&j.user.name)||"");if(j.user&&j.user.mustChange)s.setItem("rx_must","1");else s.removeItem("rx_must")}catch{}
+ location.href="/portal"}catch(err){$("err").textContent=err.message}finally{$("go").disabled=false}};
+</script></body></html>`;
+}
+
+function portalPage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rx Clinic</title><style>${WEB_CSS}
+header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+.bar{max-width:1080px;margin:0 auto;display:flex;align-items:center;gap:14px;padding:12px max(16px,env(safe-area-inset-left))}
+.bar .logo{font-size:24px;justify-content:flex-start}.bar .logo .rx{font-size:28px}.sp{flex:1}
+.me{text-align:right;font-size:14px;line-height:1.3}.me b{display:block}.me span{color:var(--muted)}
+.out{border:1px solid var(--line);background:none;color:var(--fg);border-radius:8px;padding:8px 12px}
+main{max-width:1080px;margin:0 auto;padding:22px max(16px,env(safe-area-inset-left)) 48px;display:flex;flex-direction:column;gap:18px}
+h1{font:600 26px/1.2 Georgia,serif;margin:0}.muted{color:var(--muted)}
+.lic{background:var(--band);border-radius:10px;padding:10px 14px;font-size:14px;display:flex;flex-wrap:wrap;gap:6px 18px}.lic .exp{color:var(--red);font-weight:600}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}.stat small{display:block;color:var(--muted);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;font-weight:600}
+.stat b{font:600 26px ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}.stat span{display:block;color:var(--muted);font-size:13px}
+.list{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.item{display:flex;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}.item:last-child{border:0}
+.tok{font:600 20px ui-monospace,monospace;color:var(--teal);min-width:40px}.grow{flex:1;min-width:0}.grow b{display:block}.grow span{color:var(--muted);font-size:13.5px}
+.pill{font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;background:var(--soft);color:var(--teal);white-space:nowrap}.pill.r{background:rgba(179,38,30,.12);color:var(--red)}
+.app{background:var(--soft);border-radius:12px;padding:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+.app a{background:var(--teal);color:#fff;text-decoration:none;border-radius:8px;padding:10px 14px;font-weight:600}
+.empty{padding:18px;color:var(--muted)}
+</style></head><body>
+<header><div class="bar"><div class="logo"><span class="rx">℞</span>Rx Clinic</div><div class="sp"></div><div class="me"><b id="nm"></b><span id="rl"></span></div><button class="out" id="out">Sign out</button></div></header>
+<main><div class="lic" id="lic"></div><div><h1 id="hi"></h1><div class="muted" id="sub"></div></div>
+<div class="stats" id="stats"></div><div id="listWrap"></div>
+<div class="app"><div>Case sheets, prescribing, billing and video calls are in the Rx Clinic app. The web portal shows today's work.</div><a href="/login#new">Switch user</a></div>
+</main><script>
+const $=(i)=>document.getElementById(i);
+const get=(k)=>{try{return localStorage.getItem(k)||sessionStorage.getItem(k)}catch{return null}};
+const session=get("rx_session");if(!session)location.replace("/login");
+const ROLES={doctor:"Doctor",staff:"Nursing staff",pharmacy:"Pharmacy",lab:"Lab",diagnostics:"Diagnostics",billing:"Billing",admin:"Admin"};
+const esc=(s)=>String(s??"").replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const inr=(x)=>"₹"+Math.round(x||0).toLocaleString("en-IN");
+async function api(p,b={}){const r=await fetch(p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({session,...b})});const j=await r.json();
+ if(r.status===401){signOut();throw new Error("signed out")}if(!r.ok)throw new Error(j.error||"Error");return j}
+function signOut(){try{["rx_session","rx_role","rx_name","rx_must"].forEach(k=>{localStorage.removeItem(k);sessionStorage.removeItem(k)})}catch{};location.replace("/login")}
+$("out").onclick=signOut;
+const stat=(l,v,s="")=>'<div class="stat"><small>'+esc(l)+'</small><b>'+esc(v)+'</b><span>'+esc(s)+'</span></div>';
+const list=(rows,empty)=>'<div class="list">'+(rows.length?rows.join(""):'<div class="empty">'+esc(empty)+'</div>')+'</div>';
+(async()=>{
+ const me=await api("/api/me");const role=me.role;const u=me.user||{};
+ $("nm").textContent=u.name||"";$("rl").textContent=ROLES[role]||role;
+ const h=new Date().getHours();$("hi").textContent=(h<12?"Good morning":h<17?"Good afternoon":"Good evening")+(u.name?", "+u.name:"");
+ $("sub").textContent=new Date().toLocaleDateString("en-IN",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+ fetch("/api/license").then(r=>r.json()).then(l=>{$("lic").innerHTML="<span><b>Licensed to:</b> "+esc(l.licensedTo)+"</span><span><b>Plan:</b> "+esc(l.plan)+(l.trial?" (trial)":"")+"</span><span class=exp>"+(l.expired?"License expired on ":"License expires on ")+esc(new Date(l.expires+"T00:00").toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"}))+"</span>"});
+ if(get("rx_must"))$("sub").textContent+=" · Please set your own password in the app.";
+ let S="",L="";
+ if(role==="admin"){const o=await api("/api/admin/overview");
+  S=stat("OPD checked in",o.opd.checkedIn,o.opd.waiting+" waiting")+stat("Appointments",o.appointments.total,o.appointments.tele+" video")+stat("Lab pending",o.lab.pending,o.lab.reported+" reported")+stat("Scans pending",o.diagnostics.pending,o.diagnostics.reported+" reported")+stat("To dispense",o.pharmacy.toDispense,o.pharmacy.outOfStock+" out of stock")+(o.billing?stat("Billed today",inr(o.billing.billed),"collected "+inr(o.billing.collected))+stat("Inpatients",o.billing.inpatients,"admitted"):"");}
+ else if(role==="doctor"||role==="staff"){const v=(role==="doctor"?await api("/api/doctor/visits"):await api("/api/nurse/queue")).visits||[];
+  S=stat("Checked in",v.length)+stat("Waiting",v.filter(x=>x.status!=="sent"&&x.status!=="dispensed"&&x.status!=="done").length)+stat("Emergency",v.filter(x=>x.urgent).length);
+  L=list(v.map(x=>'<div class="item"><div class="tok">'+esc(x.token)+'</div><div class="grow"><b>'+esc(x.patient&&x.patient.name)+'</b><span>'+esc([x.patient&&x.patient.age?x.patient.age+" y":"",x.patient&&x.patient.sex,x.complaint].filter(Boolean).join(" · "))+'</span></div>'+(x.urgent?'<span class="pill r">Emergency</span>':'<span class="pill">'+esc(x.status||"waiting")+'</span>')+'</div>'),"No patients have checked in today.");}
+ else if(role==="pharmacy"){const q=(await api("/api/pharmacy/queue")).queue||[];const t=q.filter(x=>x.status==="sent");
+  S=stat("To dispense",t.length)+stat("Dispensed",q.length-t.length);
+  L=list(q.map(x=>'<div class="item"><div class="tok">'+esc(x.token)+'</div><div class="grow"><b>'+esc(x.patient&&x.patient.name)+'</b><span>'+esc(((x.rx&&x.rx.items)||[]).map(i=>i.generic).join(", "))+'</span></div><span class="pill'+(x.status==="sent"?" r":"")+'">'+(x.status==="sent"?"To dispense":"Dispensed")+'</span></div>'),"No prescriptions yet.");}
+ else if(role==="lab"||role==="diagnostics"){const o=(await api("/api/orders/list",{kind:role==="lab"?"lab":"imaging"})).orders||[];const p=o.filter(x=>x.status!=="reported");
+  S=stat("Pending",p.length)+stat("Reported",o.length-p.length);
+  L=list(o.map(x=>'<div class="item"><div class="grow"><b>'+esc(x.test)+'</b><span>'+esc((x.patient&&x.patient.name)+" · token "+x.token)+'</span></div><span class="pill'+(x.status==="reported"?"":" r")+'">'+esc(x.status)+'</span></div>'),"No orders.");}
+ else if(role==="billing"){const s=await api("/api/bills/summary");
+  S=stat("Billed today",inr(s.totals.billed))+stat("Collected today",inr(s.totals.collected))+Object.entries(s.byMode||{}).map(([k,v])=>stat(k,inr(v))).join("");
+  L=list(Object.entries(s.byDept).map(([k,v])=>'<div class="item"><div class="grow"><b>'+esc({opd:"OPD",pharmacy:"Pharmacy",lab:"Lab",diagnostics:"Diagnostics",ip:"Inpatient"}[k])+'</b><span>'+v.count+' bills</span></div><span class="pill">'+inr(v.billed)+' billed · '+inr(v.collected)+' collected</span></div>'),"");}
+ $("stats").innerHTML=S;$("listWrap").innerHTML=L;
+})().catch(e=>{if(e.message!=="signed out")$("sub").textContent=e.message});
+</script></body></html>`;
+}
+
+function termsPage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Terms · Rx Clinic</title>
+<style>${WEB_CSS}main{max-width:720px;margin:0 auto;padding:28px 18px 48px}h1{font:600 28px Georgia,serif}li{margin-bottom:8px}</style></head><body><main>
+<div class="logo" style="justify-content:flex-start"><span class="rx">℞</span>Rx Clinic</div><h1>Terms of use</h1>
+<ol>
+<li>Rx Clinic is software for registered medical practitioners and their staff. Clinical decisions remain the responsibility of the treating doctor.</li>
+<li>AI suggestions (history, diagnosis, investigations, treatment) are aids for a qualified doctor to check, edit or reject. They are not a diagnosis.</li>
+<li>Each login is for one person. Do not share passwords. The clinic admin creates, resets and disables logins.</li>
+<li>Patient information is confidential. Use it only for the patient's care, billing and records, as required by law.</li>
+<li>Aadhaar numbers are never stored in full. Only a protected key for search and the last four digits are kept.</li>
+<li>The licence is for the plan and period shown on the sign-in page. Renew before the expiry date to keep access.</li>
+<li>Back up exported records and keep printed copies as your local rules require.</li>
+</ol>
+<p><a href="/login">Back to sign in</a></p></main></body></html>`;
 }

@@ -137,6 +137,9 @@ class Api(private val baseUrl: String) {
         return o.optJSONObject("json") ?: throw ApiException("The AI reply was empty. Try again.")
     }
 
+    /** Who the software is licensed to, plan and expiry date (no sign-in needed). */
+    suspend fun license(): JSONObject = get("/api/license")
+
     /** Any POST endpoint of the Rx Clinic server. */
     suspend fun call(path: String, body: JSONObject): JSONObject = post(path, body)
 

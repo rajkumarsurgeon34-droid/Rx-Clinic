@@ -326,12 +326,13 @@ fun PlanScreen(vm: CallViewModel, onBack: () -> Unit) {
     var data by remember { mutableStateOf<JSONObject?>(null) }
     var tier by remember { mutableStateOf("") }
     val addons = remember { mutableStateListOf<String>() }
+    var expires by remember { mutableStateOf("") }
     var err by remember { mutableStateOf<String?>(null) }
     var tick by remember { mutableIntStateOf(0) }
     LaunchedEffect(tick) {
         try {
             val d = api.call("/api/plan", JSONObject().put("session", session)); data = d
-            val pl = d.getJSONObject("plan"); tier = pl.str("tier"); addons.clear(); addons.addAll(pl.strs("addons"))
+            val pl = d.getJSONObject("plan"); tier = pl.str("tier"); addons.clear(); addons.addAll(pl.strs("addons")); expires = pl.str("expires")
             vm.prefs.planJson = pl.toString()
         } catch (e: Exception) { err = e.message }
     }
@@ -370,12 +371,16 @@ fun PlanScreen(vm: CallViewModel, onBack: () -> Unit) {
                     }
                 }
             }
+            item {
+                OutlinedTextField(expires, { expires = it.take(10) }, label = { Text("Licence valid until (YYYY-MM-DD)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("Shown on the sign-in page and the web portal.", color = Ui.Muted, fontSize = 12.sp)
+            }
             item { ErrorText(err) }
             item {
                 Button(onClick = {
                     scope.launch {
                         try {
-                            api.call("/api/plan/set", JSONObject().put("session", session).put("tier", tier).put("addons", JSONArray(addons.toList())))
+                            api.call("/api/plan/set", JSONObject().put("session", session).put("tier", tier).put("addons", JSONArray(addons.toList())).put("expires", expires))
                             Toast.makeText(context, "Plan saved", Toast.LENGTH_SHORT).show(); err = null; tick++
                         } catch (e: Exception) { err = e.message }
                     }
