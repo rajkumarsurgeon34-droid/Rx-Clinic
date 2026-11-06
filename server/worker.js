@@ -14,7 +14,7 @@
 //   CLINIC_TZ_MINUTES   optional, clinic time zone offset, default 330 (India)
 
 const enc = new TextEncoder();
-const DEFAULT_PINS = { doctor: "1001", staff: "2002", pharmacy: "3003", lab: "4004", diagnostics: "5005", admin: "9009" };
+const DEFAULT_PINS = { doctor: "1001", staff: "2002", pharmacy: "3003", lab: "4004", diagnostics: "5005", billing: "6006", admin: "9009" };
 const STAFF_ROLES = Object.keys(DEFAULT_PINS);
 const DEFAULT_CLINIC = { name: "Rx Clinic", doctor: "Dr. M. Rajkumar", qual: "MBBS, DNB General Surgery" };
 const SESSIONS = [["09:00", "13:00"], ["17:00", "20:00"]];
@@ -540,6 +540,148 @@ async function listDocs(env, coll, where = "", args = []) {
   return rows.map((r) => Object.assign({ id: r.id }, JSON.parse(r.data)));
 }
 
+// ---------- billing ----------
+// Department bills (pharmacy, lab, diagnostics, OPD) and inpatient (IP) admissions with a final bill.
+// Amounts are in rupees; medicine prices are MRP (tax included); clinical services carry no GST.
+
+const DEPTS = { pharmacy: "PH", lab: "LB", diagnostics: "DG", opd: "OP", ip: "IP" };
+const DEPT_ROLES = { pharmacy: ["pharmacy"], lab: ["lab"], diagnostics: ["diagnostics"], opd: ["billing", "staff"], ip: ["billing"] };
+const PAY_MODES = ["Cash", "UPI", "Card", "Insurance", "Advance", "Other"];
+const money = (x) => Math.round((Number(x) || 0) * 100) / 100;
+
+// Example prices so billing works on day one. The admin edits them under Admin → Price list.
+const DEFAULT_TARIFF = [
+  ["opd", "Registration", 100, "each"], ["opd", "Consultation", 500, "each"], ["opd", "Review consultation", 300, "each"],
+  ["opd", "Dressing", 200, "each"], ["opd", "Injection charges", 100, "each"], ["opd", "Minor procedure", 1500, "each"],
+  ["lab", "CBC", 300, "each"], ["lab", "LFT", 600, "each"], ["lab", "RFT", 600, "each"], ["lab", "RBS", 100, "each"],
+  ["lab", "FBS", 100, "each"], ["lab", "PPBS", 100, "each"], ["lab", "HbA1c", 500, "each"], ["lab", "Lipid profile", 600, "each"],
+  ["lab", "Thyroid profile", 600, "each"], ["lab", "TSH", 400, "each"], ["lab", "Urine routine", 150, "each"], ["lab", "Serum electrolytes", 500, "each"],
+  ["lab", "Serum amylase", 500, "each"], ["lab", "Serum lipase", 700, "each"], ["lab", "PT INR", 400, "each"], ["lab", "Blood grouping", 150, "each"],
+  ["lab", "HIV HBsAg HCV", 900, "each"], ["lab", "CRP", 400, "each"], ["lab", "ESR", 100, "each"],
+  ["diagnostics", "USG abdomen", 1200, "each"], ["diagnostics", "USG pelvis", 1000, "each"], ["diagnostics", "USG neck", 1000, "each"],
+  ["diagnostics", "Doppler", 2000, "each"], ["diagnostics", "Chest X-ray", 400, "each"], ["diagnostics", "X-ray", 400, "each"],
+  ["diagnostics", "CT brain", 2500, "each"], ["diagnostics", "CECT abdomen", 6000, "each"], ["diagnostics", "HRCT chest", 4000, "each"],
+  ["diagnostics", "MRI brain", 6500, "each"], ["diagnostics", "MRI spine", 7000, "each"], ["diagnostics", "MRCP", 7500, "each"],
+  ["diagnostics", "PET-CT whole body", 22000, "each"], ["diagnostics", "Mammogram", 1500, "each"], ["diagnostics", "UGI endoscopy", 2500, "each"],
+  ["diagnostics", "Colonoscopy", 4500, "each"], ["diagnostics", "ECG", 250, "each"], ["diagnostics", "Echo", 2000, "each"],
+  ["ip", "General ward", 1500, "per day"], ["ip", "Semi-private room", 3000, "per day"], ["ip", "Private room", 5000, "per day"],
+  ["ip", "ICU", 10000, "per day"], ["ip", "Nursing charges", 500, "per day"], ["ip", "Doctor visit", 500, "each"],
+  ["ip", "Surgeon fee", 20000, "each"], ["ip", "Anaesthetist fee", 8000, "each"], ["ip", "OT charges", 15000, "each"],
+  ["ip", "Consumables", 0, "each"], ["ip", "Oxygen", 1000, "per day"],
+];
+
+async function tariff(env, dept) {
+  let list = await listDocs(env, "tariff");
+  if (!list.length && !(await getSetting(env, "tariff_seeded", false))) {
+    for (const [d, name, price, unit] of DEFAULT_TARIFF) await putDoc(env, "tariff", crypto.randomUUID(), { dept: d, name, price, unit });
+    await setSetting(env, "tariff_seeded", true);
+    list = await listDocs(env, "tariff");
+  }
+  return list.filter((t) => !dept || t.dept === dept).sort((a, b) => a.dept.localeCompare(b.dept) || a.name.localeCompare(b.name));
+}
+
+/** Best price-list match for a test name (word overlap). */
+function matchTariff(list, name) {
+  const words = (x) => x.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+  const w = words(name);
+  let best = null, score = 0;
+  for (const t of list) {
+    const tw = words(t.name);
+    const hit = tw.filter((x) => w.includes(x)).length;
+    const sc = hit / Math.max(tw.length, 1) + (t.name.toLowerCase() === name.toLowerCase() ? 1 : 0);
+    if (hit && sc > score) { best = t; score = sc; }
+  }
+  return score >= 0.5 ? best : null;
+}
+
+/** Units to dispense from a prescription line: frequency (1-0-1) × days. */
+function rxQuantity(r) {
+  const form = String(r.form || "").toLowerCase();
+  if (/syr|susp|cream|oint|gel|drop|lotion|inhal|spray|powder|sachet/.test(form)) return 1;
+  const parts = String(r.frequency || "").match(/\d+(\.\d+)?|½/g) || [];
+  let perDay = parts.reduce((a, x) => a + (x === "½" ? 0.5 : Number(x)), 0);
+  if (!perDay) perDay = /sos|as needed|stat/i.test(`${r.frequency} ${r.timing}`) ? 0 : 1;
+  const d = String(r.duration || "").toLowerCase();
+  const n = Number((d.match(/\d+/) || [0])[0]);
+  const days = /month/.test(d) ? n * 30 : /week/.test(d) ? n * 7 : n;
+  const doses = String(r.dose || "").match(/^\s*(\d+(\.\d+)?)/);
+  const per = doses ? Number(doses[1]) : 1;
+  return Math.max(1, Math.ceil(perDay * per * (days || 1)));
+}
+
+function findStock(stock, generic) {
+  const g = String(generic || "").toLowerCase();
+  if (!g) return null;
+  return stock.find((s) => s.generic.toLowerCase() === g) || stock.find((s) => s.generic.length >= 4 && (g.includes(s.generic.toLowerCase()) || s.generic.toLowerCase().includes(g))) || null;
+}
+
+async function nextNo(env, key, prefix) {
+  const r = await (await db(env)).prepare("INSERT INTO settings (k, v) VALUES (?, '1') ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1 RETURNING v").bind("seq_" + key).first();
+  return `${prefix}-${String(r.v).padStart(6, "0")}`;
+}
+
+function billPatient(p) { return { id: p?.id || "", name: clean(p?.name, 60), age: clean(p?.age, 3), sex: clean(p?.sex, 10), phone: digits(p?.phone) }; }
+
+function computeBill(b) {
+  b.items = (Array.isArray(b.items) ? b.items : []).slice(0, 200).map((it) => {
+    const qty = Math.max(0, Number(it.qty) || 0), rate = Math.max(0, money(it.rate));
+    return { desc: clean(it.desc, 160), qty, rate, amount: money(qty * rate), unit: clean(it.unit, 20), ref: typeof it.ref === "string" ? it.ref.slice(0, 64) : "" };
+  }).filter((it) => it.desc && it.qty > 0);
+  b.subtotal = money(b.items.reduce((a, it) => a + it.amount, 0));
+  b.discount = Math.min(b.subtotal, Math.max(0, money(b.discount)));
+  b.total = money(b.subtotal - b.discount);
+  b.paid = money((b.payments || []).reduce((a, x) => a + x.amount, 0));
+  b.balance = money(b.total - b.paid);
+  if (b.status !== "cancelled" && b.status !== "to-ip" && b.status !== "on-ip-bill") b.status = b.total > 0 && b.paid >= b.total ? "paid" : b.paid > 0 ? "partial" : "unpaid";
+  return b;
+}
+
+/** Pharmacy: keeps stock in step with what a bill dispenses. */
+async function applyStock(env, bill, restore = false) {
+  const want = {};
+  if (!restore) for (const it of bill.items) if (it.ref) want[it.ref] = (want[it.ref] || 0) + it.qty;
+  const had = bill.stockApplied || {};
+  for (const ref of new Set([...Object.keys(want), ...Object.keys(had)])) {
+    const delta = (want[ref] || 0) - (had[ref] || 0);
+    if (!delta) continue;
+    const s = await getDoc(env, "stock", ref);
+    if (!s) continue;
+    s.stock = Math.max(0, (Number(s.stock) || 0) - delta);
+    await putDoc(env, "stock", ref, s);
+  }
+  bill.stockApplied = want;
+}
+
+function canDept(role, dept) { return role === "admin" || (DEPT_ROLES[dept] || []).includes(role); }
+
+function payment(x, by) {
+  const amount = money(x?.amount);
+  if (amount <= 0) return null;
+  const mode = PAY_MODES.includes(x.mode) ? x.mode : "Cash";
+  return { amount, mode, ref: clean(x.ref, 60), at: Date.now(), by };
+}
+
+async function activeAdmission(env, pid) {
+  if (!pid) return null;
+  return (await listDocs(env, "admissions", "json_extract(data, '$.patient.id') = ? AND json_extract(data, '$.status') = 'admitted'", [pid]))[0] || null;
+}
+
+/** Live inpatient account: room days, charges, department bills sent to IP, advances. */
+async function ipAccount(env, a) {
+  const end = a.dischargedAt || Date.now();
+  const days = Math.max(1, Math.ceil((end - a.admittedAt) / 86400000));
+  const lines = [];
+  if (a.wardRate > 0) lines.push({ desc: `${a.ward} (${days} day${days > 1 ? "s" : ""})`, qty: days, rate: a.wardRate, amount: money(days * a.wardRate), kind: "room" });
+  for (const c of a.charges || []) lines.push(Object.assign({ kind: "charge" }, c));
+  const deptBills = (await listDocs(env, "bills", "json_extract(data, '$.admissionId') = ?", [a.id])).filter((b) => b.status === "to-ip" || b.status === "on-ip-bill");
+  for (const b of deptBills) lines.push({ desc: `${b.deptName} bill ${b.no}`, qty: 1, rate: b.total, amount: b.total, kind: "bill", billId: b.id });
+  const total = money(lines.reduce((x, l) => x + l.amount, 0));
+  const advance = money((a.deposits || []).reduce((x, d) => x + d.amount, 0));
+  return { days, lines, total, advance, due: money(total - advance) };
+}
+
+const DEPT_NAMES = { pharmacy: "Pharmacy", lab: "Lab", diagnostics: "Diagnostics", opd: "OPD", ip: "Inpatient" };
+
 // ---------- routes ----------
 
 async function handle(request, env) {
@@ -733,7 +875,9 @@ async function handle(request, env) {
       const s = await requirePatient(env, body.session);
       const appts = (await D.prepare("SELECT * FROM appointments WHERE patient_id = ? OR (patient_id IS NULL AND phone = ? AND lower(name) = lower(?)) ORDER BY date DESC, time DESC LIMIT 30")
         .bind(s.uid, s.user.phone || "-", s.user.name).all()).results || [];
-      return json({ patient: publicPatient(s.uid, s.user), visits: await patientHistory(env, s.uid), appointments: appts.map(publicAppt) });
+      const bills = (await listDocs(env, "bills", "json_extract(data, '$.patient.id') = ?", [s.uid])).filter((b) => b.status !== "cancelled")
+        .sort((a, b) => b.created - a.created).slice(0, 50).map((b) => ({ id: b.id, no: b.no, dept: b.dept, deptName: b.deptName, date: b.date, total: b.total, paid: b.paid, balance: b.balance, status: b.status, items: b.items.map((i) => ({ desc: i.desc, qty: i.qty, amount: i.amount })) }));
+      return json({ patient: publicPatient(s.uid, s.user), visits: await patientHistory(env, s.uid), appointments: appts.map(publicAppt), bills });
     }
 
     case "/api/patient/update": {
@@ -757,7 +901,7 @@ async function handle(request, env) {
 
     // ----- staff: patient registry -----
     case "/api/patients/register": {
-      const me = await requireUser(env, body.session, ["staff", "doctor"]);
+      const me = await requireUser(env, body.session, ["staff", "doctor", "billing"]);
       try {
         const r = await createPatient(env, body, me.user.username || me.role, body.password ? body.password : "");
         return json({ patient: publicPatient(r.id, r.p) });
@@ -768,7 +912,7 @@ async function handle(request, env) {
     }
 
     case "/api/patients/search": {
-      await requireUser(env, body.session, ["staff", "doctor", "pharmacy", "lab", "diagnostics"]);
+      await requireUser(env, body.session, ["staff", "doctor", "pharmacy", "lab", "diagnostics", "billing"]);
       const q = String(body.q || "").trim();
       let list = [];
       if (q.length >= 2) {
@@ -779,7 +923,7 @@ async function handle(request, env) {
     }
 
     case "/api/patients/get": {
-      await requireUser(env, body.session, ["staff", "doctor"]);
+      await requireUser(env, body.session, ["staff", "doctor", "billing"]);
       const id = String(body.id || "").toUpperCase();
       const p = await getDoc(env, "patients", id);
       if (!p) throw new HttpError(404, "Patient not found");
@@ -787,7 +931,7 @@ async function handle(request, env) {
     }
 
     case "/api/patients/update": {
-      await requireUser(env, body.session, ["staff", "doctor"]);
+      await requireUser(env, body.session, ["staff", "doctor", "billing"]);
       const id = String(body.id || "").toUpperCase();
       const p = await getDoc(env, "patients", id);
       if (!p) throw new HttpError(404, "Patient not found");
@@ -1031,7 +1175,7 @@ async function handle(request, env) {
         const generic = clean(it.generic, 120);
         if (!generic) continue;
         const id = typeof it.id === "string" && ID_RE.test(it.id) ? it.id : crypto.randomUUID();
-        await putDoc(env, "stock", id, { generic, brand: clean(it.brand, 80), form: clean(it.form, 20) || "Tab", strength: clean(it.strength, 40), stock: Math.max(0, Math.floor(Number(it.stock) || 0)) });
+        await putDoc(env, "stock", id, { generic, brand: clean(it.brand, 80), form: clean(it.form, 20) || "Tab", strength: clean(it.strength, 40), stock: Math.max(0, Math.floor(Number(it.stock) || 0)), price: Math.max(0, money(it.price)) });
         n++;
       }
       return json({ saved: n });
@@ -1047,7 +1191,7 @@ async function handle(request, env) {
       await requireStaff(env, body.session, ["pharmacy"]);
       const since = addDays(clinicNow(env).date, -2);
       const list = (await listDocs(env, "visits", "json_extract(data, '$.status') IN ('sent', 'dispensed') AND json_extract(data, '$.date') >= ?", [since]))
-        .map((v) => ({ id: v.id, token: v.token, date: v.date, status: v.status, patient: v.patient, rx: v.rx, dispensedAt: v.dispensedAt || null }))
+        .map((v) => ({ id: v.id, token: v.token, date: v.date, status: v.status, patient: v.patient, rx: v.rx, dispensedAt: v.dispensedAt || null, billId: v.pharmacyBillId || "" }))
         .sort((a, b) => (a.status === b.status ? (b.rx?.sentAt || 0) - (a.rx?.sentAt || 0) : a.status === "sent" ? -1 : 1));
       return json({ queue: list });
     }
@@ -1102,8 +1246,320 @@ async function handle(request, env) {
         appointments: { total: count(appts, (a) => a.status !== "cancelled"), tele: count(appts, (a) => a.mode === "tele" && a.status !== "cancelled") },
         lab: { pending: count(orders, (o) => o.kind === "lab" && o.status !== "reported"), reported: count(orders, (o) => o.kind === "lab" && o.status === "reported") },
         diagnostics: { pending: count(orders, (o) => o.kind === "imaging" && o.status !== "reported"), reported: count(orders, (o) => o.kind === "imaging" && o.status === "reported") },
+        billing: await (async () => {
+          const bills = (await listDocs(env, "bills", "json_extract(data, '$.date') = ?", [date])).filter((b) => b.status !== "cancelled" && b.status !== "to-ip" && b.status !== "on-ip-bill");
+          const sum = (f) => money(bills.filter(f).reduce((x, b) => x + b.total, 0));
+          const paid = money(bills.reduce((x, b) => x + (b.payments || []).filter((p) => p.mode !== "Advance").reduce((y, p) => y + p.amount, 0), 0));
+          const inpatients = (await listDocs(env, "admissions", "json_extract(data, '$.status') = 'admitted'")).length;
+          return { billed: sum(() => true), collected: paid, pharmacy: sum((b) => b.dept === "pharmacy"), lab: sum((b) => b.dept === "lab"), diagnostics: sum((b) => b.dept === "diagnostics"), opd: sum((b) => b.dept === "opd"), ip: sum((b) => b.dept === "ip"), inpatients };
+        })(),
         pharmacy: { toDispense: count(visits, (v) => v.status === "sent"), dispensed: count(visits, (v) => v.status === "dispensed"), outOfStock: count(stock, (x) => !x.stock) },
       });
+    }
+
+    // ----- billing: price list -----
+    case "/api/tariff/list": {
+      await requireUser(env, body.session, ["doctor", "staff", "pharmacy", "lab", "diagnostics", "billing"]);
+      return json({ tariff: await tariff(env, DEPTS[body.dept] ? body.dept : "") });
+    }
+
+    case "/api/tariff/save": {
+      await requireUser(env, body.session, ["admin"]);
+      const items = Array.isArray(body.items) ? body.items.slice(0, 500) : [body.item || {}];
+      let n = 0;
+      for (const it of items) {
+        const name = clean(it.name, 100);
+        if (!name || !DEPTS[it.dept] || it.dept === "pharmacy") continue;
+        const id = typeof it.id === "string" && ID_RE.test(it.id) ? it.id : crypto.randomUUID();
+        await putDoc(env, "tariff", id, { dept: it.dept, name, price: Math.max(0, money(it.price)), unit: it.unit === "per day" ? "per day" : "each" });
+        n++;
+      }
+      await setSetting(env, "tariff_seeded", true);
+      return json({ saved: n });
+    }
+
+    case "/api/tariff/delete": {
+      await requireUser(env, body.session, ["admin"]);
+      await D.prepare("DELETE FROM docs WHERE coll = 'tariff' AND id = ?").bind(String(body.id || "")).run();
+      return json({ ok: true });
+    }
+
+    // ----- billing: department bills -----
+    case "/api/bills/draft": {
+      // Pre-filled bill for a visit: medicines from the prescription, or unbilled tests, or OPD charges.
+      const dept = String(body.dept || "");
+      if (!DEPTS[dept] || dept === "ip") throw new HttpError(400, "Unknown department");
+      const me = await requireUser(env, body.session, DEPT_ROLES[dept]);
+      if (!canDept(me.role, dept)) throw new HttpError(403, "Your login can't bill for this department");
+      const v = body.visitId ? await getDoc(env, "visits", String(body.visitId)) : null;
+      let patient = billPatient(v?.patient || {});
+      if (!v && body.patientId) {
+        const p = await getDoc(env, "patients", String(body.patientId).toUpperCase());
+        if (p) patient = billPatient(Object.assign({ id: String(body.patientId).toUpperCase() }, p));
+      }
+      const items = [], orderIds = [];
+      if (dept === "pharmacy" && v?.rx) {
+        const stock = await listDocs(env, "stock");
+        for (const r of v.rx.items || []) {
+          const s = findStock(stock, r.generic);
+          items.push({ desc: [r.form, r.generic, r.strength].filter(Boolean).join(" "), qty: rxQuantity(r), rate: s ? money(s.price) : 0, ref: s ? s.id : "", unit: "", inStock: s ? s.stock : 0 });
+        }
+      } else if ((dept === "lab" || dept === "diagnostics") && v) {
+        const kind = dept === "lab" ? "lab" : "imaging";
+        const list = await tariff(env, dept);
+        for (const o of await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [String(body.visitId)])) {
+          if (o.kind !== kind || o.billId) continue;
+          const t = matchTariff(list, o.test);
+          items.push({ desc: o.test, qty: 1, rate: t ? t.price : 0, ref: "" });
+          orderIds.push(o.id);
+        }
+      } else if (dept === "opd") {
+        const list = await tariff(env, "opd");
+        const first = patient.id ? (await listDocs(env, "visits", "json_extract(data, '$.patient.id') = ?", [patient.id])).length <= 1 : true;
+        const pick = (n) => list.find((t) => t.name.toLowerCase() === n.toLowerCase());
+        for (const n of first ? ["Registration", "Consultation"] : ["Review consultation"]) { const t = pick(n); if (t) items.push({ desc: t.name, qty: 1, rate: t.price, ref: "" }); }
+      }
+      const adm = await activeAdmission(env, patient.id);
+      return json({ dept, patient, visitId: v ? String(body.visitId) : "", items, orderIds, admission: adm ? { id: adm.id, no: adm.no, ward: adm.ward, bed: adm.bed } : null });
+    }
+
+    case "/api/bills/save": {
+      const x = body.bill || {};
+      const dept = String(x.dept || "");
+      if (!DEPTS[dept] || dept === "ip") throw new HttpError(400, "Unknown department");
+      const me = await requireUser(env, body.session, DEPT_ROLES[dept]);
+      if (!canDept(me.role, dept)) throw new HttpError(403, "Your login can't bill for this department");
+      const isNew = !x.id;
+      const id = isNew ? crypto.randomUUID() : String(x.id);
+      const b = isNew ? { dept, deptName: DEPT_NAMES[dept], payments: [], created: Date.now(), createdBy: me.user.name || me.role, date: clinicNow(env).date } : await getDoc(env, "bills", id);
+      if (!b) throw new HttpError(404, "Bill not found");
+      if (!isNew && (b.status === "cancelled" || b.status === "on-ip-bill" || (b.paid > 0 && me.role !== "admin"))) throw new HttpError(409, "This bill can't be changed now. Cancel it and make a new one.");
+      if (isNew) b.no = await nextNo(env, dept, DEPTS[dept]);
+      b.patient = billPatient(x.patient || b.patient);
+      if (!b.patient.name) throw new HttpError(400, "Enter the patient's name");
+      b.visitId = clean(x.visitId ?? b.visitId, 64);
+      b.items = x.items; b.discount = x.discount; b.note = clean(x.note, 300);
+      // Admitted patient: the bill can go on the inpatient account instead of being paid now.
+      if (x.toIp) {
+        const adm = await activeAdmission(env, b.patient.id);
+        if (!adm) throw new HttpError(400, "This patient is not admitted");
+        b.admissionId = adm.id; b.status = "to-ip";
+      } else if (b.status === "to-ip") { b.status = "unpaid"; b.admissionId = ""; }
+      computeBill(b);
+      if (!b.items.length) throw new HttpError(400, "Add at least one item");
+      const pay = b.status === "to-ip" ? null : payment(body.pay, me.user.name || me.role);
+      if (pay && pay.amount > b.balance + 0.001) throw new HttpError(400, `The bill is ₹${b.balance}. Enter the amount received, up to ₹${b.balance}.`);
+      if (pay) { b.payments.push(pay); computeBill(b); }
+      if (dept === "pharmacy") await applyStock(env, b);
+      await putDoc(env, "bills", id, b);
+      for (const oid of Array.isArray(x.orderIds) ? x.orderIds.slice(0, 50) : []) {
+        const o = await getDoc(env, "orders", String(oid));
+        if (o && !o.billId) { o.billId = id; await putDoc(env, "orders", String(oid), o); }
+      }
+      if (dept === "pharmacy" && b.visitId) {
+        const v = await getDoc(env, "visits", b.visitId);
+        if (v) { v.pharmacyBillId = id; if (body.dispense) { v.status = "dispensed"; v.dispensedAt = Date.now(); } await putDoc(env, "visits", b.visitId, v); }
+      }
+      return json({ bill: Object.assign({ id }, b) });
+    }
+
+    case "/api/bills/pay": {
+      const id = String(body.id || "");
+      const b = await getDoc(env, "bills", id);
+      if (!b) throw new HttpError(404, "Bill not found");
+      const me = await requireUser(env, body.session, [...DEPT_ROLES[b.dept], "billing"]);
+      if (b.status === "cancelled" || b.status === "to-ip" || b.status === "on-ip-bill") throw new HttpError(409, "This bill is not collected at the counter");
+      const pay = payment(body, me.user.name || me.role);
+      if (!pay) throw new HttpError(400, "Enter the amount received");
+      if (pay.amount > b.balance + 0.001) throw new HttpError(400, `Only ₹${b.balance} is due on this bill`);
+      b.payments.push(pay); computeBill(b);
+      await putDoc(env, "bills", id, b);
+      return json({ bill: Object.assign({ id }, b) });
+    }
+
+    case "/api/bills/cancel": {
+      const id = String(body.id || "");
+      const b = await getDoc(env, "bills", id);
+      if (!b) throw new HttpError(404, "Bill not found");
+      const me = await requireUser(env, body.session, DEPT_ROLES[b.dept]);
+      if (b.status === "on-ip-bill") throw new HttpError(409, "This bill is already on a final inpatient bill");
+      if (b.paid > 0 && me.role !== "admin") throw new HttpError(403, "Money was received on this bill. Only the admin can cancel it.");
+      if (b.dept === "pharmacy") await applyStock(env, b, true);
+      b.status = "cancelled"; b.cancelReason = clean(body.reason, 200); b.cancelledBy = me.user.name || me.role; b.cancelledAt = Date.now();
+      await putDoc(env, "bills", id, b);
+      for (const o of await listDocs(env, "orders", "json_extract(data, '$.billId') = ?", [id])) { delete o.billId; await putDoc(env, "orders", o.id, o); }
+      return json({ ok: true });
+    }
+
+    case "/api/bills/list": {
+      const me = await requireUser(env, body.session, ["pharmacy", "lab", "diagnostics", "billing", "staff"]);
+      const conds = [], args = [];
+      let dept = String(body.dept || "");
+      if (["pharmacy", "lab", "diagnostics"].includes(me.role)) dept = me.role;
+      if (dept) { conds.push("json_extract(data, '$.dept') = ?"); args.push(dept); }
+      if (body.patientId) { conds.push("json_extract(data, '$.patient.id') = ?"); args.push(String(body.patientId).toUpperCase()); }
+      else if (body.from || body.date) {
+        conds.push("json_extract(data, '$.date') >= ? AND json_extract(data, '$.date') <= ?");
+        args.push(String(body.from || body.date), String(body.to || body.date));
+      } else { conds.push("json_extract(data, '$.date') >= ?"); args.push(addDays(clinicNow(env).date, -2)); }
+      const list = (await listDocs(env, "bills", conds.join(" AND "), args)).sort((a, b) => b.created - a.created).slice(0, 300);
+      return json({ bills: list });
+    }
+
+    case "/api/bills/patient": {
+      // Hospital total for one patient: every department bill and inpatient stay.
+      await requireUser(env, body.session, ["billing", "staff"]);
+      const pid = String(body.patientId || "").toUpperCase();
+      const p = await getDoc(env, "patients", pid);
+      if (!p) throw new HttpError(404, "Patient not found");
+      const bills = (await listDocs(env, "bills", "json_extract(data, '$.patient.id') = ?", [pid])).filter((b) => b.status !== "cancelled").sort((a, b) => b.created - a.created);
+      const admissions = (await listDocs(env, "admissions", "json_extract(data, '$.patient.id') = ?", [pid])).sort((a, b) => b.admittedAt - a.admittedAt);
+      const byDept = {};
+      for (const d of Object.keys(DEPTS)) byDept[d] = { billed: 0, paid: 0, due: 0, count: 0 };
+      for (const b of bills) {
+        if (b.status === "to-ip" || b.status === "on-ip-bill") continue; // counted in the inpatient bill
+        const t = byDept[b.dept]; t.billed = money(t.billed + b.total); t.paid = money(t.paid + b.paid); t.due = money(t.due + b.balance); t.count++;
+      }
+      const running = [];
+      for (const a of admissions) if (a.status === "admitted") {
+        const acc = await ipAccount(env, a);
+        running.push({ id: a.id, no: a.no, total: acc.total, advance: acc.advance, due: acc.due });
+        const t = byDept.ip; t.billed = money(t.billed + acc.total); t.paid = money(t.paid + acc.advance); t.due = money(t.due + acc.due); t.count++;
+      }
+      const total = Object.values(byDept).reduce((x, t) => ({ billed: money(x.billed + t.billed), paid: money(x.paid + t.paid), due: money(x.due + t.due) }), { billed: 0, paid: 0, due: 0 });
+      return json({ patient: publicPatient(pid, p), byDept, total, bills, admissions: admissions.map((a) => ({ id: a.id, no: a.no, status: a.status, ward: a.ward, bed: a.bed, admittedAt: a.admittedAt, dischargedAt: a.dischargedAt || 0 })), running });
+    }
+
+    case "/api/bills/summary": {
+      await requireUser(env, body.session, ["billing"]);
+      const from = String(body.from || clinicNow(env).date), to = String(body.to || from);
+      const bills = (await listDocs(env, "bills", "json_extract(data, '$.date') >= ? AND json_extract(data, '$.date') <= ?", [from, to])).filter((b) => b.status !== "cancelled");
+      const byDept = {}, byMode = {};
+      for (const d of Object.keys(DEPTS)) byDept[d] = { billed: 0, collected: 0, count: 0 };
+      for (const b of bills) {
+        const t = byDept[b.dept];
+        if (b.status !== "to-ip" && b.status !== "on-ip-bill") { t.billed = money(t.billed + b.total); t.count++; }
+      }
+      // Money received in the period, by the day it was received
+      const start = Date.parse(from + "T00:00:00Z") - Number(env.CLINIC_TZ_MINUTES ?? 330) * 60000, endT = start + (Math.round((Date.parse(to) - Date.parse(from)) / 86400000) + 1) * 86400000;
+      const recent = await listDocs(env, "bills", "json_extract(data, '$.date') >= ?", [addDays(from, -120)]);
+      for (const b of recent) for (const pmt of b.payments || []) if (pmt.at >= start && pmt.at < endT && pmt.mode !== "Advance" && b.status !== "cancelled") {
+        byDept[b.dept].collected = money(byDept[b.dept].collected + pmt.amount); byMode[pmt.mode] = money((byMode[pmt.mode] || 0) + pmt.amount);
+      }
+      for (const a of await listDocs(env, "admissions", "json_extract(data, '$.admittedAt') >= ?", [Date.now() - 400 * 86400000])) for (const d of a.deposits || []) if (d.at >= start && d.at < endT) {
+        byDept.ip.collected = money(byDept.ip.collected + d.amount); byMode[d.mode] = money((byMode[d.mode] || 0) + d.amount);
+      }
+      const totals = Object.values(byDept).reduce((x, t) => ({ billed: money(x.billed + t.billed), collected: money(x.collected + t.collected) }), { billed: 0, collected: 0 });
+      return json({ from, to, byDept, byMode, totals });
+    }
+
+    // ----- inpatients -----
+    case "/api/ip/admit": {
+      const me = await requireUser(env, body.session, ["billing", "staff", "doctor"]);
+      const pid = String(body.patientId || "").toUpperCase();
+      const p = await getDoc(env, "patients", pid);
+      if (!p) throw new HttpError(404, "Find or register the patient first");
+      if (await activeAdmission(env, pid)) throw new HttpError(409, "This patient is already admitted");
+      const wards = await tariff(env, "ip");
+      const w = wards.find((t) => t.name === body.ward && t.unit === "per day");
+      const a = {
+        no: await nextNo(env, "ipd", "IPD"), patient: billPatient(Object.assign({ id: pid }, p)), ward: w ? w.name : clean(body.ward, 60) || "General ward",
+        wardRate: w ? w.price : Math.max(0, money(body.wardRate)), bed: clean(body.bed, 20), doctor: clean(body.doctor, 80), reason: clean(body.reason, 300),
+        admittedAt: Date.now(), admittedBy: me.user.name || me.role, status: "admitted", charges: [], deposits: [],
+      };
+      const dep = payment(body.deposit, me.user.name || me.role);
+      if (dep) a.deposits.push(dep);
+      const id = crypto.randomUUID();
+      await putDoc(env, "admissions", id, a);
+      return json({ admission: Object.assign({ id }, a) });
+    }
+
+    case "/api/ip/list": {
+      await requireUser(env, body.session, ["billing", "staff", "doctor", "pharmacy", "lab", "diagnostics"]);
+      const status = body.status === "discharged" ? "discharged" : "admitted";
+      let list = await listDocs(env, "admissions", "json_extract(data, '$.status') = ?", [status]);
+      list = list.sort((a, b) => (status === "admitted" ? a.admittedAt - b.admittedAt : b.dischargedAt - a.dischargedAt)).slice(0, 100);
+      const out = [];
+      for (const a of list) { const acc = await ipAccount(env, a); out.push({ id: a.id, no: a.no, patient: a.patient, ward: a.ward, bed: a.bed, doctor: a.doctor, admittedAt: a.admittedAt, dischargedAt: a.dischargedAt || 0, status: a.status, days: acc.days, total: acc.total, advance: acc.advance, due: acc.due }); }
+      return json({ admissions: out });
+    }
+
+    case "/api/ip/get": {
+      await requireUser(env, body.session, ["billing", "staff", "doctor"]);
+      const id = String(body.id || "");
+      const a = await getDoc(env, "admissions", id);
+      if (!a) throw new HttpError(404, "Admission not found");
+      a.id = id;
+      return json({ admission: a, account: await ipAccount(env, a), finalBill: a.finalBillId ? Object.assign({ id: a.finalBillId }, await getDoc(env, "bills", a.finalBillId)) : null });
+    }
+
+    case "/api/ip/update": {
+      // Charges, advances, ward or bed change on an admitted patient.
+      const me = await requireUser(env, body.session, ["billing", "staff"]);
+      const id = String(body.id || "");
+      const a = await getDoc(env, "admissions", id);
+      if (!a) throw new HttpError(404, "Admission not found");
+      if (a.status !== "admitted") throw new HttpError(409, "This patient is already discharged");
+      a.id = id;
+      const by = me.user.name || me.role;
+      if (body.charge) {
+        const c = body.charge, qty = Math.max(0, Number(c.qty) || 1), rate = Math.max(0, money(c.rate));
+        if (!clean(c.desc, 160)) throw new HttpError(400, "Enter what the charge is for");
+        a.charges.push({ id: randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 8), desc: clean(c.desc, 160), qty, rate, amount: money(qty * rate), date: clinicNow(env).date, by });
+      }
+      if (body.removeCharge) {
+        if (me.role !== "billing" && me.role !== "admin") throw new HttpError(403, "Only billing can remove a charge");
+        a.charges = a.charges.filter((c) => c.id !== body.removeCharge);
+      }
+      if (body.deposit) {
+        if (me.role !== "billing" && me.role !== "admin") throw new HttpError(403, "Only billing can take an advance");
+        const d = payment(body.deposit, by); if (!d) throw new HttpError(400, "Enter the amount"); a.deposits.push(d);
+      }
+      if (body.bed !== undefined) a.bed = clean(body.bed, 20);
+      if (body.ward) {
+        const w = (await tariff(env, "ip")).find((t) => t.name === body.ward && t.unit === "per day");
+        if (w) {
+          // Bill the days so far at the old rate, then continue at the new one.
+          const acc = await ipAccount(env, a);
+          if (a.wardRate > 0) a.charges.push({ id: randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 8), desc: `${a.ward} (${acc.days} day${acc.days > 1 ? "s" : ""}, before transfer)`, qty: acc.days, rate: a.wardRate, amount: money(acc.days * a.wardRate), date: clinicNow(env).date, by });
+          a.ward = w.name; a.wardRate = w.price; a.admittedAt = Date.now();
+          a.transfers = (a.transfers || []).concat([{ to: w.name, at: Date.now(), by }]);
+        }
+      }
+      delete a.id;
+      await putDoc(env, "admissions", id, a);
+      a.id = id;
+      return json({ admission: a, account: await ipAccount(env, a) });
+    }
+
+    case "/api/ip/discharge": {
+      // Final inpatient bill: room days, charges, department bills sent to IP, advances, discount, balance paid.
+      const me = await requireUser(env, body.session, ["billing"]);
+      const id = String(body.id || "");
+      const a = await getDoc(env, "admissions", id);
+      if (!a) throw new HttpError(404, "Admission not found");
+      if (a.status !== "admitted") throw new HttpError(409, "Already discharged");
+      a.id = id;
+      a.dischargedAt = Date.now();
+      const acc = await ipAccount(env, a);
+      const by = me.user.name || me.role;
+      const b = {
+        dept: "ip", deptName: "Inpatient", no: await nextNo(env, "ip", "IP"), patient: a.patient, admissionId: id, admissionNo: a.no,
+        items: acc.lines.map((l) => ({ desc: l.desc, qty: l.qty, rate: l.rate, ref: l.billId || "" })), discount: body.discount, note: clean(body.note, 300),
+        payments: (a.deposits || []).map((d) => ({ amount: d.amount, mode: "Advance", ref: d.mode, at: d.at, by: d.by })),
+        created: Date.now(), createdBy: by, date: clinicNow(env).date, admittedAt: a.admittedAt, dischargedAt: a.dischargedAt, ward: a.ward, bed: a.bed, doctor: a.doctor,
+      };
+      computeBill(b);
+      const pay = payment(body.pay, by);
+      if (pay && pay.amount > b.balance + 0.001) throw new HttpError(400, b.balance > 0 ? `Only ₹${b.balance} is due after the advance` : "Nothing is due: the advance covers the bill");
+      if (pay) { b.payments.push(pay); computeBill(b); }
+      const billId = crypto.randomUUID();
+      await putDoc(env, "bills", billId, b);
+      for (const l of acc.lines) if (l.billId) { const db2 = await getDoc(env, "bills", l.billId); if (db2) { db2.status = "on-ip-bill"; db2.ipBillId = billId; await putDoc(env, "bills", l.billId, db2); } }
+      a.status = "discharged"; a.finalBillId = billId; a.dischargedBy = by;
+      delete a.id;
+      await putDoc(env, "admissions", id, a);
+      return json({ bill: Object.assign({ id: billId }, b) });
     }
 
     // ----- AI (OpenAI), for the doctor's tools -----

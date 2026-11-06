@@ -35,6 +35,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AdminPanelSettings
+import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Assignment
 import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.MonitorHeart
@@ -97,11 +98,11 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry }
+private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry, Billing, Inpatients, PriceList }
 
 private fun roleScreen(role: String) = when (role) {
     "doctor" -> Screen.DoctorHome; "staff" -> Screen.Nurse; "pharmacy" -> Screen.Pharmacy
-    "lab" -> Screen.Lab; "diagnostics" -> Screen.Diagnostics; else -> Screen.Admin
+    "lab" -> Screen.Lab; "diagnostics" -> Screen.Diagnostics; "billing" -> Screen.Billing; else -> Screen.Admin
 }
 
 /** Everything outside the video call. */
@@ -115,6 +116,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
 
     fun open(role: String) {
         if (role == "patients") { screen = Screen.Registry; return }
+        if (role == "prices") { screen = Screen.PriceList; return }
         val has = if (role == "admin") prefs.session("admin") != null else prefs.sessionFor(role) != null
         if (has) screen = roleScreen(role) else { loginRole = role; screen = Screen.StaffLogin }
     }
@@ -138,11 +140,14 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
             Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { r -> screen = roleScreen(r) })
             Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = signedOut("doctor"))
-            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onSignedOut = signedOut("doctor"))
+            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onSignedOut = signedOut("doctor"))
             Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = signedOut("doctor"))
             Screen.Case -> CaseScreen(vm, caseId, onBack = { screen = Screen.OpdQueue })
             Screen.Checkin -> CheckinScreen(vm, onBack = { screen = Screen.PatientHome })
-            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onSignedOut = signedOut("staff"))
+            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onSignedOut = signedOut("staff"))
+            Screen.Billing -> BillingScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onSignedOut = signedOut("billing"))
+            Screen.Inpatients -> InpatientsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
+            Screen.PriceList -> PriceListScreen(vm, onBack = { screen = Screen.Admin })
             Screen.PatientAccount -> PatientAccountScreen(vm, onBack = { screen = Screen.PatientHome })
             Screen.Registry -> PatientRegistryScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.Pharmacy -> PharmacyScreen(vm, onBack = back, onSignedOut = signedOut("pharmacy"))
@@ -240,7 +245,8 @@ private fun HomeScreen(onPatient: () -> Unit, onRole: (String) -> Unit, onSettin
         RoleCard("Pharmacy", "Prescriptions to dispense, medicine stock", Icons.Filled.LocalPharmacy) { onRole("pharmacy") }
         RoleCard("Lab", "Test orders, samples, reports", Icons.Filled.Biotech) { onRole("lab") }
         RoleCard("Diagnostics", "USG, CT scan, MRI scan, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onRole("diagnostics") }
-        RoleCard("Admin", "Overview, PINs, clinic details, every section", Icons.Filled.AdminPanelSettings) { onRole("admin") }
+        RoleCard("Billing", "OPD bills, patient totals, inpatient billing", Icons.AutoMirrored.Filled.ReceiptLong) { onRole("billing") }
+        RoleCard("Admin", "Overview, logins, price list, every section", Icons.Filled.AdminPanelSettings) { onRole("admin") }
         Spacer(Modifier.height(24.dp))
     }
 }

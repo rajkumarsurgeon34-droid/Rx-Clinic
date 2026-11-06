@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Badge
+import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.EventAvailable
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Refresh
@@ -125,7 +126,7 @@ private val QUICK_ADVICE = listOf(
 // ---------- Doctor home ----------
 
 @Composable
-fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onSignedOut: () -> Unit) {
+fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onSignedOut: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         TopBar(vm.prefs.doctorName.ifBlank { "Doctor" }, onBack) {
             AccountButton(vm, onSignedOut)
@@ -134,6 +135,7 @@ fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppoi
             RoleCard("OPD today", "Patients who checked in, their case sheets, AI suggestions and prescriptions", Icons.Filled.Groups, onOpd)
             RoleCard("Appointments and video teleconsults", "Bookings by day; start video calls", Icons.Filled.EventAvailable, onAppointments)
             RoleCard("Patient records", "Find by Patient ID, mobile, Aadhaar or name; register; past visits", Icons.Filled.Badge, onPatients)
+            RoleCard("Inpatients", "Admitted patients, admit, ward charges", Icons.Filled.LocalHospital, onInpatients)
         }
     }
 }

@@ -30,6 +30,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Biotech
+import androidx.compose.material.icons.filled.PriceChange
+import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.LocalPharmacy
 import androidx.compose.material.icons.filled.MedicalServices
@@ -79,6 +81,7 @@ val ROLE_TITLES = linkedMapOf(
     "pharmacy" to "Pharmacy",
     "lab" to "Lab",
     "diagnostics" to "Diagnostics",
+    "billing" to "Billing",
     "admin" to "Admin",
 )
 
@@ -203,7 +206,7 @@ internal fun AccountButton(vm: CallViewModel, onSignedOut: () -> Unit) {
 // ---------------- Nursing staff: OPD triage vitals ----------------
 
 @Composable
-fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onSignedOut: () -> Unit) {
+fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("staff") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
@@ -224,6 +227,7 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
     Column(Modifier.fillMaxSize()) {
         TopBar("Nursing · Triage", onBack) {
             TextButton(onClick = onPatients) { Text("Patients") }
+            TextButton(onClick = onInpatients) { Text("IP") }
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
             AccountButton(vm, onSignedOut)
         }
@@ -296,6 +300,7 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
     val stock = remember { mutableStateListOf<JSONObject>() }
     var err by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(true) }
+    var billFor by remember { mutableStateOf<String?>(null) } // visit id, or "" for a counter sale
 
     LaunchedEffect(refresh) {
         loading = true; err = null
@@ -319,6 +324,7 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
         }
         Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Choice("To dispense (${queue.count { it.str("status") == "sent" }})", tab == "dispense", modifier = Modifier.weight(1f)) { tab = "dispense" }
+            Choice("Bills", tab == "bills", modifier = Modifier.weight(1f)) { tab = "bills" }
             Choice("Stock (${stock.size})", tab == "stock", modifier = Modifier.weight(1f)) { tab = "stock" }
         }
         Box(Modifier.padding(horizontal = 16.dp)) { ErrorText(err) }
@@ -344,19 +350,26 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
                                 Pill(if (inStock(r.str("generic"))) "In stock" else "Not in stock", if (inStock(r.str("generic"))) Ui.Green else Ui.Red)
                             }
                         }
-                        if (v.str("status") == "sent") Button(onClick = {
-                            scope.launch {
-                                try {
-                                    api.call("/api/pharmacy/dispense", JSONObject().put("session", session).put("id", v.str("id")))
-                                    Toast.makeText(context, "Marked dispensed", Toast.LENGTH_SHORT).show(); refresh++
-                                } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't update", Toast.LENGTH_LONG).show() }
-                            }
-                        }, modifier = Modifier.fillMaxWidth()) { Text("Mark dispensed") }
+                        if (v.str("billId").isNotBlank()) Pill("Billed", Ui.Green)
+                        if (v.str("status") == "sent") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { billFor = v.str("id") }, modifier = Modifier.weight(1f)) { Text(if (v.str("billId").isBlank()) "Bill & dispense" else "Bill again") }
+                            OutlinedButton(onClick = {
+                                scope.launch {
+                                    try {
+                                        api.call("/api/pharmacy/dispense", JSONObject().put("session", session).put("id", v.str("id")))
+                                        Toast.makeText(context, "Marked dispensed", Toast.LENGTH_SHORT).show(); refresh++
+                                    } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't update", Toast.LENGTH_LONG).show() }
+                                }
+                            }) { Text("Dispense only") }
+                        }
                     }
                 }
             }
+        } else if (tab == "bills") {
+            BillsPanel(vm, session, "pharmacy", refresh, onNew = { billFor = "" }, newLabel = "New counter sale")
         } else {
             var generic by remember { mutableStateOf("") }
+            var price by remember { mutableStateOf("") }
             var brand by remember { mutableStateOf("") }
             var form by remember { mutableStateOf("Tab") }
             var strength by remember { mutableStateOf("") }
@@ -376,23 +389,25 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
                             OutlinedTextField(strength, { strength = it }, label = { Text("Strength") }, singleLine = true, modifier = Modifier.weight(1f))
                             OutlinedTextField(units, { units = it.filter(Char::isDigit).take(6) }, label = { Text("Units") }, singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(0.8f))
+                            OutlinedTextField(price, { price = it.filter { c -> c.isDigit() || c == '.' }.take(8) }, label = { Text("MRP ₹/unit") }, singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.weight(1f))
                         }
                         Button(enabled = generic.isNotBlank(), onClick = {
                             scope.launch {
                                 try {
                                     api.call("/api/pharmacy/stock/save", JSONObject().put("session", session).put("item",
-                                        JSONObject().put("generic", generic.trim()).put("brand", brand.trim()).put("form", form.trim()).put("strength", strength.trim()).put("stock", units.toIntOrNull() ?: 0)))
-                                    generic = ""; brand = ""; strength = ""; units = ""; refresh++
+                                        JSONObject().put("generic", generic.trim()).put("brand", brand.trim()).put("form", form.trim()).put("strength", strength.trim()).put("stock", units.toIntOrNull() ?: 0).put("price", price.toDoubleOrNull() ?: 0.0)))
+                                    generic = ""; brand = ""; strength = ""; units = ""; price = ""; refresh++
                                 } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't add", Toast.LENGTH_LONG).show() }
                             }
                         }) { Text("Add to stock") }
-                        Text("Or paste a list (one per line: generic, brand, form, strength, units). You can copy columns from Excel.", color = Ui.Muted, fontSize = 12.sp)
+                        Text("Or paste a list (one per line: generic, brand, form, strength, units, MRP per unit). You can copy columns from Excel.", color = Ui.Muted, fontSize = 12.sp)
                         OutlinedTextField(bulk, { bulk = it }, label = { Text("Paste list") }, minLines = 2, modifier = Modifier.fillMaxWidth())
                         OutlinedButton(enabled = bulk.isNotBlank(), onClick = {
                             val arr = JSONArray()
                             bulk.lines().map { l -> l.split('\t', ',').map { it.trim() } }.filter { it.firstOrNull().orEmpty().isNotBlank() }.forEach { c ->
                                 arr.put(JSONObject().put("generic", c[0]).put("brand", c.getOrElse(1) { "" }).put("form", c.getOrElse(2) { "Tab" })
-                                    .put("strength", c.getOrElse(3) { "" }).put("stock", c.getOrElse(4) { "0" }.toIntOrNull() ?: 0))
+                                    .put("strength", c.getOrElse(3) { "" }).put("stock", c.getOrElse(4) { "0" }.toIntOrNull() ?: 0).put("price", c.getOrElse(5) { "0" }.toDoubleOrNull() ?: 0.0))
                             }
                             scope.launch {
                                 try {
@@ -405,9 +420,9 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
                     OutlinedTextField(search, { search = it }, label = { Text("Search stock") }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
                 }
                 items(stock.filter { search.isBlank() || (it.str("generic") + " " + it.str("brand")).contains(search, true) }, key = { it.str("id") }) { d ->
-                    StockRow(d, onSave = { n ->
+                    StockRow(d, onSave = { n, pr ->
                         scope.launch {
-                            try { api.call("/api/pharmacy/stock/save", JSONObject().put("session", session).put("item", JSONObject(d.toString()).put("stock", n))); refresh++ }
+                            try { api.call("/api/pharmacy/stock/save", JSONObject().put("session", session).put("item", JSONObject(d.toString()).put("stock", n).put("price", pr))); refresh++ }
                             catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't update", Toast.LENGTH_LONG).show() }
                         }
                     }, onDelete = {
@@ -420,20 +435,35 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
             }
         }
     }
+
+    billFor?.let { vid ->
+        BillEditor(vm, session, "pharmacy", visitId = vid, dispense = vid.isNotBlank(), onDismiss = { billFor = null }, onSaved = { b ->
+            billFor = null; refresh++
+            Toast.makeText(context, "Bill ${b.str("no")} saved · ${rupees(b.num("total"))}", Toast.LENGTH_LONG).show()
+        })
+    }
 }
 
 @Composable
-private fun StockRow(d: JSONObject, onSave: (Int) -> Unit, onDelete: () -> Unit) {
+private fun StockRow(d: JSONObject, onSave: (Int, Double) -> Unit, onDelete: () -> Unit) {
     var units by remember(d.str("id"), d.optInt("stock")) { mutableStateOf(d.optInt("stock").toString()) }
-    RowCard {
-        Column(Modifier.weight(1f)) {
-            Text("${d.str("generic")} ${d.str("strength")}", color = Ui.Text, fontWeight = FontWeight.SemiBold)
-            Text(listOf(d.str("form"), d.str("brand")).filter { it.isNotBlank() }.joinToString(" · "), color = Ui.Muted, fontSize = 13.sp)
+    var price by remember(d.str("id"), d.num("price")) { mutableStateOf(d.num("price").let { if (it % 1.0 == 0.0) it.toLong().toString() else it.toString() }) }
+    BoxCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("${d.str("generic")} ${d.str("strength")}", color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                Text(listOf(d.str("form"), d.str("brand")).filter { it.isNotBlank() }.joinToString(" · "), color = Ui.Muted, fontSize = 13.sp)
+            }
+            if (d.optInt("stock") <= 0) Pill("Out of stock", Ui.Red)
         }
-        OutlinedTextField(units, { units = it.filter(Char::isDigit).take(6) }, singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.width(84.dp))
-        TextButton(onClick = { onSave(units.toIntOrNull() ?: 0) }) { Text("Save") }
-        TextButton(onClick = onDelete) { Text("Delete", color = Ui.Red) }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedTextField(units, { units = it.filter(Char::isDigit).take(6) }, label = { Text("Units") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.width(88.dp))
+            OutlinedTextField(price, { price = it.filter { c -> c.isDigit() || c == '.' }.take(8) }, label = { Text("MRP ₹") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.width(96.dp))
+            TextButton(onClick = { onSave(units.toIntOrNull() ?: 0, price.toDoubleOrNull() ?: 0.0) }) { Text("Save") }
+            TextButton(onClick = onDelete) { Text("Delete", color = Ui.Red) }
+        }
     }
 }
 
@@ -452,6 +482,8 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
     var err by remember { mutableStateOf<String?>(null) }
     var filter by remember { mutableStateOf("All") }
     var reporting by remember { mutableStateOf<JSONObject?>(null) }
+    var tab by remember { mutableStateOf("orders") }
+    var billVisit by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(refresh) {
         loading = true; err = null
@@ -479,6 +511,11 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
         Text(if (imaging) "Scan orders from the doctors. Schedule the scan, then enter findings and impression; the report reaches the doctor's case sheet."
             else "Test orders from the doctors. Mark the sample collected, then enter the report; it reaches the doctor's case sheet.",
             color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Choice("Orders", tab == "orders", modifier = Modifier.weight(1f)) { tab = "orders" }
+            Choice("Bills", tab == "bills", modifier = Modifier.weight(1f)) { tab = "bills" }
+        }
+        if (tab == "bills") { BillsPanel(vm, session, role, refresh, onNew = { billVisit = "" }, newLabel = "New bill (walk-in)"); return@Column }
         if (imaging) FlowRow(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             modalities.forEach { m ->
                 val n = if (m == "All") list.count { it.str("status") != "reported" } else list.count { it.str("modality") == m && it.str("status") != "reported" }
@@ -500,6 +537,8 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
                         if (imaging) { Pill(o.str("modality"), Ui.Ai); Spacer(Modifier.width(4.dp)) }
                         Pill(orderStatusLabel(st), if (st == "reported") Ui.Green else Ui.Amber)
                     }
+                    if (o.str("billId").isNotBlank()) Pill("Billed", Ui.Green)
+                    else TextButton(onClick = { billVisit = o.str("visitId") }) { Text("Bill this patient's ${if (imaging) "scans" else "tests"}") }
                     when (st) {
                         "ordered" -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { update(o, if (imaging) "scheduled" else "collected") }) { Text(if (imaging) "Scan scheduled" else "Sample collected") }
@@ -514,6 +553,13 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
                 }
             }
         }
+    }
+
+    billVisit?.let { vid ->
+        BillEditor(vm, session, role, visitId = vid, onDismiss = { billVisit = null }, onSaved = { b ->
+            billVisit = null; refresh++
+            Toast.makeText(context, "Bill ${b.str("no")} saved · ${rupees(b.num("total"))}", Toast.LENGTH_LONG).show()
+        })
     }
 
     reporting?.let { o ->
@@ -592,6 +638,8 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
                     Stat("Diagnostics", o.obj("diagnostics").str("pending"), "pending · ${o.obj("diagnostics").str("reported")} reported")
                     Stat("Out of stock", o.obj("pharmacy").str("outOfStock"), "medicines")
                     Stat("Patients", o.obj("people").str("patients"), "registered")
+                    Stat("Billed today", rupees(o.obj("billing").num("billed")), "collected ${rupees(o.obj("billing").num("collected"))}")
+                    Stat("Inpatients", o.obj("billing").str("inpatients"), "admitted now")
                 }
             }
             item {
@@ -602,6 +650,8 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             item { RoleCard("Nursing staff", "Triage vitals", Icons.Filled.LocalHospital) { onOpen("staff") } }
             item { RoleCard("Pharmacy", "Dispensing and stock", Icons.Filled.LocalPharmacy) { onOpen("pharmacy") } }
             item { RoleCard("Patient records", "Register, find and edit patients", Icons.Filled.Badge) { onOpen("patients") } }
+            item { RoleCard("Billing", "OPD bills, patient totals, inpatients, collections", Icons.AutoMirrored.Filled.ReceiptLong) { onOpen("billing") } }
+            item { RoleCard("Price list", "Consultation, tests, scans, rooms and inpatient charges", Icons.Filled.PriceChange) { onOpen("prices") } }
             item { RoleCard("Lab", "Test orders and reports", Icons.Filled.Biotech) { onOpen("lab") } }
             item { RoleCard("Diagnostics", "USG, CT, MRI, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onOpen("diagnostics") } }
             item {
@@ -717,12 +767,12 @@ private fun UserDialog(vm: CallViewModel, session: String, start: JSONObject, on
 // ---------------- small shared pieces ----------------
 
 @Composable
-private fun Stat(label: String, value: String, sub: String) {
+internal fun Stat(label: String, value: String, sub: String) {
     Column(
         Modifier.width(150.dp).clip(RoundedCornerShape(14.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(14.dp)).padding(12.dp),
     ) {
         Text(label.uppercase(), color = Ui.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-        Text(value.ifBlank { "0" }, color = Ui.Text, fontSize = 28.sp, fontFamily = FontFamily.Monospace)
+        Text(value.ifBlank { "0" }, color = Ui.Text, fontSize = if (value.length > 6) 20.sp else 28.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
         Text(sub, color = Ui.Muted, fontSize = 12.sp)
     }
 }

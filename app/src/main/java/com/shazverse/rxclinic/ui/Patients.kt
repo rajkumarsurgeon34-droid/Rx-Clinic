@@ -216,6 +216,22 @@ private fun PatientRecord(vm: CallViewModel, onBack: () -> Unit, onSignedOut: ()
                     }
                 }
             }
+            val bills = d.objs("bills")
+            if (bills.isNotEmpty()) {
+                item { Text("My bills", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, fontFamily = FontFamily.Serif) }
+                items(bills, key = { "b" + it.str("id") }) { b ->
+                    RowCard {
+                        Column(Modifier.weight(1f)) {
+                            Text("${b.str("deptName")} · ${b.str("no")}", color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                            Text(dayLabel(b.str("date")) + " · " + b.objs("items").joinToString(", ") { it.str("desc") }, color = Ui.Muted, fontSize = 12.sp, maxLines = 2)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(rupees(b.num("total")), color = Ui.Text, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)
+                            Pill(billStatusLabel(b.str("status")), billStatusColor(b.str("status")))
+                        }
+                    }
+                }
+            }
             item { Text("My visits, prescriptions and reports", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, fontFamily = FontFamily.Serif) }
             val visits = d.objs("visits")
             if (visits.isEmpty()) item { Text("No visits yet.", color = Ui.Muted) }
@@ -262,7 +278,7 @@ private fun EditOwnDetailsDialog(p: JSONObject, onDismiss: () -> Unit, onSave: (
 
 @Composable
 fun PatientRegistryScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Unit) {
-    val session = vm.prefs.sessionFor("staff") ?: vm.prefs.sessionFor("doctor") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
+    val session = vm.prefs.sessionFor("staff") ?: vm.prefs.sessionFor("doctor") ?: vm.prefs.sessionFor("billing") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
