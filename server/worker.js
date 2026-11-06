@@ -2811,7 +2811,7 @@ main{padding:12px max(14px,env(safe-area-inset-left)) 40px}
 .chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 12px;font-size:13px}.chip.on{background:var(--head);color:#fff;border-color:var(--head)}
 .tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:12px}
 .tile{border-radius:8px;padding:10px 12px;display:grid;grid-template-columns:auto 1fr;gap:2px 10px;align-items:center;cursor:pointer;border:1px solid transparent}.tile:hover{border-color:var(--line)}
-.tile svg{width:26px;height:26px;grid-row:span 2}.tile b{font-size:20px;line-height:1}.tile .n{font-size:13px;font-weight:600}.tile .s{grid-column:1/-1;display:flex;gap:10px;font-size:12px;color:var(--muted);margin-top:4px}
+.tile svg{width:26px;height:26px;grid-row:span 2}.tile b{font-size:20px;line-height:1}.tile .n{font-size:13px;font-weight:600}.tile .s{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:4px 10px;font-size:12px;color:var(--muted);margin-top:4px}
 .tile .s i{font-style:normal;background:rgba(255,255,255,.75);border-radius:4px;padding:0 5px;font-weight:600;color:var(--fg)}
 .tbl-wrap{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:auto}
 table{border-collapse:collapse;width:100%;min-width:900px}th{background:var(--head);color:#fff;text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.03em;padding:8px 10px;white-space:nowrap;font-weight:600}

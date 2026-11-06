@@ -121,10 +121,10 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
         if (role == "plan") { screen = Screen.Plan; return }
         if (role.startsWith("hmis")) { hmisStart = role.substringAfter(":", ""); screen = Screen.Hmis; return }
         val has = if (role == "admin") prefs.session("admin") != null else prefs.sessionFor(role) != null
-        if (has) screen = roleScreen(role) else { loginRole = role; screen = Screen.StaffLogin }
+        if (has) { hmisStart = ""; screen = Screen.Hmis } else { loginRole = role; screen = Screen.StaffLogin }
     }
-    // Admin returns to the admin page; everyone else to the home screen.
-    val back: () -> Unit = { screen = if (prefs.session("admin") != null) Screen.Admin else Screen.Home }
+    // Staff work in the HMIS; the app's own screens ("App tools") go back to it.
+    val back: () -> Unit = { if (prefs.staffRole != null) { hmisStart = ""; screen = Screen.Hmis } else screen = Screen.Home }
     fun signedOut(role: String): () -> Unit = { loginRole = role; screen = Screen.StaffLogin }
 
     CompositionLocalProvider(LocalContentColor provides Ui.Text) {
@@ -141,7 +141,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             )
             Screen.Book -> BookScreen(vm, onBack = { screen = Screen.PatientHome }, onDone = { screen = Screen.MyAppointments })
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
-            Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { r -> screen = roleScreen(r) })
+            Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { hmisStart = ""; screen = Screen.Hmis })
             Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = signedOut("doctor"))
             Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onHmis = { open(it) }, onSignedOut = signedOut("doctor"))
             Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = signedOut("doctor"))
@@ -150,7 +150,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onHmis = { open(it) }, onSignedOut = signedOut("staff"))
             Screen.FollowUps -> FollowUpsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.Plan -> PlanScreen(vm, onBack = { screen = Screen.Admin })
-            Screen.Hmis -> HmisWebScreen(vm, hmisStart, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home })
+            Screen.Hmis -> HmisWebScreen(vm, hmisStart, onTools = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = { loginRole = prefs.staffRole ?: loginRole; screen = Screen.StaffLogin }, onBack = { screen = Screen.Home })
             Screen.Billing -> BillingScreen(vm, onChart = { open(if (it.startsWith("@")) "hmis:" + it.drop(1) else "hmis:ip-$it") }, onBack = back, onPatients = { screen = Screen.Registry }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("billing"))
             Screen.Inpatients -> InpatientsScreen(vm, onChart = { open("hmis:ip-$it") }, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.PriceList -> PriceListScreen(vm, onBack = { screen = Screen.Admin })
@@ -159,7 +159,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             Screen.Pharmacy -> PharmacyScreen(vm, onHmis = { open(it) }, onBack = back, onSignedOut = signedOut("pharmacy"))
             Screen.Lab -> OrdersScreen(vm, "lab", onHmis = { open(it) }, onBack = back, onSignedOut = signedOut("lab"))
             Screen.Diagnostics -> OrdersScreen(vm, "diagnostics", onHmis = { open(it) }, onBack = back, onSignedOut = signedOut("diagnostics"))
-            Screen.Admin -> AdminScreen(vm, onBack = { screen = Screen.Home }, onOpen = { open(it) }, onSignedOut = signedOut("admin"))
+            Screen.Admin -> AdminScreen(vm, onBack = back, onOpen = { open(it) }, onSignedOut = signedOut("admin"))
         }
     }
     }
