@@ -114,6 +114,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     var loginRole by rememberSaveable { mutableStateOf("doctor") }
     var hmisStart by rememberSaveable { mutableStateOf("") }
     val prefs = vm.prefs
+    val activity = androidx.compose.ui.platform.LocalContext.current as? android.app.Activity
 
     fun open(role: String) {
         if (role == "patients") { screen = Screen.Registry; return }
@@ -125,12 +126,16 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     }
     // Staff work in the HMIS; the app's own screens ("App tools") go back to it.
     val back: () -> Unit = { if (prefs.staffRole != null) { hmisStart = ""; screen = Screen.Hmis } else screen = Screen.Home }
-    fun signedOut(role: String): () -> Unit = { loginRole = role; screen = Screen.StaffLogin }
+    fun signedOut(role: String): () -> Unit = { loginRole = role; screen = Screen.Home }
 
     CompositionLocalProvider(LocalContentColor provides Ui.Text) {
     Box(Modifier.fillMaxSize().background(Ui.Bg).statusBarsPadding().navigationBarsPadding()) {
         when (screen) {
-            Screen.Home -> HomeScreen(vm, onPatient = { screen = Screen.PatientHome }, onRole = { open(it) }, onSettings = { showSettings = true })
+            Screen.Home -> {
+                // Front page: the BackBone-style sign-in. Signed-in staff go straight to the HMIS.
+                if (prefs.staffRole != null) LaunchedEffect(Unit) { hmisStart = ""; screen = Screen.Hmis }
+                else StaffLogin(vm, "", onBack = null, onIn = { hmisStart = ""; screen = Screen.Hmis }, onPatient = { screen = Screen.PatientHome }, onSettings = { showSettings = true })
+            }
             Screen.PatientHome -> PatientHome(
                 vm,
                 onAccount = { screen = Screen.PatientAccount },
@@ -150,7 +155,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onHmis = { open(it) }, onSignedOut = signedOut("staff"))
             Screen.FollowUps -> FollowUpsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.Plan -> PlanScreen(vm, onBack = { screen = Screen.Admin })
-            Screen.Hmis -> HmisWebScreen(vm, hmisStart, onTools = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = { loginRole = prefs.staffRole ?: loginRole; screen = Screen.StaffLogin }, onBack = { screen = Screen.Home })
+            Screen.Hmis -> HmisWebScreen(vm, hmisStart, onTools = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = { screen = Screen.Home }, onBack = { activity?.moveTaskToBack(true) })
             Screen.Billing -> BillingScreen(vm, onChart = { open(if (it.startsWith("@")) "hmis:" + it.drop(1) else "hmis:ip-$it") }, onBack = back, onPatients = { screen = Screen.Registry }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("billing"))
             Screen.Inpatients -> InpatientsScreen(vm, onChart = { open("hmis:ip-$it") }, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.PriceList -> PriceListScreen(vm, onBack = { screen = Screen.Admin })

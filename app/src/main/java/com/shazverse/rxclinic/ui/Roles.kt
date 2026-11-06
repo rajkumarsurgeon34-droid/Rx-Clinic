@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.layout.size
@@ -105,7 +106,7 @@ private fun signedOutError(e: Exception) = e.message?.contains("Sign in", ignore
 // ---------------- Staff sign-in: username and password ----------------
 
 @Composable
-fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (String) -> Unit) {
+fun StaffLogin(vm: CallViewModel, role: String, onBack: (() -> Unit)?, onIn: (String) -> Unit, onPatient: (() -> Unit)? = null, onSettings: (() -> Unit)? = null) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var username by remember { mutableStateOf(vm.prefs.staffUsername) }
@@ -136,7 +137,11 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (Strin
     }
 
     Column(Modifier.fillMaxSize().background(Ui.Bg).imePadding()) {
-        Row(Modifier.padding(start = 4.dp, top = 4.dp)) { TextButton(onClick = onBack) { Text("‹ Back", color = Ui.Teal) } }
+        Row(Modifier.fillMaxWidth().padding(start = 4.dp, top = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (onBack != null) TextButton(onClick = onBack) { Text("‹ Back", color = Ui.Teal) }
+            Spacer(Modifier.weight(1f))
+            if (onSettings != null) IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings", tint = Ui.Muted) }
+        }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(12.dp)),
@@ -149,7 +154,7 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (Strin
                     }
                     Text("HOSPITAL & CLINIC SUITE", color = Ui.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 3.sp)
                     Text("Sign in", color = Ui.Text, fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
-                    Text(ROLE_TITLES[role] ?: "Staff", color = Ui.Muted, fontSize = 14.sp)
+                    if (role.isNotBlank()) Text(ROLE_TITLES[role] ?: "Staff", color = Ui.Muted, fontSize = 14.sp)
                     OutlinedTextField(
                         username, { username = it.trim().lowercase().take(32) }, placeholder = { Text("Username") }, singleLine = true,
                         trailingIcon = { Icon(Icons.Filled.Person, null, tint = Ui.Muted) },
@@ -214,7 +219,24 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (Strin
                     }
                 }
             }
-            Text("${java.time.Year.now()} © ShazVerse Technologies · Rx Clinic", color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 16.dp, bottom = 24.dp))
+            if (onPatient != null) {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 14.dp).clip(RoundedCornerShape(12.dp)).background(Ui.Card).border(1.dp, Ui.Line, RoundedCornerShape(12.dp)).clickable(onClick = onPatient).padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Person, null, tint = Ui.Teal)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(if (vm.prefs.patientSession != null) "Patient · ${vm.prefs.patientName}" else "I'm a patient", color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                        Text("Register, check in, book, video consult, my records", color = Ui.Muted, fontSize = 13.sp)
+                    }
+                    Text("›", color = Ui.Teal, fontSize = 24.sp)
+                }
+                TextButton(onClick = { runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.prefs.serverUrl.trimEnd('/') + "/home"))) } }) {
+                    Text("About Rx Clinic · plans · free trial", color = Ui.Teal)
+                }
+            }
+            Text("${java.time.Year.now()} © ShazVerse Technologies · Rx Clinic", color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp, bottom = 24.dp))
         }
     }
     mustChange?.let { r ->
