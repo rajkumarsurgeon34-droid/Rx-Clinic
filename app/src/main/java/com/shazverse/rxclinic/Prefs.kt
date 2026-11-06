@@ -7,7 +7,7 @@ import org.json.JSONObject
 /** A booking the patient made on this phone, so they can find it again. */
 data class MyBooking(val code: String, val phone: String, val name: String, val date: String, val time: String, val mode: String)
 
-/** Small local store: server address, staff sign-in, and the patient's own bookings. */
+/** Small local store: server address, staff and patient sign-in, and the patient's own bookings. */
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("rx_clinic", Context.MODE_PRIVATE)
 
@@ -23,13 +23,38 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("mic_on", true)
         set(v) = sp.edit().putBoolean("mic_on", v).apply()
 
-    /** Signed-in staff session, per role. */
-    fun session(role: String): String? = sp.getString("session_$role", null)
+    // ----- staff sign-in (one login per device at a time) -----
 
-    /** The role's own sign-in, or the admin's (admin can open every section). */
-    fun sessionFor(role: String): String? = session(role) ?: session("admin")
+    /** The signed-in staff role: doctor, staff, pharmacy, lab, diagnostics or admin. */
+    val staffRole: String? get() = sp.getString("staff_role", null)?.takeIf { sp.getString("staff_session", null) != null }
+    var staffUsername: String
+        get() = sp.getString("staff_username", "") ?: ""
+        set(v) = sp.edit().putString("staff_username", v).apply()
+
+    /** The session if the signed-in login has exactly this role. */
+    fun session(role: String): String? = if (staffRole == role) sp.getString("staff_session", null) else null
+
+    /** The role's session, or the admin's (the admin can open every section). */
+    fun sessionFor(role: String): String? = if (staffRole == role || staffRole == "admin") sp.getString("staff_session", null) else null
+
+    /** Saves the session after sign-in; null signs out. */
     fun saveSession(role: String, token: String?) =
-        sp.edit().apply { if (token == null) remove("session_$role") else putString("session_$role", token) }.apply()
+        sp.edit().apply {
+            if (token == null) { remove("staff_session"); remove("staff_role") }
+            else { putString("staff_session", token); putString("staff_role", role) }
+        }.apply()
+
+    // ----- patient sign-in -----
+
+    val patientSession: String? get() = sp.getString("patient_session", null)
+    val patientId: String get() = sp.getString("patient_id", "") ?: ""
+    val patientName: String get() = sp.getString("patient_name", "") ?: ""
+
+    fun savePatient(token: String?, id: String = "", name: String = "") =
+        sp.edit().apply {
+            if (token == null) { remove("patient_session"); remove("patient_id"); remove("patient_name") }
+            else { putString("patient_session", token); putString("patient_id", id); putString("patient_name", name) }
+        }.apply()
 
     var doctorName: String
         get() = sp.getString("doctor_name", "") ?: ""

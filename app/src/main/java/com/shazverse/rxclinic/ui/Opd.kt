@@ -29,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.EventAvailable
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Refresh
@@ -124,14 +125,15 @@ private val QUICK_ADVICE = listOf(
 // ---------- Doctor home ----------
 
 @Composable
-fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onSignedOut: () -> Unit) {
+fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onSignedOut: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         TopBar(vm.prefs.doctorName.ifBlank { "Doctor" }, onBack) {
-            TextButton(onClick = { vm.prefs.saveSession("doctor", null); onSignedOut() }) { Text("Sign out") }
+            AccountButton(vm, onSignedOut)
         }
         Column(Modifier.padding(horizontal = 16.dp)) {
             RoleCard("OPD today", "Patients who checked in, their case sheets, AI suggestions and prescriptions", Icons.Filled.Groups, onOpd)
             RoleCard("Appointments and video teleconsults", "Bookings by day; start video calls", Icons.Filled.EventAvailable, onAppointments)
+            RoleCard("Patient records", "Find by Patient ID, mobile, Aadhaar or name; register; past visits", Icons.Filled.Badge, onPatients)
         }
     }
 }
@@ -229,10 +231,13 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
     var ordersTick by remember { mutableIntStateOf(0) }
     val stockNames = remember { mutableStateListOf<String>() }
     var stockText by remember { mutableStateOf("") }
+    val history = remember { mutableStateListOf<JSONObject>() }
 
     LaunchedEffect(visitId) {
         try {
-            val v = api.visit(session, visitId)
+            val res = api.call("/api/doctor/visit", JSONObject().put("session", session).put("id", visitId))
+            val v = res.getJSONObject("visit")
+            history.clear(); history.addAll(res.objs("history"))
             visit = v; status = v.str("status")
             val w = v.obj("work")
             if (w != null) {
@@ -345,12 +350,15 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (p.str("id").isNotBlank()) Pill("ID " + p.str("id"), Ui.Ai)
                     Text("${p.str("age")} y · ${p.str("sex")} · Token ${v.str("token")}", color = Ui.Muted)
                     if (v.optBoolean("urgent")) Pill("Urgent at check-in", Ui.Red)
                     Pill(when (status) { "waiting" -> "Waiting"; "consult" -> "In consult"; "sent" -> "Prescribed"; else -> status }, Ui.Teal)
                 }
                 saveMsg?.let { Text(it, color = if (it.endsWith(".")) Ui.Teal else Ui.Red, fontSize = 13.sp) }
             }
+
+            if (history.isNotEmpty()) item { PreviousVisits(history) }
 
             // 1. History
             item {
@@ -625,7 +633,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                     Button(onClick = { save("sent", withRx = true) }, modifier = Modifier.fillMaxWidth()) { Text("Finish and save prescription") }
                     saveMsg?.let { Text(it, color = if (it.startsWith("Prescription") || it == "Saved.") Ui.Green else Ui.Red, fontWeight = FontWeight.SemiBold) }
                     OutlinedButton(onClick = {
-                        val text = prescriptionText(vm.prefs.doctorName, p.str("name"), p.str("age"), p.str("sex"), finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote)
+                        val text = prescriptionText(vm.prefs.doctorName, p.str("name"), p.str("age"), p.str("sex"), finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote, p.str("id"))
                         context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share prescription"))
                     }, modifier = Modifier.fillMaxWidth()) { Text("Share prescription (WhatsApp, SMS…)") }
                     Text("AI suggestions are for the doctor to verify. Nothing reaches the prescription until you add it.", color = Ui.Muted, fontSize = 12.sp)
@@ -642,9 +650,9 @@ private fun aiDrug(m: JSONObject) = RxItem(
 
 private fun prescriptionText(
     doctor: String, name: String, age: String, sex: String, dx: String, surgery: String, rx: List<RxItem>,
-    advice: List<String>, physio: String, psych: String, review: String, reviewNote: String,
+    advice: List<String>, physio: String, psych: String, review: String, reviewNote: String, pid: String = "",
 ) = buildString {
-    append("Rx Clinic\n$doctor\n\nPatient: $name, $age y, $sex\nDate: ${LocalDate.now()}\n")
+    append("Rx Clinic\n$doctor\n\nPatient: $name, $age y, $sex${if (pid.isNotBlank()) "  (ID $pid)" else ""}\nDate: ${LocalDate.now()}\n")
     if (dx.isNotBlank()) append("Diagnosis: $dx\n")
     if (surgery.isNotBlank()) append("Plan: $surgery\n")
     append("\nRx\n")
@@ -737,5 +745,33 @@ private fun RxEditor(r: RxItem, inStock: Boolean?, onChange: (RxItem) -> Unit, o
             TIMINGS.forEach { t -> Choice(t, r.timing == t) { onChange(r.copy(timing = t)) } }
         }
         OutlinedTextField(r.instructions, { onChange(r.copy(instructions = it)) }, label = { Text("Instructions", fontSize = 11.sp) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
+internal fun PreviousVisits(history: List<JSONObject>) {
+    var open by remember { mutableStateOf(false) }
+    BoxCard {
+        Row(Modifier.fillMaxWidth().clickable { open = !open }, verticalAlignment = Alignment.CenterVertically) {
+            Text("Previous visits (${history.size})", color = Ui.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            Text(if (open) "Hide" else "Show", color = Ui.Teal, fontSize = 13.sp)
+        }
+        if (open) history.forEach { h -> VisitSummaryCard(h) }
+    }
+}
+
+@Composable
+internal fun VisitSummaryCard(h: JSONObject) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(dayLabel(h.str("date")) + (if (h.str("doctor").isNotBlank()) " · " + h.str("doctor") else ""), color = Ui.Muted, fontSize = 12.sp)
+        if (h.str("diagnosis").isNotBlank()) Text(h.str("diagnosis"), color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+        else if (h.str("complaint").isNotBlank()) Text(h.str("complaint"), color = Ui.Text, fontSize = 14.sp)
+        h.obj("rx").objs("items").forEach { r ->
+            Text("• ${r.str("form")} ${r.str("generic")} ${r.str("strength")}  ${r.str("dose")} ${r.str("frequency")} ${r.str("timing")} × ${r.str("duration")}".replace(Regex(" +"), " "),
+                color = Ui.Text, fontSize = 13.sp)
+        }
+        h.objs("reports").filter { it.str("status") == "reported" }.forEach { o ->
+            Text("${o.str("test")}: " + o.str("impression").ifBlank { o.str("result") }, color = Ui.Text, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        }
     }
 }

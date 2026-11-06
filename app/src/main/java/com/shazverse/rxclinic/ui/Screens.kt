@@ -36,6 +36,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Assignment
+import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.CalendarMonth
@@ -96,7 +97,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin }
+private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry }
 
 private fun roleScreen(role: String) = when (role) {
     "doctor" -> Screen.DoctorHome; "staff" -> Screen.Nurse; "pharmacy" -> Screen.Pharmacy
@@ -113,6 +114,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     val prefs = vm.prefs
 
     fun open(role: String) {
+        if (role == "patients") { screen = Screen.Registry; return }
         val has = if (role == "admin") prefs.session("admin") != null else prefs.sessionFor(role) != null
         if (has) screen = roleScreen(role) else { loginRole = role; screen = Screen.StaffLogin }
     }
@@ -125,6 +127,8 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
         when (screen) {
             Screen.Home -> HomeScreen(onPatient = { screen = Screen.PatientHome }, onRole = { open(it) }, onSettings = { showSettings = true })
             Screen.PatientHome -> PatientHome(
+                vm,
+                onAccount = { screen = Screen.PatientAccount },
                 onBack = { screen = Screen.Home },
                 onCheckin = { screen = Screen.Checkin },
                 onBook = { screen = Screen.Book },
@@ -132,13 +136,15 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             )
             Screen.Book -> BookScreen(vm, onBack = { screen = Screen.PatientHome }, onDone = { screen = Screen.MyAppointments })
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
-            Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { screen = roleScreen(loginRole) })
+            Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { r -> screen = roleScreen(r) })
             Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = signedOut("doctor"))
-            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onSignedOut = signedOut("doctor"))
+            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onSignedOut = signedOut("doctor"))
             Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = signedOut("doctor"))
             Screen.Case -> CaseScreen(vm, caseId, onBack = { screen = Screen.OpdQueue })
             Screen.Checkin -> CheckinScreen(vm, onBack = { screen = Screen.PatientHome })
-            Screen.Nurse -> NurseScreen(vm, onBack = back, onSignedOut = signedOut("staff"))
+            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onSignedOut = signedOut("staff"))
+            Screen.PatientAccount -> PatientAccountScreen(vm, onBack = { screen = Screen.PatientHome })
+            Screen.Registry -> PatientRegistryScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.Pharmacy -> PharmacyScreen(vm, onBack = back, onSignedOut = signedOut("pharmacy"))
             Screen.Lab -> OrdersScreen(vm, "lab", onBack = back, onSignedOut = signedOut("lab"))
             Screen.Diagnostics -> OrdersScreen(vm, "diagnostics", onBack = back, onSignedOut = signedOut("diagnostics"))
@@ -277,10 +283,12 @@ private fun SettingsDialog(vm: CallViewModel, onDismiss: () -> Unit) {
 // ---------------- Patient ----------------
 
 @Composable
-private fun PatientHome(onBack: () -> Unit, onCheckin: () -> Unit, onBook: () -> Unit, onMine: () -> Unit) {
+private fun PatientHome(vm: CallViewModel, onAccount: () -> Unit, onBack: () -> Unit, onCheckin: () -> Unit, onBook: () -> Unit, onMine: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         TopBar("Patient", onBack)
         Column(Modifier.padding(horizontal = 16.dp)) {
+            if (vm.prefs.patientSession != null) RoleCard("${vm.prefs.patientName} · ${vm.prefs.patientId}", "My Patient ID, visits, prescriptions and reports", Icons.Filled.Badge, onAccount)
+            else RoleCard("Register / sign in", "Get your Patient ID (linked to your mobile or Aadhaar)", Icons.Filled.Badge, onAccount)
             RoleCard("Check-in at the clinic", "Answer a few questions before you see the doctor (English, தமிழ், हिन्दी)", Icons.Filled.Assignment, onCheckin)
             RoleCard("Book an appointment", "Visit the clinic or see the doctor on video", Icons.Filled.CalendarMonth, onBook)
             RoleCard("My appointments", "Check your booking and join your video teleconsult", Icons.Filled.EventAvailable, onMine)
@@ -296,7 +304,7 @@ private fun BookScreen(vm: CallViewModel, onBack: () -> Unit, onDone: () -> Unit
     var mode by rememberSaveable { mutableStateOf("clinic") }
     var date by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
     var time by rememberSaveable { mutableStateOf("") }
-    var name by rememberSaveable { mutableStateOf("") }
+    var name by rememberSaveable { mutableStateOf(vm.prefs.patientName) }
     var age by rememberSaveable { mutableStateOf("") }
     var sex by rememberSaveable { mutableStateOf("") }
     var phone by rememberSaveable { mutableStateOf("") }
@@ -389,7 +397,7 @@ private fun BookScreen(vm: CallViewModel, onBack: () -> Unit, onDone: () -> Unit
                         busy = true
                         scope.launch {
                             try {
-                                val a = api.book(name.trim(), age, sex, phone, date, time, mode, reason.trim(), lang)
+                                val a = api.book(name.trim(), age, sex, phone, date, time, mode, reason.trim(), lang, vm.prefs.patientSession)
                                 vm.prefs.saveBooking(MyBooking(a.code, phone, a.name, a.date, a.time, a.mode))
                                 booked = a
                             } catch (e: Exception) {
@@ -507,7 +515,7 @@ private fun DoctorDay(vm: CallViewModel, withMedia: (() -> Unit) -> Unit, onBack
     var loading by remember { mutableStateOf(true) }
     var err by remember { mutableStateOf<String?>(null) }
 
-    fun signOut() { vm.prefs.saveSession("doctor", null); onSignedOut() }
+    fun signOut() { vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }; onSignedOut() }
 
     LaunchedEffect(date, refresh, vm.state) {
         loading = true; err = null

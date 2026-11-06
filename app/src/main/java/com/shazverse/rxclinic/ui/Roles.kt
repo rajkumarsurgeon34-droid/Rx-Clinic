@@ -27,6 +27,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.LocalPharmacy
@@ -40,6 +42,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -81,52 +84,126 @@ val ROLE_TITLES = linkedMapOf(
 
 private fun signedOutError(e: Exception) = e.message?.contains("Sign in", ignoreCase = true) == true
 
-// ---------------- PIN sign-in, shared by every staff role ----------------
+// ---------------- Staff sign-in: username and password ----------------
 
 @Composable
-fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: () -> Unit) {
+fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (String) -> Unit) {
     val scope = rememberCoroutineScope()
-    var pin by remember { mutableStateOf("") }
+    var username by remember { mutableStateOf(vm.prefs.staffUsername) }
+    var password by remember { mutableStateOf("") }
     var err by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    val title = ROLE_TITLES[role] ?: role
-    Column(Modifier.fillMaxSize().imePadding()) {
+    var mustChange by remember { mutableStateOf<String?>(null) } // role, while the first-sign-in password change is open
+    val title = ROLE_TITLES[role] ?: "Staff"
+    Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState())) {
         TopBar("$title sign-in", onBack)
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Enter the ${title.lowercase()} PIN.", color = Ui.Muted)
+            Text("Sign in with the username and password the admin gave you.", color = Ui.Muted)
             OutlinedTextField(
-                pin, { pin = it.filter(Char::isDigit).take(8) }, label = { Text("PIN") }, singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword), modifier = Modifier.fillMaxWidth(),
+                username, { username = it.trim().lowercase().take(32) }, label = { Text("Username") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), modifier = Modifier.fillMaxWidth(),
             )
+            PasswordField(password, { password = it }, "Password")
             ErrorText(err)
             Button(
                 onClick = {
                     busy = true; err = null
                     scope.launch {
                         try {
-                            val s = Api(vm.prefs.serverUrl).login(role, pin)
-                            vm.prefs.saveSession(role, s.token)
-                            if (role == "doctor" || role == "admin") vm.prefs.doctorName = s.doctorName
-                            onIn()
+                            val s = Api(vm.prefs.serverUrl).login(username, password)
+                            vm.prefs.saveSession(s.role, s.token)
+                            vm.prefs.staffUsername = s.username
+                            vm.prefs.doctorName = s.name
+                            if (s.mustChange) mustChange = s.role else onIn(s.role)
                         } catch (e: Exception) { err = e.message } finally { busy = false }
                     }
                 },
-                enabled = pin.isNotBlank() && !busy, modifier = Modifier.fillMaxWidth().height(50.dp),
+                enabled = username.length >= 3 && password.isNotBlank() && !busy, modifier = Modifier.fillMaxWidth().height(50.dp),
             ) { Text(if (busy) "Signing in…" else "Sign in") }
+            Text("First time? The admin signs in as admin with password admin123, then creates a login for each person.", color = Ui.Muted, fontSize = 12.sp)
         }
+    }
+    mustChange?.let { r ->
+        ChangePasswordDialog(vm, knownOld = password, forced = true, onDone = { ok -> mustChange = null; if (ok) onIn(r) else vm.prefs.saveSession(r, null) })
     }
 }
 
 @Composable
-private fun SignOutButton(vm: CallViewModel, role: String, onSignedOut: () -> Unit) {
-    TextButton(onClick = { vm.prefs.saveSession(role, null); onSignedOut() }) { Text("Sign out") }
+internal fun PasswordField(value: String, onChange: (String) -> Unit, label: String) {
+    OutlinedTextField(
+        value, { onChange(it.take(72)) }, label = { Text(label) }, singleLine = true,
+        visualTransformation = PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+/** Change the signed-in person's password. [knownOld] skips the current-password box. */
+@Composable
+internal fun ChangePasswordDialog(vm: CallViewModel, knownOld: String? = null, forced: Boolean = false, patient: Boolean = false, onDone: (Boolean) -> Unit) {
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    var old by remember { mutableStateOf("") }
+    var new1 by remember { mutableStateOf("") }
+    var new2 by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = { if (!forced) onDone(false) },
+        title = { Text(if (forced) "Set your own password" else "Change password") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (forced) Text("This is your first sign-in. Choose a new password that only you know.", color = Ui.Muted, fontSize = 13.sp)
+                if (knownOld == null) PasswordField(old, { old = it }, "Current password")
+                PasswordField(new1, { new1 = it }, "New password (at least 6 characters)")
+                PasswordField(new2, { new2 = it }, "New password again")
+                ErrorText(err)
+            }
+        },
+        confirmButton = {
+            Button(enabled = !busy && new1.length >= 6, onClick = {
+                if (new1 != new2) { err = "The two new passwords don't match"; return@Button }
+                busy = true; err = null
+                scope.launch {
+                    try {
+                        val session = if (patient) vm.prefs.patientSession else vm.prefs.staffRole?.let { vm.prefs.session(it) }
+                        val token = Api(vm.prefs.serverUrl).changePassword(session.orEmpty(), knownOld ?: old, new1)
+                        if (patient) vm.prefs.savePatient(token, vm.prefs.patientId, vm.prefs.patientName)
+                        else vm.prefs.staffRole?.let { vm.prefs.saveSession(it, token) }
+                        Toast.makeText(context, "Password changed", Toast.LENGTH_SHORT).show()
+                        onDone(true)
+                    } catch (e: Exception) { err = e.message }
+                    busy = false
+                }
+            }) { Text("Save password") }
+        },
+        dismissButton = { TextButton(onClick = { onDone(false) }) { Text(if (forced) "Sign out" else "Cancel") } },
+    )
+}
+
+/** Person icon in the top bar: who is signed in, change password, sign out. */
+@Composable
+internal fun AccountButton(vm: CallViewModel, onSignedOut: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    var changing by remember { mutableStateOf(false) }
+    IconButton(onClick = { open = true }) { Icon(Icons.Filled.AccountCircle, "Account", tint = Ui.Text) }
+    if (open) AlertDialog(
+        onDismissRequest = { open = false },
+        title = { Text(vm.prefs.doctorName.ifBlank { "Signed in" }) },
+        text = {
+            Text(listOf(vm.prefs.staffUsername, ROLE_TITLES[vm.prefs.staffRole.orEmpty()].orEmpty()).filter { it.isNotBlank() }.joinToString(" · "), color = Ui.Muted)
+        },
+        confirmButton = { TextButton(onClick = { open = false; changing = true }) { Text("Change password") } },
+        dismissButton = {
+            TextButton(onClick = { open = false; vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }; onSignedOut() }) { Text("Sign out", color = Ui.Red) }
+        },
+    )
+    if (changing) ChangePasswordDialog(vm, onDone = { changing = false })
 }
 
 // ---------------- Nursing staff: OPD triage vitals ----------------
 
 @Composable
-fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Unit) {
+fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("staff") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
@@ -140,14 +217,15 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Unit) 
     LaunchedEffect(refresh) {
         loading = true; err = null
         try { val v = api.call("/api/nurse/queue", JSONObject().put("session", session)).objs("visits"); list.clear(); list.addAll(v) }
-        catch (e: Exception) { if (signedOutError(e)) { vm.prefs.saveSession("staff", null); onSignedOut() } else err = e.message }
+        catch (e: Exception) { if (signedOutError(e)) { vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }; onSignedOut() } else err = e.message }
         loading = false
     }
 
     Column(Modifier.fillMaxSize()) {
         TopBar("Nursing · Triage", onBack) {
+            TextButton(onClick = onPatients) { Text("Patients") }
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
-            SignOutButton(vm, "staff", onSignedOut)
+            AccountButton(vm, onSignedOut)
         }
         Text("Today's checked-in patients. Record vitals before they see the doctor; they appear on the doctor's case sheet.",
             color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
@@ -225,7 +303,7 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
             val q = api.call("/api/pharmacy/queue", JSONObject().put("session", session)).objs("queue")
             val s = api.call("/api/pharmacy/stock", JSONObject().put("session", session)).objs("stock")
             queue.clear(); queue.addAll(q); stock.clear(); stock.addAll(s)
-        } catch (e: Exception) { if (signedOutError(e)) { vm.prefs.saveSession("pharmacy", null); onSignedOut() } else err = e.message }
+        } catch (e: Exception) { if (signedOutError(e)) { vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }; onSignedOut() } else err = e.message }
         loading = false
     }
 
@@ -237,7 +315,7 @@ fun PharmacyScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Uni
     Column(Modifier.fillMaxSize().imePadding()) {
         TopBar("Pharmacy", onBack) {
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
-            SignOutButton(vm, "pharmacy", onSignedOut)
+            AccountButton(vm, onSignedOut)
         }
         Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Choice("To dispense (${queue.count { it.str("status") == "sent" }})", tab == "dispense", modifier = Modifier.weight(1f)) { tab = "dispense" }
@@ -380,7 +458,7 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
         try {
             val o = api.call("/api/orders/list", JSONObject().put("session", session).put("kind", if (imaging) "imaging" else "lab")).objs("orders")
             list.clear(); list.addAll(o)
-        } catch (e: Exception) { if (signedOutError(e)) { vm.prefs.saveSession(role, null); onSignedOut() } else err = e.message }
+        } catch (e: Exception) { if (signedOutError(e)) { vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }; onSignedOut() } else err = e.message }
         loading = false
     }
 
@@ -396,7 +474,7 @@ fun OrdersScreen(vm: CallViewModel, role: String, onBack: () -> Unit, onSignedOu
     Column(Modifier.fillMaxSize()) {
         TopBar(if (imaging) "Diagnostics" else "Lab", onBack) {
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
-            SignOutButton(vm, role, onSignedOut)
+            AccountButton(vm, onSignedOut)
         }
         Text(if (imaging) "Scan orders from the doctors. Schedule the scan, then enter findings and impression; the report reaches the doctor's case sheet."
             else "Test orders from the doctors. Mark the sample collected, then enter the report; it reaches the doctor's case sheet.",
@@ -481,23 +559,25 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
     var refresh by remember { mutableIntStateOf(0) }
     var ov by remember { mutableStateOf<JSONObject?>(null) }
     var err by remember { mutableStateOf<String?>(null) }
-    val pins = remember { mutableStateMapOf<String, String>() }
+    val users = remember { mutableStateListOf<JSONObject>() }
     val clinic = remember { mutableStateMapOf<String, String>() }
+    var editing by remember { mutableStateOf<JSONObject?>(null) }
 
     LaunchedEffect(refresh) {
         err = null
         try {
             ov = api.call("/api/admin/overview", JSONObject().put("session", session))
             val st = api.call("/api/settings", JSONObject().put("session", session))
-            st.obj("pins")?.let { p -> p.keys().forEach { k -> pins[k] = p.str(k) } }
+            val u = api.call("/api/admin/users", JSONObject().put("session", session)).objs("users")
+            users.clear(); users.addAll(u)
             st.obj("clinic")?.let { c -> c.keys().forEach { k -> clinic[k] = c.str(k) } }
-        } catch (e: Exception) { if (signedOutError(e)) { vm.prefs.saveSession("admin", null); onSignedOut() } else err = e.message }
+        } catch (e: Exception) { if (signedOutError(e)) { vm.prefs.staffRole?.let { vm.prefs.saveSession(it, null) }; onSignedOut() } else err = e.message }
     }
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopBar("Admin", onBack) {
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
-            SignOutButton(vm, "admin", onSignedOut)
+            AccountButton(vm, onSignedOut)
         }
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { ErrorText(err) }
@@ -511,34 +591,41 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
                     Stat("Lab", o.obj("lab").str("pending"), "pending · ${o.obj("lab").str("reported")} reported")
                     Stat("Diagnostics", o.obj("diagnostics").str("pending"), "pending · ${o.obj("diagnostics").str("reported")} reported")
                     Stat("Out of stock", o.obj("pharmacy").str("outOfStock"), "medicines")
+                    Stat("Patients", o.obj("people").str("patients"), "registered")
                 }
             }
             item {
                 Text("Open a section", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, fontFamily = FontFamily.Serif)
-                Text("As admin you can open every section without its PIN.", color = Ui.Muted, fontSize = 13.sp)
+                Text("As admin you can open every section.", color = Ui.Muted, fontSize = 13.sp)
             }
             item { RoleCard("Doctor", "OPD, case sheets, appointments, video", Icons.Filled.MedicalServices) { onOpen("doctor") } }
             item { RoleCard("Nursing staff", "Triage vitals", Icons.Filled.LocalHospital) { onOpen("staff") } }
             item { RoleCard("Pharmacy", "Dispensing and stock", Icons.Filled.LocalPharmacy) { onOpen("pharmacy") } }
+            item { RoleCard("Patient records", "Register, find and edit patients", Icons.Filled.Badge) { onOpen("patients") } }
             item { RoleCard("Lab", "Test orders and reports", Icons.Filled.Biotech) { onOpen("lab") } }
             item { RoleCard("Diagnostics", "USG, CT, MRI, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onOpen("diagnostics") } }
             item {
                 BoxCard {
-                    Text("Sign-in PINs", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
-                    Text("4 to 8 digits each. Change the defaults before real use.", color = Ui.Muted, fontSize = 13.sp)
-                    ROLE_TITLES.forEach { (k, t) ->
-                        OutlinedTextField(pins[k].orEmpty(), { pins[k] = it.filter(Char::isDigit).take(8) }, label = { Text(t) }, singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Staff logins (${users.count { it.optBoolean("active") }})", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                        Button(onClick = { editing = JSONObject().put("role", "doctor").put("active", true) }) { Text("Add login") }
                     }
-                    Button(onClick = {
-                        scope.launch {
-                            try {
-                                val p = JSONObject(); pins.forEach { (k, x) -> p.put(k, x) }
-                                api.call("/api/settings", JSONObject().put("session", session).put("pins", p))
-                                Toast.makeText(context, "PINs saved", Toast.LENGTH_SHORT).show()
-                            } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't save", Toast.LENGTH_LONG).show() }
+                    Text("Make one login for each person. Several doctors, nurses or lab staff can work at the same time, each with their own password.", color = Ui.Muted, fontSize = 13.sp)
+                    ROLE_TITLES.forEach { (role, title) ->
+                        val list = users.filter { it.str("role") == role }
+                        if (list.isNotEmpty()) {
+                            Text(title.uppercase(), color = Ui.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 6.dp))
+                            list.forEach { u ->
+                                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { editing = u }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(u.str("name"), color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                                        Text(u.str("username") + (if (u.optBoolean("mustChange")) " · must set own password" else ""), color = Ui.Muted, fontSize = 13.sp)
+                                    }
+                                    if (!u.optBoolean("active")) Pill("Disabled", Ui.Muted)
+                                }
+                            }
                         }
-                    }) { Text("Save PINs") }
+                    }
                 }
             }
             item {
@@ -552,7 +639,6 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
                             try {
                                 val c = JSONObject(); clinic.forEach { (k, x) -> c.put(k, x) }
                                 api.call("/api/settings", JSONObject().put("session", session).put("clinic", c))
-                                vm.prefs.doctorName = clinic["doctor"].orEmpty()
                                 Toast.makeText(context, "Clinic details saved", Toast.LENGTH_SHORT).show()
                             } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't save", Toast.LENGTH_LONG).show() }
                         }
@@ -561,6 +647,71 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             }
         }
     }
+
+    editing?.let { u ->
+        UserDialog(vm, session, u, onDone = { changed -> editing = null; if (changed) { refresh++; Toast.makeText(context, "Login saved", Toast.LENGTH_SHORT).show() } })
+    }
+}
+
+@Composable
+private fun UserDialog(vm: CallViewModel, session: String, start: JSONObject, onDone: (Boolean) -> Unit) {
+    val scope = rememberCoroutineScope()
+    val isNew = start.str("id").isBlank()
+    var name by remember { mutableStateOf(start.str("name")) }
+    var username by remember { mutableStateOf(start.str("username")) }
+    var role by remember { mutableStateOf(start.str("role").ifBlank { "doctor" }) }
+    var qual by remember { mutableStateOf(start.str("qual")) }
+    var reg by remember { mutableStateOf(start.str("reg")) }
+    var phone by remember { mutableStateOf(start.str("phone")) }
+    var active by remember { mutableStateOf(start.optBoolean("active", true)) }
+    var password by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = { onDone(false) },
+        title = { Text(if (isNew) "New login" else "Edit login") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(name, { name = it.take(80) }, label = { Text("Full name (shown on prescriptions)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(username, { username = it.trim().lowercase().filter { c -> c.isLetterOrDigit() || c in "._-" }.take(32) }, label = { Text("Username") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), modifier = Modifier.fillMaxWidth())
+                Text("Role", color = Ui.Muted, fontSize = 13.sp)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ROLE_TITLES.forEach { (k, t) -> Choice(t, role == k) { role = k } }
+                }
+                if (role == "doctor") {
+                    OutlinedTextField(qual, { qual = it.take(80) }, label = { Text("Qualification, e.g. MBBS, MS") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(reg, { reg = it.take(40) }, label = { Text("Registration number") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                }
+                OutlinedTextField(phone, { phone = it.filter(Char::isDigit).take(10) }, label = { Text("Mobile (optional)") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), modifier = Modifier.fillMaxWidth())
+                PasswordField(password, { password = it }, if (isNew) "Starting password (at least 6)" else "New password (leave empty to keep)")
+                Text("They will be asked to choose their own password at first sign-in.", color = Ui.Muted, fontSize = 12.sp)
+                if (!isNew) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Login active", color = Ui.Text, modifier = Modifier.weight(1f))
+                    Switch(checked = active, onCheckedChange = { active = it })
+                }
+                ErrorText(err)
+            }
+        },
+        confirmButton = {
+            Button(enabled = !busy && name.isNotBlank() && username.length >= 3 && (!isNew || password.length >= 6), onClick = {
+                busy = true; err = null
+                scope.launch {
+                    try {
+                        val u = JSONObject().put("name", name.trim()).put("username", username).put("role", role).put("qual", qual).put("reg", reg)
+                            .put("phone", phone).put("active", active)
+                        if (!isNew) u.put("id", start.str("id"))
+                        if (password.isNotBlank()) u.put("password", password)
+                        Api(vm.prefs.serverUrl).call("/api/admin/users/save", JSONObject().put("session", session).put("user", u))
+                        onDone(true)
+                    } catch (e: Exception) { err = e.message }
+                    busy = false
+                }
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = { onDone(false) }) { Text("Cancel") } },
+    )
 }
 
 // ---------------- small shared pieces ----------------

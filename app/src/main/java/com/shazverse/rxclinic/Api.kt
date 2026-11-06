@@ -28,7 +28,7 @@ data class Appt(
 }
 
 data class Slot(val time: String, val free: Boolean)
-data class Session(val token: String, val role: String, val doctorName: String, val clinicName: String)
+data class Session(val token: String, val role: String, val name: String, val username: String, val mustChange: Boolean, val clinicName: String)
 data class Joined(val url: String, val token: String, val identity: String, val role: String, val room: String, val title: String)
 
 class ApiException(message: String) : Exception(message)
@@ -44,22 +44,30 @@ class Api(private val baseUrl: String) {
 
     suspend fun book(
         name: String, age: String, sex: String, phone: String, date: String, time: String,
-        mode: String, reason: String, lang: String,
+        mode: String, reason: String, lang: String, patientSession: String? = null,
     ): Appt {
-        val o = post("/api/book", JSONObject()
+        val body = JSONObject()
             .put("name", name).put("age", age).put("sex", sex).put("phone", phone)
-            .put("date", date).put("time", time).put("mode", mode).put("reason", reason).put("lang", lang))
+            .put("date", date).put("time", time).put("mode", mode).put("reason", reason).put("lang", lang)
+        if (patientSession != null) body.put("patientSession", patientSession)
+        val o = post("/api/book", body)
         return Appt.from(o.getJSONObject("appointment"))
     }
 
     suspend fun myAppointment(code: String, phone: String): Appt =
         Appt.from(post("/api/appt", JSONObject().put("code", code).put("phone", phone)).getJSONObject("appointment"))
 
-    suspend fun login(role: String, pin: String): Session {
-        val o = post("/api/login", JSONObject().put("role", role).put("pin", pin))
+    /** Staff sign-in with username and password; the server says which role the login has. */
+    suspend fun login(username: String, password: String): Session {
+        val o = post("/api/login", JSONObject().put("username", username.trim()).put("password", password))
+        val u = o.optJSONObject("user") ?: JSONObject()
         val c = o.optJSONObject("clinic") ?: JSONObject()
-        return Session(o.getString("session"), o.getString("role"), c.optString("doctor"), c.optString("name"))
+        return Session(o.getString("session"), o.getString("role"), u.optString("name"), u.optString("username"), u.optBoolean("mustChange"), c.optString("name"))
     }
+
+    /** Changes the signed-in person's password; returns the new session (old ones stop working). */
+    suspend fun changePassword(session: String, old: String, new: String): String =
+        post("/api/me/password", JSONObject().put("session", session).put("old", old).put("password", new)).getString("session")
 
     suspend fun dayAppointments(session: String, date: String): List<Appt> {
         val arr = post("/api/doctor/appointments", JSONObject().put("session", session).put("date", date))
@@ -96,17 +104,17 @@ class Api(private val baseUrl: String) {
         return post("/api/checkin/next", JSONObject().put("lang", lang).put("age", age).put("sex", sex).put("turns", arr))
     }
 
-    /** Saves the check-in; the server builds the English case sheet. Returns the token number. */
+    /** Saves the check-in; the server builds the English case sheet. Returns { token, patientId, newPatient }. */
     suspend fun checkinFinish(
         name: String, age: String, sex: String, phone: String, lang: String,
-        qa: List<Pair<String, String>>, urgent: Boolean,
-    ): Int {
+        qa: List<Pair<String, String>>, urgent: Boolean, patientId: String = "", patientSession: String? = null,
+    ): JSONObject {
         val arr = JSONArray()
         qa.forEach { (q, a) -> arr.put(JSONObject().put("q", q).put("a", a)) }
         val o = post("/api/checkin/finish", JSONObject()
-            .put("patient", JSONObject().put("name", name).put("age", age).put("sex", sex).put("phone", phone))
-            .put("lang", lang).put("qa", arr).put("urgent", urgent))
-        return o.optInt("token")
+            .put("patient", JSONObject().put("name", name).put("age", age).put("sex", sex).put("phone", phone).put("id", patientId))
+            .put("lang", lang).put("qa", arr).put("urgent", urgent).apply { if (patientSession != null) put("patientSession", patientSession) })
+        return o
     }
 
     // ----- doctor: OPD -----

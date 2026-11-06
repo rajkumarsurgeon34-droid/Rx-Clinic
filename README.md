@@ -38,19 +38,26 @@ Nothing to do: the first deploy creates the D1 database `rxclinic-db` and links 
 GitHub Actions builds `Rx-Clinic.apk` on every push. Download it from **Releases**.
 If your worker address is not `https://rx-clinic.rajkumarsurgeon34.workers.dev`, either add a repository variable `RX_CLINIC_SERVER_URL`, or change it in the app under ⚙️ Settings.
 
-## Sign-in PINs (defaults)
+## Logins
 
-| Login | PIN | What it opens |
-|---|---|---|
-| Patient | none | Check-in, booking, video teleconsult (booking code + mobile) |
-| Doctor | 1001 | OPD case sheets with AI, appointments, video |
-| Nursing staff | 2002 | Triage vitals |
-| Pharmacy | 3003 | Dispensing queue, medicine stock |
-| Lab | 4004 | Test orders and reports |
-| Diagnostics | 5005 | USG, CT, MRI, PET-CT, X-ray orders and reports |
-| Admin | 9009 | Overview, every section, change PINs and clinic details |
+**Staff** sign in with a username and password. The admin creates one login per person, so a clinic can have several doctors, nurses, pharmacists, lab and diagnostics staff, each with their own password.
 
-Only the admin can change PINs (Admin → Sign-in PINs). Change them before real use.
+1. First sign-in: username `admin`, password `admin123`. The app makes you choose a new password at once.
+2. Admin → Staff logins → Add login: name, username, role (Doctor, Nursing staff, Pharmacy, Lab, Diagnostics, Admin), starting password. Doctors also get qualification and registration number for prescriptions.
+3. Each person signs in and sets their own password. The admin can reset a password or disable a login; that signs the person out everywhere.
+
+Five wrong passwords lock a login for 15 minutes. Old PIN sign-in (app 0.5) works only until the admin sets up the new password.
+
+**Patients** get a Patient ID (RX100001, RX100002, …) linked to their mobile number and/or Aadhaar:
+- Register themselves in the app (Patient → Register / sign in) and sign in with Patient ID, mobile or Aadhaar plus password.
+- Or the reception registers them (Nursing → Patients, or Doctor → Patient records) and can set an app password.
+- Check-in links the visit to their ID automatically (same name + mobile), or makes a new ID for a first visit.
+- Aadhaar is checked (Verhoeff checksum) and never stored in full: only a keyed hash for lookup and the last 4 digits.
+- Family members can share one mobile number; each gets their own Patient ID.
+
+## Building the APK
+
+Pushes only check that the code compiles. To make the APK: GitHub → Actions → Build APK → Run workflow.
 
 ## Privacy
 

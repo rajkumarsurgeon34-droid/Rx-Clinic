@@ -1,4 +1,6 @@
 name: Build APK
+# On every push: only checks that the app code compiles (no APK).
+# To make the APK: Actions → Build APK → Run workflow.
 
 on:
   push:
@@ -51,6 +53,8 @@ jobs:
           cp keystore/debug.keystore ~/.android/debug.keystore
 
       - name: Build APK
+# On every push: only checks that the app code compiles (no APK).
+# To make the APK: Actions → Build APK → Run workflow.
         env:
           # Optional: add a repository variable RX_CLINIC_SERVER_URL so the app
           # comes pre-filled with your Rx Clinic server address.
@@ -58,14 +62,17 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Rename APK
+        if: github.event_name == 'workflow_dispatch'
         run: cp app/build/outputs/apk/debug/app-debug.apk Rx-Clinic.apk
 
       - uses: actions/upload-artifact@v5
+        if: github.event_name == 'workflow_dispatch'
         with:
           name: Rx-Clinic.apk
           path: Rx-Clinic.apk
 
       - name: Publish download (Releases)
+        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}

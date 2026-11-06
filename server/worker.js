@@ -126,6 +126,8 @@ async function db(env) {
       // General record store for the next stages (visits, ward, lab, pharmacy).
       env.DB.prepare("CREATE TABLE IF NOT EXISTS docs (coll TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, updated INTEGER NOT NULL, PRIMARY KEY (coll, id))"),
     ]);
+    // Older databases: add the patient link to appointments (fails harmlessly once it exists).
+    try { await env.DB.prepare("ALTER TABLE appointments ADD COLUMN patient_id TEXT").run(); } catch { /* already there */ }
     schemaReady = true;
   }
   return env.DB;
@@ -144,26 +146,192 @@ async function setSetting(env, k, v) {
 
 function publicAppt(r) {
   return {
-    id: r.id, date: r.date, time: r.time, mode: r.mode, status: r.status, name: r.name, age: r.age || "",
+    patientId: r.patient_id || "", id: r.id, date: r.date, time: r.time, mode: r.mode, status: r.status, name: r.name, age: r.age || "",
     sex: r.sex || "", phone: r.phone, reason: r.reason || "", lang: r.lang || "en", code: r.code,
   };
 }
 
-// ---------- staff sessions ----------
+// ---------- accounts and sessions ----------
+// Staff: user accounts (username + password) created by the admin, many per role.
+// Patients: registered with a Patient ID (RX100001…), linked to a mobile number and/or Aadhaar.
+// Session token: role.uid.ver.exp.sig  (ver changes when the password is reset or the account is disabled).
 
-async function makeSession(env, role) {
-  const exp = now() + 12 * 3600;
-  const sig = b64url(await hmac(secret(env), `session:${role}.${exp}`)).slice(0, 32);
-  return `${role}.${exp}.${sig}`;
+const USER_RE = /^[a-z0-9._-]{3,32}$/;
+const PBKDF2_ITER = 20000; // kept modest for the Workers CPU limit; the count is stored with each hash
+
+async function hashPassword(pw, iter = PBKDF2_ITER, saltB64) {
+  const salt = saltB64 ? Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0)) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: iter }, key, 256));
+  return `pbkdf2$${iter}$${btoa(String.fromCharCode(...salt))}$${btoa(String.fromCharCode(...bits))}`;
+}
+async function checkPassword(pw, stored) {
+  const [kind, iter, salt] = String(stored || "").split("$");
+  if (kind !== "pbkdf2" || !salt) return false;
+  return safeEqual(await hashPassword(String(pw || ""), Number(iter), salt), stored);
+}
+function validPassword(pw) {
+  pw = String(pw || "");
+  if (pw.length < 6) throw new HttpError(400, "Password must be at least 6 characters");
+  if (pw.length > 72) throw new HttpError(400, "Password is too long");
+  return pw;
 }
 
-async function requireStaff(env, session, roles) {
-  const [role, exp, sig] = String(session || "").split(".");
-  if (!role || !exp || !sig || !(roles.includes(role) || role === "admin")) throw new HttpError(401, "Sign in again");
+// Lock an account for 15 minutes after 5 wrong passwords.
+async function checkLock(env, key) {
+  const f = await getDoc(env, "loginfail", key);
+  if (f && f.until > Date.now()) throw new HttpError(429, "Too many wrong attempts. Try again in 15 minutes.");
+}
+async function noteFail(env, key) {
+  const f = (await getDoc(env, "loginfail", key)) || { n: 0, until: 0 };
+  f.n = f.until && f.until < Date.now() ? 1 : f.n + 1;
+  f.until = f.n >= 5 ? Date.now() + 15 * 60000 : 0;
+  if (f.n >= 5) f.n = 0;
+  await putDoc(env, "loginfail", key, f);
+}
+async function clearFail(env, key) { await (await db(env)).prepare("DELETE FROM docs WHERE coll = 'loginfail' AND id = ?").bind(key).run(); }
+
+async function makeSession(env, role, uid = "pin", ver = 0, hours = 12) {
+  const exp = now() + hours * 3600;
+  const sig = b64url(await hmac(secret(env), `session:${role}.${uid}.${ver}.${exp}`)).slice(0, 32);
+  return `${role}.${uid}.${ver}.${exp}.${sig}`;
+}
+
+/** Checks a session token; returns { role, uid, user }. */
+async function readSession(env, session) {
+  const [role, uid, ver, exp, sig] = String(session || "").split(".");
+  if (!role || !uid || !exp || !sig) throw new HttpError(401, "Sign in again");
   if (Number(exp) < now()) throw new HttpError(401, "Sign in again: your session expired");
-  const expected = b64url(await hmac(secret(env), `session:${role}.${exp}`)).slice(0, 32);
+  const expected = b64url(await hmac(secret(env), `session:${role}.${uid}.${ver}.${exp}`)).slice(0, 32);
   if (!safeEqual(expected, sig)) throw new HttpError(401, "Sign in again");
-  return role;
+  if (uid === "pin") { // old PIN sign-in (app 0.5), allowed only until the admin sets up accounts
+    if (await accountsReady(env)) throw new HttpError(401, "Sign in again with your username and password");
+    return { role, uid, user: { name: role === "doctor" || role === "admin" ? (await clinicInfo(env)).doctor : role, role } };
+  }
+  const user = await getDoc(env, role === "patient" ? "patients" : "users", uid);
+  if (!user || user.active === false || String(user.ver || 0) !== String(ver)) throw new HttpError(401, "Sign in again");
+  if (role !== "patient" && user.role !== role) throw new HttpError(401, "Sign in again");
+  return { role, uid, user };
+}
+
+async function requireUser(env, session, roles) {
+  const s = await readSession(env, session);
+  if (s.role === "patient" || !(roles.includes(s.role) || s.role === "admin")) throw new HttpError(403, "Your login can't open this section");
+  return s;
+}
+async function requireStaff(env, session, roles) { return (await requireUser(env, session, roles)).role; }
+async function requirePatient(env, session) {
+  const s = await readSession(env, session);
+  if (s.role !== "patient") throw new HttpError(401, "Sign in as a patient");
+  return s;
+}
+
+async function clinicInfo(env) { return Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {})); }
+
+/** True once the admin has signed in with the new accounts and changed the starting password. */
+async function accountsReady(env) { return !!(await getSetting(env, "accounts_ready", false)); }
+
+/** First run: create the admin account (admin / admin123, must be changed at first sign-in). */
+async function ensureAdmin(env) {
+  const row = await (await db(env)).prepare("SELECT id FROM docs WHERE coll = 'users' LIMIT 1").first();
+  if (row) return;
+  await putDoc(env, "users", "admin", {
+    username: "admin", name: "Administrator", role: "admin", passHash: await hashPassword("admin123"),
+    mustChange: true, active: true, ver: 0, created: Date.now(), createdBy: "setup",
+  });
+}
+
+function publicUser(id, u) {
+  return { id, username: u.username, name: u.name, role: u.role, qual: u.qual || "", reg: u.reg || "", phone: u.phone || "",
+    active: u.active !== false, mustChange: !!u.mustChange, created: u.created || 0, lastLogin: u.lastLogin || 0 };
+}
+
+async function findUser(env, username) {
+  const r = await (await db(env)).prepare("SELECT id, data FROM docs WHERE coll = 'users' AND json_extract(data, '$.username') = ?").bind(username).first();
+  return r ? { id: r.id, u: JSON.parse(r.data) } : null;
+}
+
+// ----- patients -----
+
+// Verhoeff checksum used by Aadhaar numbers.
+const VD = [[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],[3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],[6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],[9,8,7,6,5,4,3,2,1,0]];
+const VP = [[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],[8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],[2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]];
+function validAadhaar(n) {
+  if (!/^[2-9]\d{11}$/.test(n)) return false;
+  let c = 0;
+  n.split("").reverse().forEach((d, i) => { c = VD[c][VP[i % 8][Number(d)]]; });
+  return c === 0;
+}
+// Aadhaar is never stored in full: only a keyed hash (to find the patient) and the last 4 digits.
+async function aadhaarKey(env, n) { return b64url(await hmac(secret(env), "aadhaar:" + n)); }
+
+function normAadhaar(v) {
+  const n = String(v || "").replace(/\D/g, "");
+  if (!n) return "";
+  if (!validAadhaar(n)) throw new HttpError(400, "That Aadhaar number is not valid. Check the 12 digits.");
+  return n;
+}
+
+async function nextPatientId(env) {
+  const r = await (await db(env)).prepare("INSERT INTO settings (k, v) VALUES ('patient_seq', '100001') ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1 RETURNING v").first();
+  return "RX" + r.v;
+}
+
+function publicPatient(id, p) {
+  return { id, name: p.name, age: p.age || "", sex: p.sex || "", phone: p.phone || "", aadhaar: p.aadhaarLast4 ? "XXXX XXXX " + p.aadhaarLast4 : "",
+    address: p.address || "", hasLogin: !!p.passHash, created: p.created || 0 };
+}
+
+async function patientByAadhaar(env, n) {
+  const key = await aadhaarKey(env, n);
+  return (await listDocs(env, "patients", "json_extract(data, '$.aadhaarKey') = ?", [key]))[0] || null;
+}
+
+/** Creates a patient record from a request body; returns { id, p }. */
+async function createPatient(env, b, createdBy, password) {
+  const name = clean(b.name, 60);
+  if (!name) throw new HttpError(400, "Enter the patient's name");
+  const phone = digits(b.phone);
+  if (phone && phone.length !== 10) throw new HttpError(400, "Enter a 10-digit mobile number");
+  const aadhaar = normAadhaar(b.aadhaar);
+  if (!phone && !aadhaar) throw new HttpError(400, "Enter a mobile number or an Aadhaar number");
+  if (aadhaar) {
+    const old = await patientByAadhaar(env, aadhaar);
+    if (old) throw Object.assign(new HttpError(409, "This Aadhaar number is already registered"), { existing: old.id });
+  }
+  const id = await nextPatientId(env);
+  const p = {
+    name, age: clean(b.age, 3), sex: clean(b.sex, 10), phone, address: clean(b.address, 200),
+    aadhaarKey: aadhaar ? await aadhaarKey(env, aadhaar) : "", aadhaarLast4: aadhaar ? aadhaar.slice(-4) : "",
+    passHash: password ? await hashPassword(validPassword(password)) : "", ver: 0, active: true, created: Date.now(), createdBy,
+  };
+  await putDoc(env, "patients", id, p);
+  return { id, p };
+}
+
+/** Finds the patient a login refers to: Patient ID, Aadhaar, or mobile number. */
+async function patientsForLogin(env, login) {
+  const t = String(login || "").trim().toUpperCase().replace(/\s/g, "");
+  if (/^RX\d{6,}$/.test(t)) { const p = await getDoc(env, "patients", t); return p ? [Object.assign({ id: t }, p)] : []; }
+  const d = t.replace(/\D/g, "");
+  if (d.length === 12) { const p = validAadhaar(d) ? await patientByAadhaar(env, d) : null; return p ? [p] : []; }
+  if (d.length >= 10) return listDocs(env, "patients", "json_extract(data, '$.phone') = ?", [d.slice(-10)]);
+  return [];
+}
+
+async function patientHistory(env, pid) {
+  const visits = (await listDocs(env, "visits", "json_extract(data, '$.patient.id') = ?", [pid])).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 50);
+  const out = [];
+  for (const v of visits) {
+    const orders = await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [v.id]);
+    out.push({
+      id: v.id, date: v.date, token: v.token, status: v.status, complaint: visitSummary(v.id, v).complaint,
+      diagnosis: v.rx?.dx || v.work?.provisional?.diagnosis || "", doctor: v.doctor?.name || "",
+      rx: v.status === "sent" || v.status === "dispensed" ? v.rx : null,
+      reports: orders.map((o) => ({ test: o.test, modality: o.modality, status: o.status, result: o.status === "reported" ? o.result : "", impression: o.status === "reported" ? o.impression : "", date: o.date })),
+    });
+  }
+  return out;
 }
 
 // ---------- LiveKit (same approach as the SRK Meet server) ----------
@@ -419,15 +587,17 @@ async function handle(request, env) {
       if (date < today || date > addDays(today, 30) || (date === today && h * 60 + m <= minutes)) throw new HttpError(400, "That time has passed. Choose another slot.");
       const clash = await D.prepare("SELECT id FROM appointments WHERE date = ? AND time = ? AND status != 'cancelled'").bind(date, time).first();
       if (clash) throw new HttpError(409, "That slot was just taken. Choose another time.");
+      let patientId = null;
+      if (body.patientSession) patientId = (await requirePatient(env, body.patientSession)).uid;
       const id = crypto.randomUUID();
       const code = randomFrom("0123456789", 6);
       const row = {
         id, created_at: Date.now(), date, time, mode, status: "booked", name, age: clean(body.age, 3), sex: clean(body.sex, 10),
-        phone, reason: clean(body.reason, 300), lang: ["en", "ta", "hi"].includes(body.lang) ? body.lang : "en", code, room: null, source: "patient",
+        phone, reason: clean(body.reason, 300), lang: ["en", "ta", "hi"].includes(body.lang) ? body.lang : "en", code, room: null, source: "patient", patient_id: patientId,
       };
-      await D.prepare(`INSERT INTO appointments (id, created_at, date, time, mode, status, name, age, sex, phone, reason, lang, code, room, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .bind(row.id, row.created_at, row.date, row.time, row.mode, row.status, row.name, row.age, row.sex, row.phone, row.reason, row.lang, row.code, row.room, row.source).run();
+      await D.prepare(`INSERT INTO appointments (id, created_at, date, time, mode, status, name, age, sex, phone, reason, lang, code, room, source, patient_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(row.id, row.created_at, row.date, row.time, row.mode, row.status, row.name, row.age, row.sex, row.phone, row.reason, row.lang, row.code, row.room, row.source, patientId).run();
       return json({ appointment: publicAppt(row) });
     }
 
@@ -440,30 +610,201 @@ async function handle(request, env) {
 
     // ----- staff -----
     case "/api/login": {
-      const role = String(body.role || "");
-      if (!STAFF_ROLES.includes(role)) throw new HttpError(400, "Unknown role");
-      const pins = Object.assign({}, DEFAULT_PINS, await getSetting(env, "pins", {}));
-      if (!safeEqual(String(pins[role]), String(body.pin || ""))) throw new HttpError(401, "That PIN is not right");
-      const clinic = Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {}));
-      return json({ session: await makeSession(env, role), role, clinic });
+      // Old app (0.5) sends { role, pin }: allowed only until the admin finishes account setup.
+      if (body.pin !== undefined && !body.username) {
+        if (await accountsReady(env)) throw new HttpError(401, "PIN sign-in is off. Update the app and sign in with your username and password.");
+        const role = String(body.role || "");
+        if (!STAFF_ROLES.includes(role)) throw new HttpError(400, "Unknown role");
+        const pins = Object.assign({}, DEFAULT_PINS, await getSetting(env, "pins", {}));
+        if (!safeEqual(String(pins[role]), String(body.pin || ""))) throw new HttpError(401, "That PIN is not right");
+        return json({ session: await makeSession(env, role), role, clinic: await clinicInfo(env) });
+      }
+      await ensureAdmin(env);
+      const username = String(body.username || "").trim().toLowerCase();
+      const lockKey = "u:" + username;
+      await checkLock(env, lockKey);
+      const f = USER_RE.test(username) ? await findUser(env, username) : null;
+      if (!f || !(await checkPassword(body.password, f.u.passHash))) {
+        if (USER_RE.test(username)) await noteFail(env, lockKey);
+        throw new HttpError(401, "Wrong username or password");
+      }
+      if (f.u.active === false) throw new HttpError(403, "This login is disabled. Ask the admin.");
+      await clearFail(env, lockKey);
+      f.u.lastLogin = Date.now();
+      await putDoc(env, "users", f.id, f.u);
+      return json({ session: await makeSession(env, f.u.role, f.id, f.u.ver || 0), role: f.u.role, user: publicUser(f.id, f.u), clinic: await clinicInfo(env) });
+    }
+
+    case "/api/me": {
+      const s = await readSession(env, body.session);
+      if (s.role === "patient") return json({ role: "patient", patient: publicPatient(s.uid, s.user) });
+      return json({ role: s.role, user: s.uid === "pin" ? { name: s.user.name, role: s.role, username: "" } : publicUser(s.uid, s.user), clinic: await clinicInfo(env) });
+    }
+
+    case "/api/me/password": {
+      const s = await readSession(env, body.session);
+      if (s.uid === "pin") throw new HttpError(400, "Sign in with a username first");
+      const coll = s.role === "patient" ? "patients" : "users";
+      const u = s.user;
+      if (u.passHash && !(await checkPassword(body.old, u.passHash))) throw new HttpError(401, "Your current password is not right");
+      const pw = validPassword(body.password);
+      if (pw === String(body.old || "")) throw new HttpError(400, "Choose a new password, different from the old one");
+      u.passHash = await hashPassword(pw);
+      u.mustChange = false;
+      u.ver = (u.ver || 0) + 1;
+      await putDoc(env, coll, s.uid, u);
+      if (s.role === "admin") await setSetting(env, "accounts_ready", true);
+      return json({ ok: true, session: await makeSession(env, s.role, s.uid, u.ver, s.role === "patient" ? 24 * 30 : 12) });
+    }
+
+    // ----- admin: staff logins -----
+    case "/api/admin/users": {
+      await requireUser(env, body.session, ["admin"]);
+      const list = (await listDocs(env, "users")).map((u) => publicUser(u.id, u))
+        .sort((a, b) => STAFF_ROLES.indexOf(a.role) - STAFF_ROLES.indexOf(b.role) || a.name.localeCompare(b.name));
+      return json({ users: list });
+    }
+
+    case "/api/admin/users/save": {
+      const me = await requireUser(env, body.session, ["admin"]);
+      const x = body.user || {};
+      const isNew = !x.id;
+      const id = isNew ? randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 10) : String(x.id);
+      const u = isNew ? { created: Date.now(), createdBy: me.user.username || "admin", ver: 0 } : await getDoc(env, "users", id);
+      if (!u) throw new HttpError(404, "Login not found");
+      const username = String(x.username ?? u.username ?? "").trim().toLowerCase();
+      if (!USER_RE.test(username)) throw new HttpError(400, "Username: 3 to 32 letters, numbers, dot, dash or underscore");
+      const clash = await findUser(env, username);
+      if (clash && clash.id !== id) throw new HttpError(409, "That username is taken");
+      const role = String(x.role ?? u.role ?? "");
+      if (!STAFF_ROLES.includes(role)) throw new HttpError(400, "Choose a role");
+      const name = clean(x.name ?? u.name, 80);
+      if (!name) throw new HttpError(400, "Enter the person's name");
+      const active = x.active === undefined ? u.active !== false : !!x.active;
+      if (!isNew && u.role === "admin" && (role !== "admin" || !active)) {
+        const admins = (await listDocs(env, "users")).filter((a) => a.role === "admin" && a.active !== false && a.id !== id);
+        if (!admins.length) throw new HttpError(400, "Keep at least one active admin login");
+      }
+      if (!isNew && (u.role !== role || (u.active !== false) !== active)) u.ver = (u.ver || 0) + 1; // signs them out
+      Object.assign(u, { username, role, name, active, qual: clean(x.qual ?? u.qual, 80), reg: clean(x.reg ?? u.reg, 40), phone: digits(x.phone ?? u.phone) });
+      if (isNew || x.password) {
+        u.passHash = await hashPassword(validPassword(x.password));
+        u.mustChange = true;
+        if (!isNew) u.ver = (u.ver || 0) + 1;
+      }
+      await putDoc(env, "users", id, u);
+      return json({ ok: true, user: publicUser(id, u) });
     }
 
     case "/api/settings": {
       const who = await requireStaff(env, body.session, ["doctor"]);
-      if (body.pins && typeof body.pins === "object") {
-        if (who !== "admin") throw new HttpError(403, "Only the admin can change PINs");
-        const pins = Object.assign({}, DEFAULT_PINS, await getSetting(env, "pins", {}));
-        for (const r of STAFF_ROLES) if (/^\d{4,8}$/.test(String(body.pins[r] || ""))) pins[r] = String(body.pins[r]);
-        await setSetting(env, "pins", pins);
-      }
       if (body.clinic && typeof body.clinic === "object") {
-        const c = Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {}));
+        if (who !== "admin") throw new HttpError(403, "Only the admin can change clinic details");
+        const c = await clinicInfo(env);
         for (const k of ["name", "doctor", "qual", "reg", "address", "phone", "hours"]) if (k in body.clinic) c[k] = clean(body.clinic[k], 200);
         await setSetting(env, "clinic", c);
       }
-      const out = { ok: true, clinic: Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {})) };
-      if (who === "admin") out.pins = Object.assign({}, DEFAULT_PINS, await getSetting(env, "pins", {}));
-      return json(out);
+      return json({ ok: true, clinic: await clinicInfo(env) });
+    }
+
+    // ----- patient accounts -----
+    case "/api/patient/register": {
+      let r;
+      try { r = await createPatient(env, body, "self", validPassword(body.password)); }
+      catch (e) { if (e.existing) throw new HttpError(409, "This Aadhaar number is already registered. Sign in, or ask the reception to reset your password."); throw e; }
+      return json({ patient: publicPatient(r.id, r.p), session: await makeSession(env, "patient", r.id, 0, 24 * 30) });
+    }
+
+    case "/api/patient/login": {
+      const login = String(body.login || "").trim();
+      const lockKey = "p:" + login.toUpperCase().replace(/\s/g, "");
+      await checkLock(env, lockKey);
+      const found = (await patientsForLogin(env, login)).filter((p) => p.passHash && p.active !== false);
+      const ok = [];
+      for (const p of found) if (await checkPassword(body.password, p.passHash)) ok.push(p);
+      if (!ok.length) { await noteFail(env, lockKey); throw new HttpError(401, "Wrong Patient ID / mobile / Aadhaar or password"); }
+      if (ok.length > 1) throw new HttpError(409, "More than one patient uses this mobile number. Sign in with your Patient ID.");
+      await clearFail(env, lockKey);
+      const p = ok[0];
+      return json({ patient: publicPatient(p.id, p), session: await makeSession(env, "patient", p.id, p.ver || 0, 24 * 30) });
+    }
+
+    case "/api/patient/me": {
+      const s = await requirePatient(env, body.session);
+      const appts = (await D.prepare("SELECT * FROM appointments WHERE patient_id = ? OR (patient_id IS NULL AND phone = ? AND lower(name) = lower(?)) ORDER BY date DESC, time DESC LIMIT 30")
+        .bind(s.uid, s.user.phone || "-", s.user.name).all()).results || [];
+      return json({ patient: publicPatient(s.uid, s.user), visits: await patientHistory(env, s.uid), appointments: appts.map(publicAppt) });
+    }
+
+    case "/api/patient/update": {
+      const s = await requirePatient(env, body.session);
+      const p = s.user;
+      if ("name" in body) p.name = clean(body.name, 60) || p.name;
+      if ("age" in body) p.age = clean(body.age, 3);
+      if ("sex" in body) p.sex = clean(body.sex, 10);
+      if ("address" in body) p.address = clean(body.address, 200);
+      if ("phone" in body) { const ph = digits(body.phone); if (ph && ph.length !== 10) throw new HttpError(400, "Enter a 10-digit mobile number"); p.phone = ph; }
+      if (body.aadhaar) {
+        const n = normAadhaar(body.aadhaar);
+        const old = await patientByAadhaar(env, n);
+        if (old && old.id !== s.uid) throw new HttpError(409, "This Aadhaar number is already linked to another Patient ID");
+        p.aadhaarKey = await aadhaarKey(env, n); p.aadhaarLast4 = n.slice(-4);
+      }
+      if (!p.phone && !p.aadhaarKey) throw new HttpError(400, "Keep a mobile number or an Aadhaar number");
+      await putDoc(env, "patients", s.uid, p);
+      return json({ patient: publicPatient(s.uid, p) });
+    }
+
+    // ----- staff: patient registry -----
+    case "/api/patients/register": {
+      const me = await requireUser(env, body.session, ["staff", "doctor"]);
+      try {
+        const r = await createPatient(env, body, me.user.username || me.role, body.password ? body.password : "");
+        return json({ patient: publicPatient(r.id, r.p) });
+      } catch (e) {
+        if (e.existing) throw new HttpError(409, `This Aadhaar number is already registered as ${e.existing}`);
+        throw e;
+      }
+    }
+
+    case "/api/patients/search": {
+      await requireUser(env, body.session, ["staff", "doctor", "pharmacy", "lab", "diagnostics"]);
+      const q = String(body.q || "").trim();
+      let list = [];
+      if (q.length >= 2) {
+        list = await patientsForLogin(env, q);
+        if (!list.length && !/\d/.test(q)) list = await listDocs(env, "patients", "lower(json_extract(data, '$.name')) LIKE ?", [q.toLowerCase().replace(/[%_]/g, "") + "%"]);
+      }
+      return json({ patients: list.slice(0, 30).map((p) => publicPatient(p.id, p)) });
+    }
+
+    case "/api/patients/get": {
+      await requireUser(env, body.session, ["staff", "doctor"]);
+      const id = String(body.id || "").toUpperCase();
+      const p = await getDoc(env, "patients", id);
+      if (!p) throw new HttpError(404, "Patient not found");
+      return json({ patient: publicPatient(id, p), visits: await patientHistory(env, id) });
+    }
+
+    case "/api/patients/update": {
+      await requireUser(env, body.session, ["staff", "doctor"]);
+      const id = String(body.id || "").toUpperCase();
+      const p = await getDoc(env, "patients", id);
+      if (!p) throw new HttpError(404, "Patient not found");
+      const x = body.patient || {};
+      if (x.name) p.name = clean(x.name, 60);
+      for (const k of ["age", "sex"]) if (k in x) p[k] = clean(x[k], k === "age" ? 3 : 10);
+      if ("address" in x) p.address = clean(x.address, 200);
+      if ("phone" in x) { const ph = digits(x.phone); if (ph && ph.length !== 10) throw new HttpError(400, "Enter a 10-digit mobile number"); p.phone = ph; }
+      if (x.aadhaar) {
+        const n = normAadhaar(x.aadhaar);
+        const old = await patientByAadhaar(env, n);
+        if (old && old.id !== id) throw new HttpError(409, `This Aadhaar number is already registered as ${old.id}`);
+        p.aadhaarKey = await aadhaarKey(env, n); p.aadhaarLast4 = n.slice(-4);
+      }
+      if (x.password) { p.passHash = await hashPassword(validPassword(x.password)); p.ver = (p.ver || 0) + 1; }
+      await putDoc(env, "patients", id, p);
+      return json({ patient: publicPatient(id, p) });
     }
 
     case "/api/doctor/appointments": {
@@ -486,13 +827,12 @@ async function handle(request, env) {
       if (!liveKitReady(env)) throw new HttpError(500, "Video is not set up: add LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET");
       if (body.session) {
         // Doctor: host of the teleconsult
-        await requireStaff(env, body.session, ["doctor"]);
+        const me = await requireUser(env, body.session, ["doctor"]);
         const a = await D.prepare("SELECT * FROM appointments WHERE id = ?").bind(String(body.id || "")).first();
         if (!a || a.mode !== "tele") throw new HttpError(404, "Teleconsult not found");
         const room = await ensureRoom(env, a);
         if (["booked", "arrived"].includes(a.status)) await D.prepare("UPDATE appointments SET status = 'in-call' WHERE id = ?").bind(a.id).run();
-        const clinic = Object.assign({}, DEFAULT_CLINIC, await getSetting(env, "clinic", {}));
-        const name = clinic.doctor || "Doctor";
+        const name = me.user.name || "Doctor";
         const identity = `dr-${slug(name)}-${randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 5)}`;
         const token = await issueToken(env, { room, name, identity, role: "host" });
         return json({ url: env.LIVEKIT_URL, token, identity, role: "host", room, title: `Teleconsult · ${a.name}` });
@@ -563,13 +903,30 @@ async function handle(request, env) {
       const { date } = clinicNow(env);
       const today = (await D.prepare("SELECT data FROM docs WHERE coll = 'visits' AND json_extract(data, '$.date') = ?").bind(date).all()).results || [];
       const token = today.reduce((m, r) => Math.max(m, Number(JSON.parse(r.data).token) || 0), 0) + 1;
+      // Link the visit to a Patient ID: the signed-in patient, a Patient ID with its mobile number,
+      // the same name and mobile seen before, or a new registration.
+      const phone = digits(p.phone);
+      let pid = null, newPatient = false;
+      if (body.patientSession) pid = (await requirePatient(env, body.patientSession)).uid;
+      if (!pid && p.id) {
+        const known = await getDoc(env, "patients", String(p.id).toUpperCase().trim());
+        if (known && phone && known.phone === phone) pid = String(p.id).toUpperCase().trim();
+      }
+      if (!pid && phone) {
+        const same = (await listDocs(env, "patients", "json_extract(data, '$.phone') = ?", [phone])).filter((x) => x.name.trim().toLowerCase() === name.toLowerCase());
+        if (same.length === 1) pid = same[0].id;
+      }
+      if (!pid) {
+        try { pid = (await createPatient(env, { name, age: p.age, sex: p.sex, phone, aadhaar: p.aadhaar }, "check-in", "")).id; newPatient = true; }
+        catch (e) { if (e.existing) pid = e.existing; /* otherwise check in without an ID */ }
+      }
       const id = crypto.randomUUID();
       const visit = {
-        patient: { name, age: clean(p.age, 3), sex: clean(p.sex, 10), phone: digits(p.phone) }, lang, qa, caseSheet,
+        patient: { id: pid || "", name, age: clean(p.age, 3), sex: clean(p.sex, 10), phone }, lang, qa, caseSheet,
         urgent: !!body.urgent, status: "waiting", token, date, createdAt: Date.now(), work: null, rx: null,
       };
       await putDoc(env, "visits", id, visit);
-      return json({ id, token });
+      return json({ id, token, patientId: pid || "", newPatient });
     }
 
     // ----- doctor: OPD visits -----
@@ -585,16 +942,18 @@ async function handle(request, env) {
       await requireStaff(env, body.session, ["doctor"]);
       const v = await getDoc(env, "visits", String(body.id || ""));
       if (!v) throw new HttpError(404, "Visit not found");
-      return json({ id: body.id, visit: v });
+      const history = v.patient?.id ? (await patientHistory(env, v.patient.id)).filter((h) => h.id !== body.id).slice(0, 10) : [];
+      return json({ id: body.id, visit: v, history });
     }
 
     case "/api/doctor/visit/save": {
-      await requireStaff(env, body.session, ["doctor"]);
+      const me = await requireUser(env, body.session, ["doctor"]);
       const id = String(body.id || "");
       const v = await getDoc(env, "visits", id);
       if (!v) throw new HttpError(404, "Visit not found");
       const patch = body.patch || {};
       for (const k of ["work", "rx", "caseSheet"]) if (k in patch) v[k] = patch[k];
+      if (patch.rx && me.uid !== "pin") v.doctor = { id: me.uid, name: me.user.name, qual: me.user.qual || "", reg: me.user.reg || "" };
       if (["waiting", "consult", "sent", "dispensed", "done"].includes(patch.status)) v.status = patch.status;
       if (JSON.stringify(v).length > 900000) throw new HttpError(413, "This case sheet is too large to save");
       await putDoc(env, "visits", id, v);
@@ -615,7 +974,7 @@ async function handle(request, env) {
         const test = clean(t, 120);
         if (!test || have.has(test.toLowerCase())) continue;
         const c = classifyTest(test);
-        const o = { visitId, patient: { name: v.patient?.name || "", age: v.patient?.age || "", sex: v.patient?.sex || "" }, token: v.token,
+        const o = { visitId, patient: { id: v.patient?.id || "", name: v.patient?.name || "", age: v.patient?.age || "", sex: v.patient?.sex || "" }, token: v.token,
           test, kind: c.kind, modality: c.modality, status: "ordered", date, orderedAt: Date.now(), result: "", impression: "" };
         const id = crypto.randomUUID();
         await putDoc(env, "orders", id, o);
@@ -733,9 +1092,12 @@ async function handle(request, env) {
       const orders = await listDocs(env, "orders", "json_extract(data, '$.date') = ?", [date]);
       const appts = (await D.prepare("SELECT mode, status FROM appointments WHERE date = ?").bind(date).all()).results || [];
       const stock = await listDocs(env, "stock");
+      const users = await listDocs(env, "users");
+      const pc = await D.prepare("SELECT COUNT(*) AS n FROM docs WHERE coll = 'patients'").first();
       const count = (arr, f) => arr.filter(f).length;
       return json({
-        date,
+        date, accountsReady: await accountsReady(env),
+        people: { patients: pc?.n || 0, logins: count(users, (u) => u.active !== false) },
         opd: { checkedIn: visits.length, waiting: count(visits, (v) => v.status === "waiting"), prescribed: count(visits, (v) => v.status === "sent" || v.status === "dispensed"), urgent: count(visits, (v) => v.urgent) },
         appointments: { total: count(appts, (a) => a.status !== "cancelled"), tele: count(appts, (a) => a.mode === "tele" && a.status !== "cancelled") },
         lab: { pending: count(orders, (o) => o.kind === "lab" && o.status !== "reported"), reported: count(orders, (o) => o.kind === "lab" && o.status === "reported") },
@@ -762,4 +1124,4 @@ export default {
   },
 };
 
-export { allSlots, makeSession, requireStaff, issueToken, clinicNow };
+export { allSlots, makeSession, requireStaff, issueToken, clinicNow, validAadhaar, hashPassword, checkPassword };
