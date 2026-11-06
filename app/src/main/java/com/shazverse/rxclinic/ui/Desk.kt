@@ -420,3 +420,43 @@ fun ClinicQrDialog(vm: CallViewModel, onDismiss: () -> Unit) {
 }
 
 internal val DATE_SHORT: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM")
+
+// ---------------- Admin: free trial requests from the website ----------------
+
+@Composable
+fun LeadsDialog(vm: CallViewModel, session: String, onDismiss: () -> Unit) {
+    val api = remember { Api(vm.prefs.serverUrl) }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val list = remember { mutableStateListOf<JSONObject>() }
+    var err by remember { mutableStateOf<String?>(null) }
+    fun load(extra: JSONObject = JSONObject()) = scope.launch {
+        try { val r = api.call("/api/leads", extra.put("session", session)).objs("leads"); list.clear(); list.addAll(r); err = null }
+        catch (e: Exception) { err = e.message }
+    }
+    LaunchedEffect(Unit) { load() }
+    val statuses = listOf("new" to "New", "contacted" to "Contacted", "demo" to "Demo done", "won" to "Joined", "lost" to "Not interested")
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Free trial requests (${list.size})") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                ErrorText(err)
+                if (list.isEmpty() && err == null) Text("No requests yet. They arrive from the Start a free trial form on your website.", color = Ui.Muted)
+                list.forEach { l ->
+                    BoxCard {
+                        Text("${l.str("hospital")} · ${l.str("city")}", color = Ui.Text, fontWeight = FontWeight.SemiBold)
+                        Text("${l.str("name")} · ${l.str("phone")} · ${l.str("email")}", color = Ui.Muted, fontSize = 13.sp)
+                        Text(listOf(l.str("plan").replaceFirstChar { it.uppercase() }, whenText(l.optLong("created"))).filter { it.isNotBlank() }.joinToString(" · "), color = Ui.Muted, fontSize = 12.sp)
+                        if (l.str("message").isNotBlank()) Text(l.str("message"), color = Ui.Text, fontSize = 13.sp)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(onClick = { dial(context, l.str("phone")) }) { Icon(Icons.Filled.Call, null); Text(" Call") }
+                            statuses.forEach { (k, t) -> Choice(t, l.str("status") == k) { load(JSONObject().put("id", l.str("id")).put("status", k)) } }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}

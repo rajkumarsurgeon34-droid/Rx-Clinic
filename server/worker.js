@@ -719,7 +719,10 @@ async function handle(request, env) {
   if (request.method === "OPTIONS") return json({ ok: true });
 
   if (request.method === "GET") {
-    if (path === "/") {
+    // Browsers get the product website; the app and health checks get JSON (or /status).
+    if ((path === "/" && (request.headers.get("accept") || "").includes("text/html")) || path === "/home")
+      return new Response(landingPage(), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" } });
+    if (path === "/" || path === "/status") {
       let database = false;
       try { await db(env); database = true; } catch { /* reported below */ }
       return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
@@ -1304,6 +1307,32 @@ async function handle(request, env) {
         })(),
         pharmacy: { toDispense: count(visits, (v) => v.status === "sent"), dispensed: count(visits, (v) => v.status === "dispensed"), outOfStock: count(stock, (x) => !x.stock) },
       });
+    }
+
+    // ----- free trial requests from the website -----
+    case "/api/trial": {
+      if (body.website) return json({ ok: true }); // hidden field: only bots fill it
+      const ip = request.headers.get("cf-connecting-ip") || "local";
+      const rl = (await getDoc(env, "ratelimit", "trial:" + ip)) || { n: 0, since: Date.now() };
+      if (Date.now() - rl.since > 3600000) { rl.n = 0; rl.since = Date.now(); }
+      if (++rl.n > 5) throw new HttpError(429, "Too many requests. Please try again in an hour.");
+      await putDoc(env, "ratelimit", "trial:" + ip, rl);
+      const name = clean(body.name, 80), hospital = clean(body.hospital, 120), city = clean(body.city, 60), email = clean(body.email, 120).toLowerCase(), phone = digits(body.phone).slice(-10);
+      if (!name || !hospital || !city) throw new HttpError(400, "Please fill in your name, hospital name and city.");
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new HttpError(400, "Please enter a valid email address.");
+      if (phone.length !== 10) throw new HttpError(400, "Please enter a 10-digit mobile number.");
+      const plan = ["bronze", "silver", "gold", "platinum"].includes(body.plan) ? body.plan : "";
+      await putDoc(env, "leads", crypto.randomUUID(), { name, email, phone, hospital, city, plan, doctors: clean(body.doctors, 6), message: clean(body.message, 500), created: Date.now(), status: "new" });
+      return json({ ok: true });
+    }
+
+    case "/api/leads": {
+      await requireUser(env, body.session, ["admin"]);
+      if (body.id && body.status) {
+        const l = await getDoc(env, "leads", String(body.id));
+        if (l) { l.status = ["new", "contacted", "demo", "won", "lost"].includes(body.status) ? body.status : l.status; await putDoc(env, "leads", String(body.id), l); }
+      }
+      return json({ leads: (await listDocs(env, "leads")).sort((a, b) => b.created - a.created).slice(0, 300) });
     }
 
     // ----- plan -----
@@ -1948,4 +1977,184 @@ function termsPage() {
 <li>Back up exported records and keep printed copies as your local rules require.</li>
 </ol>
 <p><a href="/login">Back to sign in</a></p></main></body></html>`;
+}
+
+// ---------- product website (opened at the server's main address in a browser) ----------
+function landingPage() {
+  const ic = (d, c) => `<svg viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+  const I = {
+    cal: ic('<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M8 14h2M14 14h2M8 18h2"/>', "#1b6f8a"),
+    mic: ic('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>', "#e0573f"),
+    brain: ic('<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 3 3h1V4z"/><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-3 3h-1V4z"/>', "#4447a3"),
+    id: ic('<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2.5"/><path d="M5.5 16.5c.7-1.6 2-2.5 3.5-2.5s2.8.9 3.5 2.5M15 10h3M15 13h3"/>', "#d8a51c"),
+    rx: ic('<path d="M6 20V4h5a4 4 0 0 1 0 8H6M10 12l8 8M18 13l-6 6"/>', "#b3261e"),
+    video: ic('<rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3z"/>', "#1b6f8a"),
+    bed: ic('<path d="M3 18V6M3 14h18v4M21 14v-3a3 3 0 0 0-3-3h-7v6"/><circle cx="7" cy="10" r="2"/>', "#2e9e8a"),
+    ot: ic('<circle cx="12" cy="5" r="2"/><path d="M4 12h16M7 12l-2 8M17 12l2 8M9 12V9h6v3"/>', "#1b6f8a"),
+    flask: ic('<path d="M9 3h6M10 3v6L4.5 18.5A2 2 0 0 0 6.2 21h11.6a2 2 0 0 0 1.7-2.5L14 9V3"/><path d="M7 15h10"/>', "#e0573f"),
+    scan: ic('<rect x="3" y="3" width="18" height="18" rx="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3"/>', "#4447a3"),
+    pill: ic('<rect x="3" y="9" width="18" height="6" rx="3" transform="rotate(-45 12 12)"/><path d="m9.5 9.5 5 5"/>', "#1b6f8a"),
+    bill: ic('<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>', "#f08c2e"),
+    shield: ic('<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>', "#2e9e8a"),
+    home: ic('<path d="M3 11 12 4l9 7M5 10v10h14V10"/><path d="M12 13v5M9.5 15.5h5"/>', "#e0573f"),
+    van: ic('<path d="M3 7h11v9H3zM14 10h4l3 3v3h-7"/><circle cx="7" cy="17" r="2"/><circle cx="17" cy="17" r="2"/><path d="M8.5 9.5v4M6.5 11.5h4"/>', "#1b6f8a"),
+    bell: ic('<path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 20a2 2 0 0 0 4 0"/>', "#f08c2e"),
+    chart: ic('<path d="M4 20V4M4 20h16"/><path d="m7 15 4-4 3 3 5-6"/>', "#2e9e8a"),
+    users: ic('<circle cx="9" cy="8" r="3"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14c2.8 0 5 2.2 5 5"/>', "#1b6f8a"),
+    doc: ic('<path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>', "#4447a3"),
+    globe: ic('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>', "#1b6f8a"),
+    qr: ic('<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/>', "#14201f"),
+  };
+  const feats = [
+    [I.mic, "AI voice check-in", "Patients answer by voice in Tamil, Hindi or English. The doctor gets an English case sheet."],
+    [I.brain, "AI diagnosis support", "Differential and provisional diagnosis, tests to order and results analysis, each with reasons."],
+    [I.rx, "Smart prescriptions", "Doses, timing and duration, diet and lifestyle advice, review date. Checks your pharmacy stock."],
+    [I.cal, "Appointments", "Booking slots, clinic QR code for patients, emergency and normal queues."],
+    [I.video, "Video teleconsult", "Built in, with a waiting room. No Zoom or Meet needed."],
+    [I.id, "Unique Patient IDs", "Linked to mobile or Aadhaar (stored masked). Every visit, report and bill in one record."],
+    [I.users, "Out-patient management", "Nurse vitals, doctor queue, case sheets, certificates and referral letters."],
+    [I.bed, "In-patient management", "Admission, wards and beds, transfers, daily charges, advances and discharge bill."],
+    [I.ot, "OT management", "Theatre schedule, surgeons, checklists, consent and post-op notes."],
+    [I.flask, "Laboratory", "Orders from the case sheet, samples, reports back to the doctor, lab billing."],
+    [I.scan, "Diagnostics", "USG, CT, MRI, PET-CT and X-ray: schedule, findings, impression, billing."],
+    [I.pill, "Pharmacy", "Stock and MRP, dispensing from the prescription, counter sales, stock alerts."],
+    [I.bill, "Automated billing", "OPD, pharmacy, lab and scan bills; cash, UPI, card, insurance; the patient's hospital total."],
+    [I.shield, "Insurance desk", "Pre-authorisation, claims and settlements, PM-JAY and CMCHIS."],
+    [I.home, "Home care", "Doctor, nurse and physio visits at home with notes, vitals and billing."],
+    [I.van, "Mobile medical units", "Health camps and van trips: team roster, screening, referrals."],
+    [I.bell, "Reminders and follow-ups", "Review dates due, call-back lists, WhatsApp and AI reminder calls."],
+    [I.chart, "Reports and analytics", "Daily collections, monthly sales, doctor-wise revenue, goals."],
+    [I.doc, "Patient portal", "Patients see their ID, prescriptions, reports and bills on their phone."],
+    [I.globe, "Web and mobile", "Android app plus a web portal for any computer. One login for both."],
+  ];
+  const art = {
+    clinic: `<svg viewBox="0 0 120 100"><rect x="30" y="20" width="60" height="70" rx="3" fill="#fff" stroke="#14201f" stroke-width="3"/><rect x="14" y="44" width="16" height="46" fill="#e9c24c" stroke="#14201f" stroke-width="3"/><rect x="90" y="44" width="16" height="46" fill="#e9c24c" stroke="#14201f" stroke-width="3"/><path d="M60 30v20M50 40h20" stroke="#e0573f" stroke-width="7"/><rect x="48" y="66" width="24" height="24" fill="#dbe9f6" stroke="#14201f" stroke-width="3"/><path d="M60 66v24" stroke="#14201f" stroke-width="3"/></svg>`,
+    hospital: `<svg viewBox="0 0 120 100"><rect x="38" y="10" width="44" height="82" fill="#5cc3b8"/><rect x="44" y="16" width="32" height="24" fill="#efe9da"/><path d="M60 20v16M52 28h16" stroke="#e0573f" stroke-width="5"/><rect x="14" y="40" width="24" height="52" fill="#a8ddd4"/><rect x="82" y="40" width="24" height="52" fill="#a8ddd4"/><g fill="#f4e27a"><rect x="20" y="48" width="6" height="6"/><rect x="20" y="62" width="6" height="6"/><rect x="20" y="76" width="6" height="6"/><rect x="94" y="48" width="6" height="6"/><rect x="94" y="62" width="6" height="6"/><rect x="94" y="76" width="6" height="6"/></g><rect x="50" y="62" width="20" height="30" fill="#cdeef0" stroke="#2d4a47" stroke-width="2"/></svg>`,
+    pharmacy: `<svg viewBox="0 0 120 100"><rect x="44" y="6" width="32" height="22" fill="#4f8fd8" stroke="#2d3a4a" stroke-width="2.5"/><path d="M60 10v14M53 17h14" stroke="#fff" stroke-width="4"/><path d="M18 46 28 32h64l10 14z" fill="#4f8fd8" stroke="#2d3a4a" stroke-width="2.5"/><path d="M40 32l-5 14M60 32v14M80 32l5 14" stroke="#f6e6c8" stroke-width="7"/><rect x="24" y="46" width="72" height="42" fill="#c48a5a" stroke="#2d3a4a" stroke-width="2.5"/><rect x="34" y="54" width="18" height="34" fill="#dbe9f6" stroke="#2d3a4a" stroke-width="2.5"/><rect x="58" y="56" width="30" height="16" fill="#dbe9f6" stroke="#2d3a4a" stroke-width="2.5"/><rect x="16" y="88" width="88" height="5" fill="#2d3a4a"/></svg>`,
+    lab: `<svg viewBox="0 0 120 100"><path d="M46 12h18M50 12v26L30 76a8 8 0 0 0 7 12h34a8 8 0 0 0 7-12L60 38V12" fill="#fff" stroke="#2d3a4a" stroke-width="3"/><path d="M36 66h38l6 12a6 6 0 0 1-5 8H35a6 6 0 0 1-5-8z" fill="#8fd3c4"/><rect x="80" y="24" width="14" height="62" rx="7" fill="#fff" stroke="#2d3a4a" stroke-width="3"/><rect x="81.5" y="52" width="11" height="32" rx="5" fill="#e0573f"/></svg>`,
+  };
+  const plans = [
+    ["Bronze", "Solo clinic · 1 doctor · OPD", "₹1,000", "/month"],
+    ["Silver", "2–4 doctors · OPD + inpatient", "₹1,000/doctor", "+ ₹2,000/month"],
+    ["Gold", "5–20 doctors · full hospital", "₹1,000/doctor", "+ ₹7,500/month"],
+    ["Platinum", "21+ doctors · OT · multi-speciality", "₹1,000/doctor", "+ ₹20,000/month"],
+  ];
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rx Clinic · AI hospital and clinic software</title>
+<meta name="description" content="AI hospital and clinic management software for India: voice check-in in Tamil, Hindi and English, AI diagnosis support, prescriptions, teleconsult, lab, diagnostics, pharmacy, inpatient, OT, billing and insurance.">
+<style>
+:root{--teal:#1b7f8f;--teal-d:#14606c;--mint:#55c1a9;--ink:#14201f;--muted:#5b6b70;--bg:#ffffff;--soft:#f2f6f6;--line:#e2eaea;--rx:#c62f26;--orange:#f2784b;--sky:#22b7dc}
+*{box-sizing:border-box}body{margin:0;font:17px/1.6 "Segoe UI",Roboto,system-ui,-apple-system,sans-serif;color:var(--ink);background:var(--bg)}
+a{color:inherit}img,svg{max-width:100%}.in{max-width:1100px;margin:0 auto;padding-left:max(18px,env(safe-area-inset-left));padding-right:max(18px,env(safe-area-inset-right))}
+header{position:sticky;top:0;background:#fff;z-index:5;box-shadow:0 1px 0 var(--line)}
+.nav{display:flex;align-items:center;gap:14px;padding-block:12px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:8px;text-decoration:none;font:700 30px/1 Georgia,"Times New Roman",serif;color:var(--teal)}.brand b{color:var(--rx);font-size:34px}
+.sp{flex:1}.btn{display:inline-block;text-decoration:none;font-weight:600;letter-spacing:.03em;padding:11px 18px;border:0;cursor:pointer;font-size:16px}
+.btn.trial{background:var(--mint);color:#fff}.btn.login{background:var(--sky);color:#fff}.btn.big{padding:15px 28px;font-size:18px;letter-spacing:.08em;text-transform:uppercase}
+.hero{background:var(--teal);color:#fff;position:relative;overflow:hidden}
+.hero:before{content:"";position:absolute;inset:0;background-image:radial-gradient(rgba(255,255,255,.07) 1.5px,transparent 1.5px);background-size:26px 26px}
+.hero .in{position:relative;display:grid;grid-template-columns:1.1fr .9fr;gap:36px;align-items:center;padding-block:56px}
+.hero h1{font:700 clamp(30px,4.6vw,48px)/1.12 Georgia,serif;margin:0 0 16px}.hero p{font-size:18px;margin:0 0 14px;opacity:.95;max-width:56ch}
+.hero .cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:22px}.hero .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.chip{border:1px solid rgba(255,255,255,.45);border-radius:999px;padding:4px 12px;font-size:14px}
+.phone{justify-self:center;width:270px;max-width:100%;background:#0f1d1c;border-radius:34px;padding:10px;box-shadow:0 30px 60px -30px rgba(0,0,0,.6)}
+.scr{background:#f4f7f6;border-radius:26px;overflow:hidden;color:var(--ink);font-size:12.5px;padding:14px 12px;display:flex;flex-direction:column;gap:8px;min-height:470px}
+.scr .t{font:700 16px Georgia,serif;display:flex;justify-content:space-between}.scr .t span{color:var(--rx)}
+.q{background:#fff;border:1px solid #d6e0dd;border-radius:12px;padding:10px}.q b{display:block;font-size:13px}.q small{color:var(--muted)}
+.opt{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.opt span{background:#e8efed;border-radius:8px;padding:4px 8px}.opt .on{background:#0e6a64;color:#fff}
+.ai{background:#edeefa;border:1px solid #c9cbf0;border-radius:12px;padding:10px}.ai b{color:#4447a3}.mic{align-self:center;width:54px;height:54px;border-radius:50%;background:#0e6a64;display:grid;place-items:center;margin-top:auto}
+.mic svg{width:26px;height:26px}
+section{padding-block:60px}h2{font:600 clamp(26px,3.4vw,36px)/1.2 "Segoe UI",system-ui;text-align:center;margin:0 0 36px;color:#4b5a5f}
+.prods{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:22px}
+.prod{text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px;padding:10px}.prod h3{margin:0;font-size:20px;color:#4b5a5f}.prod svg{width:150px;height:125px}.prod p{margin:0;color:var(--muted)}
+.feat{background:var(--mint);color:#fff}.feat h2{color:#fff}
+.fg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 36px}
+.f{display:flex;gap:16px;align-items:center}.f .c{flex:none;width:76px;height:76px;border-radius:50%;background:#fff;display:grid;place-items:center;box-shadow:0 8px 20px -14px rgba(0,0,0,.5)}
+.f .c svg{width:38px;height:38px}.f b{display:block;font-size:19px}.f span{font-size:15px;opacity:.95}
+.why{background:var(--soft)}.wg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+.w{background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px}.w b{font:700 34px Georgia,serif;color:var(--teal);display:block}.w p{margin:4px 0 0;color:var(--muted)}
+.pg{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
+.p{border:1px solid var(--line);border-radius:14px;padding:20px;display:flex;flex-direction:column;gap:6px}.p h3{margin:0;font-size:20px}.p .pr{font:700 22px ui-monospace,Menlo,monospace;color:var(--teal)}.p small{color:var(--muted)}
+.p.hl{border:2px solid var(--mint)}
+.note{text-align:center;color:var(--muted);margin-top:16px;font-size:15px}
+.trialsec{background:var(--teal);color:#fff;position:relative}.trialsec:before{content:"";position:absolute;inset:0;background-image:radial-gradient(rgba(255,255,255,.07) 1.5px,transparent 1.5px);background-size:26px 26px}
+.trialsec .in{position:relative;max-width:640px}.trialsec h2{color:#fff}
+form{display:grid;gap:14px}label{display:block;font-weight:600;color:#d9f0f2}label input,label select,label textarea{display:block;width:100%;margin-top:6px}label i{color:#ffb3a7;font-style:normal}
+input,select,textarea{font:inherit;padding:13px 14px;border:1px solid #cfdde0;background:#f5f9fa;color:var(--ink);border-radius:2px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.hp{position:absolute;left:-9999px}
+.submit{background:var(--orange);color:#fff;border:0;padding:15px 34px;font:700 18px system-ui;cursor:pointer;justify-self:start}.submit:disabled{opacity:.6}
+.msg{min-height:1.4em;font-weight:600}.msg.ok{color:#c9ffe9}.msg.err{color:#ffd0c8}
+.contact{background:#f2f2f2;text-align:center}.contact p{color:var(--muted);font-size:19px;margin:-18px 0 22px}
+footer{background:var(--mint);color:#fff;padding-block:30px}.fgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}footer b{font-size:18px;display:block;margin-bottom:6px}footer a{display:block;text-decoration:none;opacity:.95}
+:focus-visible{outline:3px solid var(--orange);outline-offset:2px}
+@media(max-width:900px){.hero .in{grid-template-columns:1fr}.prods,.pg{grid-template-columns:repeat(2,minmax(0,1fr))}.wg{grid-template-columns:1fr}.fg{grid-template-columns:1fr}}
+@media(max-width:520px){.prods{grid-template-columns:1fr}.pg{grid-template-columns:1fr}.two{grid-template-columns:1fr}.fgrid{grid-template-columns:1fr}.brand{font-size:26px}.btn{padding:10px 13px;font-size:15px}}
+</style></head><body>
+<header><div class="in nav"><a class="brand" href="/home"><b>℞</b>Rx Clinic</a><div class="sp"></div><a class="btn trial" href="#trial">Start a free trial</a><a class="btn login" href="/login">Register / Login</a></div></header>
+
+<div class="hero"><div class="in"><div>
+<h1>AI hospital and clinic software, made for India</h1>
+<p><b>Rx Clinic</b> runs your OPD, IPD, OT, lab, diagnostics, pharmacy and billing in one app, with AI that helps at every step.</p>
+<p>Patients check in by voice in their own language. Doctors get an English case sheet, AI diagnosis support with reasons, and a prescription that checks pharmacy stock.</p>
+<div class="cta"><a class="btn trial big" href="#trial">Start a free trial</a><a class="btn login big" href="/login">Login</a></div>
+<div class="chips"><span class="chip">தமிழ்</span><span class="chip">हिन्दी</span><span class="chip">English</span><span class="chip">Android + web</span><span class="chip">30-day free trial</span></div>
+</div>
+<div class="phone" aria-hidden="true"><div class="scr">
+<div class="t">Check-in <span>℞</span></div>
+<div class="q"><small>Question 3 of 9 · Tamil</small><b>வயிற்று வலி எத்தனை நாட்களாக உள்ளது?</b><small>How many days have you had stomach pain?</small><div class="opt"><span>1 நாள்</span><span class="on">1 வாரம்</span><span>1 மாதம்</span></div></div>
+<div class="ai"><b>AI · Provisional diagnosis</b><br>Acid peptic disease<br><small>Why: burning epigastric pain, worse when hungry, NSAID use</small></div>
+<div class="q"><b>℞ Tab Pantoprazole 40 mg</b><small>1-0-0 · before food · 14 days · <span style="color:#24734a">In pharmacy</span></small></div>
+<div class="mic">${ic('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>', "#fff")}</div>
+</div></div></div></div>
+
+<section><div class="in"><h2>Tailored products that fit your needs</h2><div class="prods">
+<div class="prod">${art.clinic}<h3>Private practices &amp; clinics</h3><p>AI case sheets and prescriptions for the independent practice.</p></div>
+<div class="prod">${art.hospital}<h3>Hospitals</h3><p>OPD, IPD, OT, wards, insurance and billing in one place.</p></div>
+<div class="prod">${art.pharmacy}<h3>Pharmacies</h3><p>Stock, MRP, dispensing straight from the prescription, alerts.</p></div>
+<div class="prod">${art.lab}<h3>Labs &amp; diagnostics</h3><p>Orders, reports and billing for lab tests, USG, CT, MRI and PET-CT.</p></div>
+</div></div></section>
+
+<section class="feat"><div class="in"><h2>Key features</h2><div class="fg">
+${feats.map(([i, t, d]) => `<div class="f"><div class="c">${i}</div><div><b>${t}</b><span>${d}</span></div></div>`).join("")}
+</div></div></section>
+
+<section class="why"><div class="in"><h2>Why Rx Clinic</h2><div class="wg">
+<div class="w"><b>3 languages</b><p>Voice check-in in Tamil, Hindi and English. The case sheet comes out in English for the doctor.</p></div>
+<div class="w"><b>AI with reasons</b><p>Every suggestion explains why. The doctor accepts, edits or rejects; nothing goes on the prescription by itself.</p></div>
+<div class="w"><b>One Patient ID</b><p>OPD, inpatient, lab, scans, pharmacy and bills under one ID, linked to mobile or Aadhaar.</p></div>
+</div></div></section>
+
+<section><div class="in"><h2>Simple pricing</h2><div class="pg">
+${plans.map(([n, d, p, f], i) => `<div class="p${i === 2 ? " hl" : ""}"><h3>${n}</h3><small>${d}</small><div class="pr">${p}</div><small>${f}</small></div>`).join("")}
+</div><p class="note">Prices per month, plus GST. Pay yearly and get 2 months free. Every plan starts with a 30-day free trial.</p></div></section>
+
+<section class="trialsec" id="trial"><div class="in"><h2>Start a free trial</h2>
+<form id="tf" novalidate>
+<label>Name <i>*</i><input name="name" required maxlength="80" autocomplete="name"></label>
+<div class="two"><label>Email <i>*</i><input name="email" type="email" required maxlength="120" autocomplete="email"></label>
+<label>Phone number <i>*</i><input name="phone" required inputmode="tel" maxlength="14" autocomplete="tel"></label></div>
+<label>Hospital or clinic name <i>*</i><input name="hospital" required maxlength="120" autocomplete="organization"></label>
+<div class="two"><label>City <i>*</i><input name="city" required maxlength="60" autocomplete="address-level2"></label>
+<label>Number of doctors<select name="plan"><option value="bronze">1 (Bronze)</option><option value="silver">2–4 (Silver)</option><option value="gold" selected>5–20 (Gold)</option><option value="platinum">21+ (Platinum)</option></select></label></div>
+<label>Anything we should know? (optional)<textarea name="message" rows="3" maxlength="500"></textarea></label>
+<input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
+<div class="msg" id="tm" role="status"></div>
+<button class="submit" id="ts" type="submit">Submit</button>
+</form></div></section>
+
+<section class="contact"><div class="in"><h2>Contact us</h2><p>Get in touch with us for a demo or more information.</p><a class="btn big" style="background:var(--sky);color:#fff" href="#trial">Start a free trial</a></div></section>
+
+<footer><div class="in fgrid">
+<div><b>Rx Clinic</b><a href="#trial">Free trial</a><a href="/login">Login</a><a href="/book">Book an appointment</a></div>
+<div><b>Product</b><a href="/terms">Terms of use</a><span>Android app and web portal</span></div>
+<div><b>ShazVerse Technologies</b><span>Made in India · ${new Date().getFullYear()}</span></div>
+</div></footer>
+<script>
+const f=document.getElementById("tf"),m=document.getElementById("tm"),b=document.getElementById("ts");
+f.onsubmit=async(e)=>{e.preventDefault();m.className="msg";m.textContent="";b.disabled=true;
+ const d=Object.fromEntries(new FormData(f).entries());
+ try{const r=await fetch("/api/trial",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(d)});const j=await r.json();
+ if(!r.ok)throw new Error(j.error||"Couldn't send. Please try again.");f.reset();m.className="msg ok";m.textContent="Thank you. We'll call you within one working day to set up your free trial."}
+ catch(err){m.className="msg err";m.textContent=err.message}finally{b.disabled=false}};
+</script></body></html>`;
 }

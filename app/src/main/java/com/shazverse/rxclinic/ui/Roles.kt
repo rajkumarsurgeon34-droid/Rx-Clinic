@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.PriceChange
 import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.WorkspacePremium
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
@@ -709,6 +710,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
     val clinic = remember { mutableStateMapOf<String, String>() }
     var editing by remember { mutableStateOf<JSONObject?>(null) }
     var qr by remember { mutableStateOf(false) }
+    var leads by remember { mutableStateOf(false) }
 
     LaunchedEffect(refresh) {
         err = null
@@ -755,6 +757,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             item { RoleCard("Price list", "Consultation, tests, scans, rooms and inpatient charges", Icons.Filled.PriceChange) { onOpen("prices") } }
             item { RoleCard("Plan", "Bronze, Silver, Gold or Platinum; add-ons; logins in use", Icons.Filled.WorkspacePremium) { onOpen("plan") } }
             item { RoleCard("Clinic QR code", "Patients scan to book; print a poster for the desk", Icons.Filled.QrCode2) { qr = true } }
+            item { RoleCard("Free trial requests", "Clinics that asked for a trial on the website", Icons.Filled.Inbox) { leads = true } }
             item { RoleCard("Web portal", "Sign in from any computer or browser: ${vm.prefs.serverUrl.trimEnd('/')}/login", Icons.Filled.Language) {
                 runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.prefs.serverUrl.trimEnd('/') + "/login"))) }
             } }
@@ -805,6 +808,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
     }
 
     if (qr) ClinicQrDialog(vm, onDismiss = { qr = false })
+    if (leads) LeadsDialog(vm, session, onDismiss = { leads = false })
     editing?.let { u ->
         UserDialog(vm, session, u, onDone = { changed -> editing = null; if (changed) { refresh++; Toast.makeText(context, "Login saved", Toast.LENGTH_SHORT).show() } })
     }

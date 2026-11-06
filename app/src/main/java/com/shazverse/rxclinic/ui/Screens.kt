@@ -262,6 +262,9 @@ private fun HomeScreen(vm: CallViewModel, onPatient: () -> Unit, onRole: (String
         RoleCard("Diagnostics", "USG, CT scan, MRI scan, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onRole("diagnostics") }
         RoleCard("Billing", "OPD bills, patient totals, inpatient billing", Icons.AutoMirrored.Filled.ReceiptLong) { onRole("billing") }
         RoleCard("Admin", "Overview, logins, price list, every section", Icons.Filled.AdminPanelSettings) { onRole("admin") }
+        val ctx = androidx.compose.ui.platform.LocalContext.current
+        TextButton(onClick = { runCatching { ctx.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.prefs.serverUrl.trimEnd('/') + "/home"))) } },
+            modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp)) { Text("About Rx Clinic · plans · free trial", color = Ui.Teal) }
         Spacer(Modifier.height(24.dp))
     }
 }
