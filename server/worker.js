@@ -1158,10 +1158,12 @@ async function handle(request, env) {
     // ----- investigation orders: lab and diagnostics -----
     case "/api/orders/create": {
       await requireStaff(env, body.session, ["doctor"]);
-      const visitId = String(body.visitId || "");
-      const v = await getDoc(env, "visits", visitId);
+      const admissionId = String(body.admissionId || "");
+      const visitId = admissionId ? "ip:" + admissionId : String(body.visitId || "");
+      const v = admissionId ? await getDoc(env, "admissions", admissionId) : await getDoc(env, "visits", visitId);
       if (!v) throw new HttpError(404, "Visit not found");
-      const existing = await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [visitId]);
+      if (admissionId) v.token = v.no;
+      const existing = (await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", [visitId])).filter((o) => !admissionId || o.date === clinicNow(env).date);
       const have = new Set(existing.map((o) => o.test.toLowerCase()));
       const { date } = clinicNow(env);
       const made = [];
@@ -1309,6 +1311,142 @@ async function handle(request, env) {
       });
     }
 
+    // ----- HMIS: inpatient chart -----
+    case "/api/hmis/ip/chart": {
+      const me = await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      await needFeature(env, "ip");
+      const id = String(body.admissionId || "");
+      const a = await getDoc(env, "admissions", id);
+      if (!a) throw new HttpError(404, "Admission not found");
+      a.id = id;
+      const pid = a.patient?.id || "";
+      const p = pid ? await getDoc(env, "patients", pid) : null;
+      const orders = await listDocs(env, "orders", "json_extract(data, '$.visitId') = ?", ["ip:" + id]);
+      const surgeries = (await listDocs(env, "requests", "json_extract(data, '$.type') = 'surgery'")).filter((r) => r.admissionId === id || (pid && r.patient?.id === pid && r.date >= new Date(a.admittedAt + 330 * 60000).toISOString().slice(0, 10)));
+      const deptBills = await listDocs(env, "bills", "json_extract(data, '$.admissionId') = ?", [id]);
+      return json({ me: { name: me.user.name, role: me.role }, admission: a, patient: p ? publicPatient(pid, p) : a.patient, flags: { allergy: p?.allergy || "", remarks: p?.remarks || "" },
+        account: await ipAccount(env, a), orders: orders.sort((x, y) => x.orderedAt - y.orderedAt), surgeries, history: pid ? (await patientHistory(env, pid)).slice(0, 10) : [],
+        deptBills: deptBills.map((b) => ({ id: b.id, no: b.no, deptName: b.deptName, total: b.total, status: b.status })),
+        finalBill: a.finalBillId ? Object.assign({ id: a.finalBillId }, await getDoc(env, "bills", a.finalBillId)) : null });
+    }
+
+    case "/api/hmis/ip/record": {
+      // Clinical entries on an admission: progress notes and ward rounds, nursing notes, vitals, medicine orders, doses given, discharge summary.
+      const me = await requireUser(env, body.session, ["doctor", "staff"]);
+      const id = String(body.admissionId || "");
+      const a = await getDoc(env, "admissions", id);
+      if (!a) throw new HttpError(404, "Admission not found");
+      const by = me.user.name || me.role, at = Date.now(), kind = String(body.kind || "");
+      const rid = () => randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 8);
+      const txt = (x, n = 4000) => clean(x, n);
+      if (kind === "note") {
+        const t = ["round", "progress", "nursing", "procedure"].includes(body.type) ? body.type : "progress";
+        if (t !== "nursing" && me.role === "staff") throw new HttpError(403, "Nurses add nursing notes");
+        const f = {};
+        for (const [k, x] of Object.entries(body.fields || {}).slice(0, 20)) f[clean(k, 40)] = txt(x);
+        a.notes = (a.notes || []).concat([{ id: rid(), type: t, fields: f, at, by, role: me.role }]).slice(-300);
+      } else if (kind === "vitals") {
+        const vit = {};
+        for (const k of ["temp", "pulse", "bp", "rr", "spo2", "o2", "rbs", "pain", "intake", "output", "gcs"]) vit[k] = clean(body.vitals?.[k], 12);
+        a.vitalsLog = (a.vitalsLog || []).concat([{ at, by, vitals: vit, note: txt(body.note, 300) }]).slice(-500);
+      } else if (kind === "drug") {
+        if (me.role === "staff") throw new HttpError(403, "Only doctors order medicines");
+        const d = body.drug || {};
+        if (!clean(d.name, 120)) throw new HttpError(400, "Enter the medicine");
+        a.drugs = (a.drugs || []).concat([{ id: rid(), name: clean(d.name, 120), dose: clean(d.dose, 40), route: clean(d.route, 20) || "Oral", freq: clean(d.freq, 30) || "BD",
+          times: clean(d.times, 60), notes: clean(d.notes, 200), start: at, by, active: true }]).slice(-200);
+      } else if (kind === "drugStop") {
+        if (me.role === "staff") throw new HttpError(403, "Only doctors stop medicines");
+        for (const d of a.drugs || []) if (d.id === body.drugId) { d.active = false; d.stoppedAt = at; d.stoppedBy = by; }
+      } else if (kind === "dose") {
+        const d = (a.drugs || []).find((x) => x.id === body.drugId);
+        if (!d) throw new HttpError(404, "Medicine not found");
+        a.mar = (a.mar || []).concat([{ id: rid(), drugId: d.id, drug: d.name + " " + d.dose, status: body.status === "held" ? "held" : body.status === "refused" ? "refused" : "given", note: txt(body.note, 200), at, by }]).slice(-2000);
+      } else if (kind === "discharge") {
+        if (me.role === "staff") throw new HttpError(403, "Only doctors write the discharge summary");
+        const f = {};
+        for (const [k, x] of Object.entries(body.fields || {}).slice(0, 20)) f[clean(k, 40)] = txt(x, 6000);
+        a.dischargeSummary = { fields: f, at, by, final: !!body.final };
+      } else throw new HttpError(400, "Unknown entry");
+      await putDoc(env, "admissions", id, a);
+      return json({ ok: true });
+    }
+
+    // ----- operation theatre -----
+    case "/api/ot/list": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      await needFeature(env, "ot");
+      const from = String(body.from || clinicNow(env).date), to = String(body.to || addDays(from, 7));
+      const list = (await listDocs(env, "requests", "json_extract(data, '$.type') = 'surgery'"))
+        .filter((r) => (r.date >= from && r.date <= to) || (r.ot?.status === "in-theatre"))
+        .sort((x, y) => (x.date + (x.ot?.time || x.fields.time || "")).localeCompare(y.date + (y.ot?.time || y.fields.time || "")));
+      return json({ from, to, surgeries: list });
+    }
+
+    case "/api/ot/get": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const r = await getDoc(env, "requests", String(body.id || ""));
+      if (!r || r.type !== "surgery") throw new HttpError(404, "Surgery not found");
+      const pid = r.patient?.id;
+      const adm = r.admissionId ? await getDoc(env, "admissions", r.admissionId) : pid ? await activeAdmission(env, pid) : null;
+      const p = pid ? await getDoc(env, "patients", pid) : null;
+      return json({ surgery: Object.assign({ id: String(body.id) }, r), admission: adm ? { id: adm.id || r.admissionId, no: adm.no, ward: adm.ward, bed: adm.bed, status: adm.status } : null,
+        allergy: p?.allergy || "", tariff: await tariff(env, "ip") });
+    }
+
+    case "/api/ot/update": {
+      // Schedule, checklists, operation notes, post-op orders and monitoring, and OT charges.
+      const me = await requireUser(env, body.session, ["doctor", "staff"]);
+      await needFeature(env, "ot");
+      const id = String(body.id || "");
+      const r = await getDoc(env, "requests", id);
+      if (!r || r.type !== "surgery") throw new HttpError(404, "Surgery not found");
+      const by = me.user.name || me.role, at = Date.now();
+      r.ot = r.ot || { status: "scheduled", log: [] };
+      const ot = r.ot;
+      const put = (k, v) => { ot[k] = v; };
+      const cleanObj = (o, n = 2000) => Object.fromEntries(Object.entries(o || {}).slice(0, 40).map(([k, v]) => [clean(k, 60), typeof v === "boolean" ? v : clean(v, n)]));
+      if (body.schedule) {
+        const sc = body.schedule;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(sc.date || "")) r.date = sc.date;
+        put("time", clean(sc.time, 5)); put("theatre", clean(sc.theatre, 30)); put("team", cleanObj(sc.team, 120));
+      }
+      if (body.status) {
+        const st = ["scheduled", "in-theatre", "done", "cancelled", "postponed"].includes(body.status) ? body.status : ot.status;
+        ot.status = st;
+        if (st === "in-theatre") ot.inAt = at;
+        if (st === "done") { ot.outAt = at; r.status = "done"; }
+        if (st === "cancelled") r.status = "cancelled";
+      }
+      if (body.preop) put("preop", Object.assign(cleanObj(body.preop), { by, at }));
+      if (body.who) put("who", Object.assign(ot.who || {}, cleanObj(body.who), { by, at }));
+      if (body.opnote) {
+        if (me.role !== "doctor" && me.role !== "admin") throw new HttpError(403, "Only doctors write the operation notes");
+        put("opnote", Object.assign(cleanObj(body.opnote, 6000), { by, at }));
+      }
+      if (body.postop) {
+        if (me.role !== "doctor" && me.role !== "admin") throw new HttpError(403, "Only doctors write post-op orders");
+        put("postop", Object.assign(cleanObj(body.postop, 4000), { by, at }));
+      }
+      if (body.obs) ot.obs = (ot.obs || []).concat([{ ...cleanObj(body.obs, 200), by, at }]).slice(-200);
+      if (body.charges) {
+        // Post OT charges to the inpatient account (once).
+        if (ot.charged) throw new HttpError(409, "OT charges are already on the bill");
+        const adm = r.admissionId ? await getDoc(env, "admissions", r.admissionId) : r.patient?.id ? await activeAdmission(env, r.patient.id) : null;
+        const admId = r.admissionId || adm?.id;
+        if (!adm || adm.status !== "admitted") throw new HttpError(400, "Admit the patient first; OT charges go on the inpatient bill");
+        const lines = (Array.isArray(body.charges) ? body.charges : []).slice(0, 20).map((c) => ({ desc: clean(c.desc, 160), qty: Math.max(0, Number(c.qty) || 1), rate: Math.max(0, money(c.rate)) })).filter((c) => c.desc && c.rate > 0);
+        if (!lines.length) throw new HttpError(400, "Add at least one charge");
+        adm.charges = (adm.charges || []).concat(lines.map((c) => ({ id: randomFrom("abcdefghijkmnpqrstuvwxyz23456789", 8), desc: `${c.desc} (${r.fields.procedure || "surgery"})`, qty: c.qty, rate: c.rate, amount: money(c.qty * c.rate), date: clinicNow(env).date, by })));
+        delete adm.id;
+        await putDoc(env, "admissions", admId, adm);
+        ot.charged = { at, by, total: money(lines.reduce((x, c) => x + c.qty * c.rate, 0)) };
+      }
+      ot.log = (ot.log || []).concat([{ at, by, what: Object.keys(body).filter((k) => !["session", "id"].includes(k)).join(", ") }]).slice(-100);
+      await putDoc(env, "requests", id, r);
+      return json({ surgery: Object.assign({ id }, r) });
+    }
+
     // ----- HMIS web: doctor's dashboard and patient chart -----
     case "/api/hmis/dashboard": {
       const me = await requireUser(env, body.session, ["doctor", "staff", "billing"]);
@@ -1329,7 +1467,7 @@ async function handle(request, env) {
           review, complaint: visitSummary(v.id, v).complaint, orders: { total: os.length, done: os.filter((o) => o.status === "reported").length }, doctor: v.doctor?.name || "" });
         if (pid) seen.add(pid);
       }
-      for (const a of admitted) rows.push({ id: "", admissionId: a.id, kind: "IP", regNo: a.patient?.id || "", token: a.no, at: a.admittedAt, patient: a.patient, status: "admitted", ward: `${a.ward} ${a.bed}`.trim(), doctor: a.doctor, orders: { total: 0, done: 0 } });
+      for (const a of admitted) rows.push({ id: "", admissionId: a.id, day: Math.max(1, Math.ceil((Date.now() - a.admittedAt) / 86400000)), kind: "IP", regNo: a.patient?.id || "", token: a.no, at: a.admittedAt, patient: a.patient, status: "admitted", ward: `${a.ward} ${a.bed}`.trim(), doctor: a.doctor, orders: { total: 0, done: 0 } });
       rows.sort((a, b) => (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0) || (a.kind === b.kind ? (a.at || 0) - (b.at || 0) : a.kind === "OP" ? -1 : 1));
       const today = date === clinicNow(env).date;
       return json({ date, me: { name: me.user.name, role: me.role },
@@ -1338,7 +1476,7 @@ async function handle(request, env) {
           outpatient: { total: visits.length, new: rows.filter((r) => r.kind === "OP" && !r.review).length, review: rows.filter((r) => r.kind === "OP" && r.review).length, emergency: visits.filter((v) => v.urgent).length },
           inpatient: { total: admitted.length, today: admitted.filter((a) => new Date(a.admittedAt + 330 * 60000).toISOString().slice(0, 10) === date).length, existing: admitted.filter((a) => new Date(a.admittedAt + 330 * 60000).toISOString().slice(0, 10) !== date).length },
           investigation: { total: orders.length, inProgress: orders.filter((o) => o.status !== "reported").length, completed: orders.filter((o) => o.status === "reported").length },
-          surgery: { total: ots.length, scheduled: ots.filter((r) => r.status !== "done").length, completed: ots.filter((r) => r.status === "done").length },
+          surgery: { total: ots.filter((r) => r.date === date).length, scheduled: ots.filter((r) => r.date === date && !["done", "cancelled"].includes(r.ot?.status || r.status)).length, completed: ots.filter((r) => r.date === date && (r.ot?.status || r.status) === "done").length },
         }, rows, today });
     }
 
@@ -1411,11 +1549,11 @@ async function handle(request, env) {
       const type = String(body.type || "");
       if (!["consult", "surgery", "diet"].includes(type)) throw new HttpError(400, "Unknown request");
       if (type === "surgery") await needFeature(env, "ot");
-      const v = await getDoc(env, "visits", String(body.visitId || ""));
-      if (!v) throw new HttpError(404, "Visit not found");
+      const v = body.admissionId ? await getDoc(env, "admissions", String(body.admissionId)) : await getDoc(env, "visits", String(body.visitId || ""));
+      if (!v) throw new HttpError(404, "Patient record not found");
       const f = {};
       for (const [k, x] of Object.entries(body.fields || {}).slice(0, 30)) f[clean(k, 40)] = clean(x, 1500);
-      const r = { type, visitId: String(body.visitId), patient: billPatient(v.patient || {}), fields: f, toDoctor: clean(body.toDoctor, 80), status: "open",
+      const r = { type, visitId: String(body.visitId || ""), admissionId: String(body.admissionId || ""), admissionNo: v.no || "", patient: billPatient(v.patient || {}), fields: f, toDoctor: clean(body.toDoctor, 80), status: "open",
         date: /^\d{4}-\d{2}-\d{2}$/.test(f.date || "") ? f.date : clinicNow(env).date, created: Date.now(), by: me.user.name || me.role, byId: me.uid };
       const id = crypto.randomUUID();
       await putDoc(env, "requests", id, r);
@@ -1612,7 +1750,8 @@ async function handle(request, env) {
       if (!DEPTS[dept] || dept === "ip") throw new HttpError(400, "Unknown department");
       const me = await requireUser(env, body.session, DEPT_ROLES[dept]);
       if (!canDept(me.role, dept)) throw new HttpError(403, "Your login can't bill for this department");
-      const v = body.visitId ? await getDoc(env, "visits", String(body.visitId)) : null;
+      const vid = String(body.visitId || "");
+      const v = vid ? (vid.startsWith("ip:") ? await getDoc(env, "admissions", vid.slice(3)) : await getDoc(env, "visits", vid)) : null;
       let patient = billPatient(v?.patient || {});
       if (!v && body.patientId) {
         const p = await getDoc(env, "patients", String(body.patientId).toUpperCase());
@@ -2012,7 +2151,7 @@ h1{font:600 30px/1.2 "Segoe UI",system-ui;text-align:center;margin:4px 0 4px}
 const $=(i)=>document.getElementById(i);
 const store=()=>{try{return localStorage.getItem("rx_remember")==="0"?sessionStorage:localStorage}catch{return null}};
 const NEXT=(new URLSearchParams(location.search).get("next")||"").replace(/[^a-z/]/g,"");
-const dest=(role)=>NEXT||(["doctor","staff","admin"].includes(role)?"/hmis":"/portal");
+const dest=(role)=>NEXT||(["doctor","staff","admin","billing"].includes(role)?"/hmis":"/portal");
 try{const s=localStorage.getItem("rx_session")||sessionStorage.getItem("rx_session");if(s&&!location.hash.includes("new"))location.replace(dest(localStorage.getItem("rx_role")||sessionStorage.getItem("rx_role")))}catch{}
 try{$("u").value=localStorage.getItem("rx_user")||""}catch{}
 $("eye").onclick=()=>{const t=$("p").type==="password";$("p").type=t?"text":"password";$("eye").textContent=t?"Hide":"Show"};
@@ -2359,7 +2498,7 @@ label.f{display:grid;gap:4px;font-size:12px;color:var(--muted);font-weight:600}l
 <script>
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 // The Rx Clinic app opens /hmis#s=<session> so the signed-in user doesn't sign in again.
-(()=>{const m=location.hash.match(/^#s=([^&]+)(?:&r=(\w+))?/);if(m){try{sessionStorage.setItem("rx_session",decodeURIComponent(m[1]));if(m[2])sessionStorage.setItem("rx_role",m[2])}catch{}history.replaceState(null,"","/hmis")}})();
+(()=>{const m=location.hash.match(/^#s=([^&]+)(?:&r=(\\w+))?(?:&go=([\\w-]+))?/);if(m){try{sessionStorage.setItem("rx_session",decodeURIComponent(m[1]));if(m[2])sessionStorage.setItem("rx_role",m[2])}catch{}history.replaceState(null,"","/hmis"+(m[3]?"#"+m[3]:""))}})();
 const store=(()=>{try{return sessionStorage.getItem("rx_session")?sessionStorage:localStorage.getItem("rx_session")?localStorage:sessionStorage}catch{return null}})();
 const session=store&&store.getItem("rx_session");if(!session)location.replace("/login?next=/hmis");
 const esc=(s)=>String(s??"").replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -2377,7 +2516,7 @@ const IC={cal:'<path d="M3 5h18v16H3zM3 10h18M8 3v4M16 3v4"/>',op:'<circle cx="9
 const ic=(k,c="currentColor")=>'<svg viewBox="0 0 24 24" fill="none" stroke="'+c+'" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+IC[k]+'</svg>';
 let ME={},DASH=null,FILTER="all";
 
-async function route(){const m=location.hash.match(/^#v-(.+)$/);if(m)return chart(m[1]);return dashboard()}
+async function route(){const h=location.hash;let m;if((m=h.match(/^#v-(.+)$/)))return chart(m[1]);if((m=h.match(/^#ip-(.+)$/)))return ipChart(m[1]);if((m=h.match(/^#ot-(.+)$/)))return otRecord(m[1]);if(h==="#ot")return otList();return dashboard()}
 window.onhashchange=route;
 
 // ---------- dashboard ----------
@@ -2387,14 +2526,14 @@ async function dashboard(date){
  ME=DASH.me;$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role;
  const t=DASH.tiles;
  const tile=(cls,i,n,label,sub,f)=>'<div class="tile" data-f="'+f+'" style="background:var(--'+cls+')">'+ic(i,"var(--"+cls+"i)")+'<b>'+n+'</b><span class="n">'+label+'</span><div class="s">'+sub.map(([k,v])=>k+' <i>'+v+'</i>').join("")+'</div></div>';
- app.innerHTML='<div class="bar2"><h1>'+esc(ME.name||"")+'</h1><div class="sp"></div><input type="date" id="dd" class="chip" value="'+DASH.date+'"><button class="chip" id="rf">Refresh</button></div>'+
+ app.innerHTML='<div class="bar2"><h1>'+esc(ME.name||"")+'</h1><div class="sp"></div><a class="chip" href="#ot" style="text-decoration:none;color:inherit">Theatre list</a><input type="date" id="dd" class="chip" value="'+DASH.date+'"><button class="chip" id="rf">Refresh</button></div>'+
  '<div class="tiles">'+tile("t1","cal",t.appointment.total,"Appointment",[["Phone",t.appointment.phone],["Online",t.appointment.online],["Video",t.appointment.video]],"appt")+
  tile("t2","op",t.outpatient.total,"Outpatient",[["New",t.outpatient.new],["Review",t.outpatient.review],["Emergency",t.outpatient.emergency]],"OP")+
  tile("t3","ip",t.inpatient.total,"Inpatients",[["Today",t.inpatient.today],["Existing",t.inpatient.existing]],"IP")+
  tile("t4","inv",t.investigation.total,"Investigation",[["In progress",t.investigation.inProgress],["Completed",t.investigation.completed]],"inv")+
  tile("t5","sx",t.surgery.total,"Surgery",[["Scheduled",t.surgery.scheduled],["Completed",t.surgery.completed]],"sx")+'</div>'+
  '<div class="bar2"><div id="fl"></div><div class="sp"></div><input id="ps" class="chip" placeholder="My patient search" style="min-width:200px"></div><div class="tbl-wrap" id="tw"></div>';
- $$(".tile").forEach(x=>x.onclick=()=>{const f=x.dataset.f;FILTER=f==="OP"||f==="IP"?f:f==="inv"?"inv":"all";drawRows()});
+ $$(".tile").forEach(x=>x.onclick=()=>{const f=x.dataset.f;if(f==="sx"){location.hash="ot";return}FILTER=f==="OP"||f==="IP"?f:f==="inv"?"inv":"all";drawRows()});
  $("#dd").onchange=(e)=>dashboard(e.target.value);$("#rf").onclick=()=>dashboard($("#dd").value);$("#ps").oninput=drawRows;drawRows();
 }
 function drawRows(){
@@ -2404,8 +2543,8 @@ function drawRows(){
  const rows=DASH.rows.filter(r=>(FILTER==="all"||(FILTER==="urgent"?r.urgent:FILTER==="inv"?r.orders.total>0:r.kind===FILTER))&&(!q||(r.patient?.name+" "+r.regNo+" "+(r.patient?.phone||"")).toLowerCase().includes(q)));
  const st=(r)=>r.urgent?'<span class="pill red">Emergency</span>':r.status==="admitted"?'<span class="pill">Admitted</span>':r.status==="sent"?'<span class="pill grn">Seen · Rx sent</span>':r.status==="dispensed"?'<span class="pill grn">Seen · dispensed</span>':r.status==="seen"||r.status==="done"?'<span class="pill grn">Seen</span>':'<span class="pill amb">Not seen</span>';
  $("#tw").innerHTML='<table><thead><tr><th>Reg no</th><th>Token / IP no</th><th>Encounter</th><th>Patient name</th><th>Complaint</th><th>Status</th><th>Ward</th><th>Order status</th><th>Action</th></tr></thead><tbody>'+
- (rows.length?rows.map(r=>'<tr class="r" data-v="'+esc(r.id)+'" data-a="'+esc(r.admissionId||"")+'"><td>'+esc(r.regNo||"—")+' · '+r.kind+'</td><td>'+esc(r.token)+'</td><td>'+tm(r.at)+'</td><td class="pn"><b>'+esc(r.patient?.name)+'</b><small>'+esc([r.patient?.age?r.patient.age+"Y":"",r.patient?.sex].filter(Boolean).join(" / "))+(r.review?" · Review":r.kind==="OP"?" · New":"")+'</small></td><td>'+esc(r.complaint||"")+'</td><td>'+st(r)+'</td><td>'+esc(r.ward||"")+'</td><td>'+(r.orders.total?'<span class="prog"><i style="width:'+Math.round(r.orders.done/r.orders.total*100)+'%"></i></span>'+r.orders.done+'/'+r.orders.total:"")+'</td><td><button class="btn">Open</button></td></tr>').join(""):'<tr><td colspan="9" class="empty">No patients'+(DASH.today?" yet today":"")+'.</td></tr>')+'</tbody></table><div style="padding:8px 10px;color:var(--muted);font-size:12px">Showing '+rows.length+' of '+DASH.rows.length+' records</div>';
- $$("#tw tr.r").forEach(tr=>tr.onclick=()=>{if(tr.dataset.v)location.hash="v-"+tr.dataset.v;else toast("Open inpatient accounts in the Rx Clinic app (Billing → Inpatients).")});
+ (rows.length?rows.map(r=>'<tr class="r" data-v="'+esc(r.id)+'" data-a="'+esc(r.admissionId||"")+'"><td>'+esc(r.regNo||"—")+' · '+r.kind+'</td><td>'+esc(r.token)+'</td><td>'+tm(r.at)+'</td><td class="pn"><b>'+esc(r.patient?.name)+'</b><small>'+esc([r.patient?.age?r.patient.age+"Y":"",r.patient?.sex].filter(Boolean).join(" / "))+(r.review?" · Review":r.kind==="OP"?" · New":"")+'</small></td><td>'+esc(r.complaint||"")+'</td><td>'+st(r)+'</td><td>'+esc(r.ward||"")+(r.day?' · day '+r.day:"")+'</td><td>'+(r.orders.total?'<span class="prog"><i style="width:'+Math.round(r.orders.done/r.orders.total*100)+'%"></i></span>'+r.orders.done+'/'+r.orders.total:"")+'</td><td><button class="btn">Open</button></td></tr>').join(""):'<tr><td colspan="9" class="empty">No patients'+(DASH.today?" yet today":"")+'.</td></tr>')+'</tbody></table><div style="padding:8px 10px;color:var(--muted);font-size:12px">Showing '+rows.length+' of '+DASH.rows.length+' records</div>';
+ $$("#tw tr.r").forEach(tr=>tr.onclick=()=>{location.hash=tr.dataset.v?"v-"+tr.dataset.v:"ip-"+tr.dataset.a});
 }
 $("#q").onkeydown=async(e)=>{if(e.key!=="Enter")return;const q=e.target.value.trim();if(q.length<2)return;
  try{const r=await api("/api/patients/search",{q});if(!r.patients.length)return toast("No patient found");
@@ -2578,6 +2717,214 @@ async function paneRequests(){
   $$("[data-tp]",f).forEach(b=>b.onclick=()=>{$("#dt").value=($("#dt").value?$("#dt").value+"\\n":"")+T[b.dataset.tp]});
   $("#ds").onclick=()=>{if(!$("#dt").value.trim())return toast("Write the advice");send("diet",{diet:$("#dt").value})}}
 }
+// ---------- shared form helpers ----------
+const fld=(k,l,o={})=>o.rows?'<label class="f">'+l+'<textarea name="'+k+'" rows="'+o.rows+'">'+esc(o.v||"")+'</textarea></label>'
+ :o.opts?'<label class="f">'+l+'<select name="'+k+'">'+o.opts.map(x=>'<option'+(x===o.v?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select></label>'
+ :'<label class="f">'+l+'<input name="'+k+'" type="'+(o.type||"text")+'" value="'+esc(o.v||"")+'"'+(o.list?' list="'+o.list+'"':"")+(o.ph?' placeholder="'+esc(o.ph)+'"':"")+'></label>';
+const ckl=(k,items,val={})=>'<div class="cks" style="flex-direction:column;gap:8px">'+items.map(([n,l])=>'<label><input type="checkbox" name="'+k+"."+n+'"'+(val[n]===true||val[n]==="true"?" checked":"")+'>'+esc(l)+'</label>').join("")+'</div>';
+function readForm(root){const o={};$$("input,select,textarea",root).forEach(x=>{if(!x.name)return;if(x.type==="checkbox"){const [g,n]=x.name.split(".");if(n){(o[g]=o[g]||{})[n]=x.checked}else o[x.name]=x.checked}else o[x.name]=x.value.trim()});return o}
+const isDoc=()=>ME.role==="doctor"||ME.role==="admin";
+const isBill=()=>ME.role==="billing"||ME.role==="admin";
+const inr=(x)=>"₹"+Math.round(x||0).toLocaleString("en-IN");
+async function aiJson(prompt){const r=await api("/api/ai",{prompt,json:true});if(!r.json)throw new Error("The AI gave no answer. Try again.");return r.json}
+
+// ---------- inpatient chart ----------
+let IPD=null,ITAB="over";
+async function ipChart(id,keep){
+ try{IPD=await api("/api/hmis/ip/chart",{admissionId:id})}catch(e){$("#app").innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
+ ME=IPD.me;$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role;
+ if(!keep)ITAB="over";drawIp();
+}
+function ipVitals(){const l=IPD.admission.vitalsLog||[];return l.length?l[l.length-1].vitals:{}}
+function drawIp(){
+ const a=IPD.admission,p=IPD.patient||a.patient||{},vit=ipVitals(),day=Math.max(1,Math.ceil(((a.dischargedAt||Date.now())-a.admittedAt)/864e5));
+ const side='<aside class="side"><div class="ban" style="background:#9fd8cf">'+esc(p.name)+'</div><div class="id"><div class="av">'+esc((p.name||"?").trim()[0])+'</div><div><b>'+esc(p.id||"")+'</b><br><small>'+esc([p.age?p.age+"Y":"",p.sex].filter(Boolean).join(" / "))+'</small><br><span class="pill '+(a.status==="admitted"?"":"grn")+'">'+(a.status==="admitted"?"IP · day "+day:"Discharged")+'</span></div></div>'+
+ '<dl><dt>IP number</dt><dd>'+esc(a.no)+'</dd><dt>Ward / bed</dt><dd>'+esc(a.ward)+' · '+esc(a.bed||"–")+'</dd><dt>Admitted</dt><dd>'+tm(a.admittedAt)+'</dd>'+(a.dischargedAt?'<dt>Discharged</dt><dd>'+tm(a.dischargedAt)+'</dd>':"")+'<dt>Consultant</dt><dd>'+esc(a.doctor||"")+'</dd><dt>Reason</dt><dd>'+esc(a.reason||"")+'</dd></dl>'+
+ '<h4>Latest vitals <button data-it="nurse" title="Add vitals">+</button></h4><div class="vit">'+[["temp","Temp","°F"],["pulse","Pulse",""],["bp","BP",""],["rr","RR",""],["spo2","SpO₂","%"],["rbs","RBS",""],["pain","Pain",""]].map(([k,l,u])=>'<span>'+l+'</span><b class="'+(hi(k,vit[k])?"hi":"")+'">'+(vit[k]?esc(vit[k])+(u?" "+u:""):"–")+'</b>').join("")+'</div>'+
+ '<h4>Allergy</h4><p style="color:'+(IPD.flags.allergy?"var(--red)":"inherit")+'">'+esc(IPD.flags.allergy||"–")+'</p><div style="padding:8px 10px"><button class="btn" onclick="location.hash=\\'\\'">‹ All patients</button></div></aside>';
+ const tabs=[["over","Overview","home"],["round","Ward rounds","asmt"],["nurse","Nursing","mon"],["meds","Medicines","med"],["ord","Orders & results","res"],["sx","Surgery","req"],["bill","Billing","ord"],["dis","Discharge","hist"]];
+ $("#app").innerHTML='<div class="chart">'+side+'<section><div class="tabs">'+tabs.map(([k,l,i])=>'<button data-t="'+k+'" class="'+(ITAB===k?"on":"")+'">'+ic(i)+l+'</button>').join("")+'</div><div id="pane"></div></section></div>';
+ $$(".tabs button").forEach(b=>b.onclick=()=>{ITAB=b.dataset.t;drawIp()});$$("[data-it]").forEach(b=>b.onclick=()=>{ITAB=b.dataset.it;drawIp()});
+ ({over:ipOver,round:ipRounds,nurse:ipNursing,meds:ipMeds,ord:ipOrders,sx:ipSurgery,bill:ipBill,dis:ipDischarge}[ITAB])();
+}
+async function ipRec(kind,b){const a=IPD.admission;try{await api("/api/hmis/ip/record",Object.assign({admissionId:a.id,kind},b));toast("Saved");ipChart(a.id,true)}catch(e){toast(e.message)}}
+const noteHtml=(n)=>'<div class="note"><h5>'+esc({round:"Ward round",progress:"Progress note",nursing:"Nursing note",procedure:"Procedure note"}[n.type]||n.type)+'</h5><div class="m">'+tm(n.at)+' · '+esc(n.by)+'</div><dl>'+Object.entries(n.fields).filter(([,x])=>x).map(([k,x])=>'<dt>'+esc(k)+'</dt><dd>'+esc(x)+'</dd>').join("")+'</dl></div>';
+function ipOver(){
+ const a=IPD.admission,acc=IPD.account,act=(a.drugs||[]).filter(d=>d.active);
+ const notes=(a.notes||[]).filter(n=>n.type!=="nursing").slice(-3).reverse();
+ $("#pane").innerHTML='<div class="grid2">'+
+ '<div class="panel"><h3>Latest rounds</h3><div class="pb">'+(notes.map(noteHtml).join("")||'<div class="empty">No ward round notes yet.</div>')+'</div></div>'+
+ panel("Active medicines",["Medicine","Route","Frequency","Since"],act.map(d=>'<tr><td><b>'+esc(d.name)+'</b> '+esc(d.dose)+'</td><td>'+esc(d.route)+'</td><td>'+esc(d.freq)+'</td><td>'+tm(d.start).slice(0,10)+'</td></tr>'),"No medicines ordered")+
+ panel("Investigations",["Test","Status","Ordered"],IPD.orders.map(o=>'<tr><td>'+esc(o.test)+'</td><td>'+(o.status==="reported"?'<span class="pill grn">Reported</span>':'<span class="pill amb">'+esc(o.status)+'</span>')+'</td><td>'+tm(o.orderedAt)+'</td></tr>'),"No investigations")+
+ panel("Surgery",["Date","Procedure","Status"],IPD.surgeries.map(r=>'<tr class="r" onclick="location.hash=\\'ot-'+r.id+'\\'"><td>'+dt(r.date)+'</td><td>'+esc(r.fields.procedure)+'</td><td><span class="pill">'+esc(r.ot?.status||"scheduled")+'</span></td></tr>'),"No surgery booked")+
+ '<div class="panel"><h3>Bill so far</h3><div class="pb"><div style="display:flex;justify-content:space-between"><span>Total</span><b>'+inr(acc.total)+'</b></div><div style="display:flex;justify-content:space-between"><span>Advance</span><b style="color:var(--green)">'+inr(acc.advance)+'</b></div><div style="display:flex;justify-content:space-between"><span>'+(acc.due>=0?"Balance":"Refund")+'</span><b style="color:var(--red)">'+inr(Math.abs(acc.due))+'</b></div></div></div></div>';
+}
+function ipCase(){const a=IPD.admission,p=IPD.patient||{};
+ return "Patient: "+p.name+", "+(p.age||"?")+" y "+(p.sex||"")+". Admitted "+tm(a.admittedAt)+" (day "+Math.max(1,Math.ceil((Date.now()-a.admittedAt)/864e5))+") to "+a.ward+" for: "+(a.reason||"not stated")+". Allergy: "+(IPD.flags.allergy||"none recorded")+".\\n"+
+ "Vitals (latest first): "+(a.vitalsLog||[]).slice(-6).reverse().map(e=>tm(e.at)+" "+Object.entries(e.vitals).filter(([,x])=>x).map(([k,x])=>k+" "+x).join(", ")).join(" | ")+"\\n"+
+ "Medicines: "+(a.drugs||[]).map(d=>d.name+" "+d.dose+" "+d.route+" "+d.freq+(d.active?"":" (stopped)")).join("; ")+"\\n"+
+ "Investigations: "+IPD.orders.map(o=>o.test+": "+(o.status==="reported"?(o.impression||o.result||"").slice(0,300):o.status)).join("; ")+"\\n"+
+ "Surgery: "+IPD.surgeries.map(r=>r.fields.procedure+" on "+r.date+" ("+(r.ot?.status||"scheduled")+")"+(r.ot?.opnote?". Findings: "+(r.ot.opnote.findings||""):"")).join("; ")+"\\n"+
+ "Notes (latest last): "+(a.notes||[]).slice(-8).map(n=>n.type+" "+tm(n.at)+": "+Object.entries(n.fields).map(([k,x])=>k+": "+x).join("; ")).join("\\n")}
+function ipRounds(){
+ const a=IPD.admission,list=(a.notes||[]).filter(n=>n.type!=="nursing").slice().reverse();
+ $("#pane").innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)"><div class="panel"><h3>Ward round <small>'+tm(Date.now())+'</small></h3><div class="pb" id="rf">'+
+ (isDoc()?fld("Subjective","Subjective (patient\\'s complaints today)",{rows:2})+fld("Objective","Objective (examination, drains, wound)",{rows:3})+fld("Assessment","Assessment",{rows:2})+fld("Plan","Plan",{rows:3})+
+ '<div class="acts"><button class="btn" id="ai">AI suggestions</button><button class="btn p" id="sr">Save round</button></div><div id="aib"></div>':'<div class="empty">Doctors write ward rounds. Add nursing notes in the Nursing tab.</div>')+
+ '</div></div><div class="panel"><h3>Round notes</h3><div class="pb">'+(list.map(noteHtml).join("")||'<div class="empty">No notes yet.</div>')+'</div></div></div>';
+ if(!isDoc())return;
+ $("#sr").onclick=()=>{const f=readForm($("#rf"));if(!Object.values(f).some(Boolean))return toast("Write the round note");ipRec("note",{type:"round",fields:f})};
+ $("#ai").onclick=async()=>{const b=$("#aib");b.innerHTML='<div class="empty">Asking the AI…</div>';const f=readForm($("#rf"));
+  try{const j=await aiJson("You assist a qualified doctor on a ward round in an Indian hospital. Suggest, do not decide. Be brief and specific.\\n"+ipCase()+"\\nToday's round so far: "+JSON.stringify(f)+
+   '\\nReply with ONLY JSON: {"summary":"one line","concerns":["red flags or worsening trends"],"investigations":["tests to consider, with reason"],"medication":["changes to consider: add/stop/adjust, with reason"],"nursing":["instructions"],"discharge":{"ready":false,"why":""}}');
+   const L=(t,a)=>a&&a.length?'<b>'+t+'</b><ul style="margin:4px 0 8px;padding-left:18px">'+a.map(x=>'<li>'+esc(typeof x==="string"?x:JSON.stringify(x))+'</li>').join("")+'</ul>':"";
+   b.innerHTML='<div class="note" style="background:#eef0fb;border-color:#c9cbf0"><h5 style="color:#4447a3">AI suggestion box</h5><p style="margin:4px 0 8px">'+esc(j.summary||"")+'</p>'+L("Concerns",j.concerns)+L("Investigations to consider",j.investigations)+L("Medication to consider",j.medication)+L("Nursing",j.nursing)+
+   (j.discharge?'<b>Discharge:</b> '+(j.discharge.ready?"May be ready":"Not yet")+' · '+esc(j.discharge.why||""):"")+'<div class="acts"><button class="btn" id="cp">Copy into plan</button></div><div class="m">For the doctor to check. Nothing is applied automatically.</div></div>';
+   $("#cp").onclick=()=>{const t=$('#rf textarea[name="Plan"]');t.value=(t.value?t.value+"\\n":"")+[...(j.investigations||[]),...(j.medication||[]),...(j.nursing||[])].map(x=>"- "+(typeof x==="string"?x:JSON.stringify(x))).join("\\n")}}
+  catch(e){b.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}};
+}
+function ipNursing(){
+ const a=IPD.admission,log=(a.vitalsLog||[]).slice().reverse(),nn=(a.notes||[]).filter(n=>n.type==="nursing").slice().reverse();
+ const F=[["temp","Temp °F"],["pulse","Pulse"],["bp","BP"],["rr","Resp. rate"],["spo2","SpO₂ %"],["o2","O₂ L/min"],["rbs","RBS"],["pain","Pain 0–10"],["intake","Intake ml"],["output","Output ml"],["gcs","GCS"]];
+ $("#pane").innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.4fr)"><div style="display:grid;gap:12px"><div class="panel"><h3>Record vitals</h3><div class="pb" id="vf"><div class="fr">'+F.map(([k,l])=>fld(k,l)).join("")+'</div><div class="acts"><button class="btn p" id="vs">Save vitals</button></div></div></div>'+
+ '<div class="panel"><h3>Nursing note</h3><div class="pb" id="nf">'+fld("Note","Note (care given, wound, drain, position change, patient complaints)",{rows:3})+'<div class="acts"><button class="btn p" id="ns">Save note</button></div></div></div></div>'+
+ '<div style="display:grid;gap:12px;min-width:0">'+panel("Vitals chart",["Time","Temp","Pulse","BP","RR","SpO₂","RBS","Pain","I/O","By"],log.map(e=>{const v=e.vitals;return '<tr><td>'+tm(e.at)+'</td>'+["temp","pulse","bp","rr","spo2","rbs","pain"].map(k=>'<td style="'+(hi(k,v[k])?"color:var(--red);font-weight:700":"")+'">'+esc(v[k]||"")+'</td>').join("")+'<td>'+esc((v.intake||"")+(v.output?"/"+v.output:""))+'</td><td>'+esc(e.by)+'</td></tr>'}),"No vitals yet")+
+ '<div class="panel"><h3>Nursing notes</h3><div class="pb">'+(nn.map(noteHtml).join("")||'<div class="empty">No nursing notes yet.</div>')+'</div></div></div></div>';
+ $("#vs").onclick=()=>{const v=readForm($("#vf"));if(!Object.values(v).some(Boolean))return toast("Enter at least one value");ipRec("vitals",{vitals:v})};
+ $("#ns").onclick=()=>{const f=readForm($("#nf"));if(!f.Note)return toast("Write the note");ipRec("note",{type:"nursing",fields:f})};
+}
+let IPSTOCK=null;
+async function ipMeds(){
+ const a=IPD.admission,drugs=a.drugs||[],mar=a.mar||[],td=today();
+ if(isDoc()&&!IPSTOCK){try{IPSTOCK=(await api("/api/pharmacy/stock")).stock}catch{IPSTOCK=[]}}
+ const given=(d)=>mar.filter(m=>m.drugId===d.id&&new Date(m.at-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10)===td);
+ $("#pane").innerHTML=(isDoc()&&a.status==="admitted"?'<div class="panel" style="margin-bottom:12px"><h3>Order a medicine</h3><div class="pb" id="df"><div class="fr">'+fld("name","Medicine",{list:"ipstk",ph:"e.g. Inj Ceftriaxone"})+fld("dose","Dose",{ph:"1 g"})+fld("route","Route",{opts:["IV","IM","Oral","SC","Nebulisation","Topical","PR","SL","Infusion"]})+fld("freq","Frequency",{opts:["OD","BD","TDS","QID","Q6H","Q8H","HS","SOS","STAT","Continuous"]})+fld("times","Times",{ph:"8 am, 8 pm"})+fld("notes","Notes",{ph:"Infuse over 30 min"})+
+ '</div><datalist id="ipstk">'+(IPSTOCK||[]).map(s=>'<option value="'+esc((s.form?s.form+" ":"")+s.generic+(s.strength?" "+s.strength:""))+'">').join("")+'</datalist><div class="acts"><button class="btn p" id="da">Add to chart</button></div></div></div>':"")+
+ '<div class="panel"><h3>Medication chart <small>Today\\'s doses · tap Given or Held after each dose</small></h3><table><thead><tr><th>Medicine</th><th>Route</th><th>Frequency</th><th>Times</th><th>Given today</th><th></th></tr></thead><tbody>'+
+ (drugs.length?drugs.slice().reverse().map(d=>{const g=given(d);return '<tr style="'+(d.active?"":"opacity:.55")+'"><td><b>'+esc(d.name)+'</b> '+esc(d.dose)+(d.notes?'<br><small>'+esc(d.notes)+'</small>':"")+(d.active?"":'<br><small>Stopped '+tm(d.stoppedAt)+'</small>')+'</td><td>'+esc(d.route)+'</td><td>'+esc(d.freq)+'</td><td>'+esc(d.times||"")+'</td><td>'+(g.map(m=>'<span class="pill '+(m.status==="given"?"grn":"red")+'" title="'+esc(m.by)+'">'+new Date(m.at).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"})+(m.status==="given"?"":" "+m.status)+'</span>').join(" ")||"–")+'</td><td style="white-space:nowrap">'+
+  (d.active&&a.status==="admitted"?'<button class="btn p" data-g="'+d.id+'">Given</button> <button class="btn" data-h="'+d.id+'">Held</button>'+(isDoc()?' <button class="btn d" data-s="'+d.id+'">Stop</button>':""):"")+'</td></tr>'}).join(""):'<tr><td colspan="6" class="empty">No medicines on the chart.</td></tr>')+'</tbody></table></div>';
+ $("#da")&&($("#da").onclick=()=>{const d=readForm($("#df"));if(!d.name)return toast("Enter the medicine");ipRec("drug",{drug:d})});
+ $$("[data-g]").forEach(b=>b.onclick=()=>ipRec("dose",{drugId:b.dataset.g,status:"given"}));
+ $$("[data-h]").forEach(b=>b.onclick=()=>prompt2("Why was the dose held?","",(n)=>ipRec("dose",{drugId:b.dataset.h,status:"held",note:n})));
+ $$("[data-s]").forEach(b=>b.onclick=()=>prompt2("Stop this medicine? Add a reason (optional)","",()=>ipRec("drugStop",{drugId:b.dataset.s})));
+}
+async function ipOrders(){
+ const a=IPD.admission;if(!CAT){try{const [l,d]=await Promise.all([api("/api/tariff/list",{dept:"lab"}),api("/api/tariff/list",{dept:"diagnostics"})]);CAT=[...l.tariff.map(t=>({...t,k:"Lab"})),...d.tariff.map(t=>({...t,k:"Imaging"}))]}catch{CAT=[]}}
+ const pick=new Set();
+ $("#pane").innerHTML='<div class="grid2">'+(isDoc()&&a.status==="admitted"?'<div class="panel"><h3>New orders</h3><div class="pb"><input id="os" placeholder="Search tests and scans" style="border:1px solid var(--line);border-radius:5px;padding:7px 9px"><div class="cat" id="oc"></div><div id="sel" class="cks"></div><div class="acts"><button class="btn p" id="op">Place orders</button></div></div></div>':"")+
+ '<div class="panel"><h3>Orders and results</h3><table><thead><tr><th>Test</th><th>Status</th><th>Result</th></tr></thead><tbody>'+(IPD.orders.length?IPD.orders.slice().reverse().map(o=>'<tr><td><b>'+esc(o.test)+'</b><br><small>'+tm(o.orderedAt)+'</small></td><td>'+(o.status==="reported"?'<span class="pill grn">Reported</span>':'<span class="pill amb">'+esc(o.status)+'</span>')+'</td><td style="white-space:pre-wrap;font-size:12.5px">'+esc(o.status==="reported"?(o.result||"")+(o.impression?"\\nImpression: "+o.impression:""):"")+'</td></tr>').join(""):'<tr><td colspan="3" class="empty">No orders yet</td></tr>')+'</tbody></table></div></div>';
+ if(!$("#oc"))return;
+ const drawCat=()=>{const q=$("#os").value.toLowerCase();$("#oc").innerHTML=CAT.filter(t=>!q||t.name.toLowerCase().includes(q)).map(t=>'<label><input type="checkbox" value="'+esc(t.name)+'"'+(pick.has(t.name)?" checked":"")+'>'+esc(t.name)+'<span>'+t.k+' · '+inr(t.price)+'</span></label>').join("");
+  $$("#oc input").forEach(c=>c.onchange=()=>{c.checked?pick.add(c.value):pick.delete(c.value);$("#sel").innerHTML=[...pick].map(x=>'<span class="pill">'+esc(x)+'</span>').join(" ")})};
+ $("#os").oninput=drawCat;drawCat();
+ $("#op").onclick=async()=>{if(!pick.size)return toast("Choose at least one test");try{const r=await api("/api/orders/create",{admissionId:a.id,tests:[...pick]});toast(r.created+" order(s) sent");ipChart(a.id,true)}catch(e){toast(e.message)}};
+}
+function ipSurgery(){
+ const a=IPD.admission;
+ $("#pane").innerHTML='<div class="grid2">'+(isDoc()&&a.status==="admitted"?'<div class="panel"><h3>Book surgery</h3><div class="pb" id="sf"><div class="fr">'+fld("date","Date",{type:"date",v:today()})+fld("time","Time",{type:"time"})+'</div>'+fld("procedure","Procedure",{ph:"e.g. Laparoscopic cholecystectomy"})+'<div class="fr">'+fld("surgeon","Surgeon",{v:ME.name})+fld("anaesthetist","Anaesthetist")+fld("anaesthesia","Anaesthesia",{opts:["General","Spinal","Regional block","Local","Sedation"]})+fld("urgency","Urgency",{opts:["Elective","Urgent","Emergency"]})+'</div>'+fld("remarks","Remarks, implants, special equipment",{rows:2})+'<div class="acts"><button class="btn p" id="sb">Book</button></div></div></div>':"")+
+ panel("Surgeries",["Date","Procedure","Surgeon","Status",""],IPD.surgeries.map(r=>'<tr><td>'+dt(r.date)+' '+esc(r.ot?.time||r.fields.time||"")+'</td><td>'+esc(r.fields.procedure)+'</td><td>'+esc(r.ot?.team?.surgeon||r.fields.surgeon||"")+'</td><td><span class="pill">'+esc(r.ot?.status||"scheduled")+'</span></td><td><button class="btn" onclick="location.hash=\\'ot-'+r.id+'\\'">Open OT record</button></td></tr>'),"No surgery booked")+'</div>';
+ $("#sb")&&($("#sb").onclick=async()=>{const f=readForm($("#sf"));if(!f.procedure)return toast("Enter the procedure");try{await api("/api/hmis/request",{admissionId:a.id,type:"surgery",fields:f});toast("Surgery booked on the theatre list");ipChart(a.id,true)}catch(e){toast(e.message)}});
+}
+let IPT=null;
+async function ipBill(){
+ const a=IPD.admission,acc=IPD.account,open=a.status==="admitted",canEdit=open&&(isBill()||ME.role==="staff");
+ if(canEdit&&!IPT){try{IPT=(await api("/api/tariff/list",{dept:"ip"})).tariff}catch{IPT=[]}}
+ $("#pane").innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)">'+
+ '<div class="panel"><h3>Inpatient bill '+(open?"(running)":"(final)")+'</h3><table><thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>Amount</th></tr></thead><tbody>'+acc.lines.map(l=>'<tr><td>'+esc(l.desc)+'</td><td>'+esc(l.qty)+'</td><td>'+inr(l.rate)+'</td><td>'+inr(l.amount)+'</td></tr>').join("")+
+ '<tr><td colspan="3"><b>Total</b></td><td><b>'+inr(acc.total)+'</b></td></tr><tr><td colspan="3">Advance received</td><td style="color:var(--green)">'+inr(acc.advance)+'</td></tr><tr><td colspan="3"><b>'+(acc.due>=0?"Balance":"Refund")+'</b></td><td style="color:var(--red)"><b>'+inr(Math.abs(acc.due))+'</b></td></tr></tbody></table>'+
+ (IPD.finalBill?'<div class="pb"><button class="btn p" id="fb">View final bill '+esc(IPD.finalBill.no)+'</button></div>':"")+'</div><div style="display:grid;gap:12px;align-content:start">'+
+ (canEdit?'<div class="panel"><h3>Add charge</h3><div class="pb" id="cf"><div class="cks">'+(IPT||[]).filter(t=>t.unit!=="per day"||/nursing|oxygen/i.test(t.name)).map(t=>'<button class="chip" data-c="'+esc(t.name)+'" data-r="'+t.price+'">'+esc(t.name)+'</button>').join("")+'</div><div class="fr">'+fld("desc","Charge for")+fld("qty","Qty / days",{v:"1"})+fld("rate","Rate ₹")+'</div><div class="acts"><button class="btn p" id="ca">Add</button></div></div></div>':"")+
+ (open&&isBill()?'<div class="panel"><h3>Advance</h3><div class="pb" id="af"><div class="fr">'+fld("amount","Amount ₹")+fld("mode","Mode",{opts:["Cash","UPI","Card","Insurance"]})+'</div><div class="acts"><button class="btn p" id="aa">Save advance</button></div></div></div>'+
+ '<div class="panel"><h3>Discharge and final bill</h3><div class="pb" id="xf"><div class="fr">'+fld("discount","Discount ₹",{v:"0"})+fld("amount","Received now ₹",{v:String(Math.max(0,Math.round(acc.due)))})+fld("mode","Mode",{opts:["Cash","UPI","Card","Insurance"]})+'</div><div class="acts"><button class="btn p" id="xd">Discharge & make final bill</button></div></div></div>':"")+
+ panel("Department bills on this account",["Bill","Department","Amount"],IPD.deptBills.map(b=>'<tr><td>'+esc(b.no)+'</td><td>'+esc(b.deptName)+'</td><td>'+inr(b.total)+'</td></tr>'),"None")+'</div></div>';
+ $$("[data-c]").forEach(b=>b.onclick=()=>{$('#cf input[name=desc]').value=b.dataset.c;$('#cf input[name=rate]').value=b.dataset.r});
+ const up=async(body,msg)=>{try{await api("/api/ip/update",Object.assign({id:a.id},body));toast(msg);ipChart(a.id,true)}catch(e){toast(e.message)}};
+ $("#ca")&&($("#ca").onclick=()=>{const f=readForm($("#cf"));if(!f.desc)return toast("Enter the charge");up({charge:{desc:f.desc,qty:+f.qty||1,rate:+f.rate||0}},"Charge added")});
+ $("#aa")&&($("#aa").onclick=()=>{const f=readForm($("#af"));if(!(+f.amount>0))return toast("Enter the amount");up({deposit:{amount:+f.amount,mode:f.mode}},"Advance saved")});
+ $("#xd")&&($("#xd").onclick=async()=>{const f=readForm($("#xf"));try{const r=await api("/api/ip/discharge",{id:a.id,discount:+f.discount||0,pay:+f.amount>0?{amount:+f.amount,mode:f.mode}:undefined});toast("Discharged · final bill "+r.bill.no);ipChart(a.id,true)}catch(e){toast(e.message)}});
+ $("#fb")&&($("#fb").onclick=()=>{const b=IPD.finalBill;modal('<div class="rep"><h2>Inpatient final bill '+esc(b.no)+'</h2><p>'+esc(b.patient.name)+' · '+esc(b.patient.id)+' · '+esc(a.no)+' · '+tm(b.admittedAt)+' to '+tm(b.dischargedAt)+'</p><table><thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>Amount</th></tr></thead><tbody>'+b.items.map(i=>'<tr><td>'+esc(i.desc)+'</td><td>'+i.qty+'</td><td>'+inr(i.rate)+'</td><td>'+inr(i.amount)+'</td></tr>').join("")+'<tr><td colspan="3">Discount</td><td>'+inr(b.discount)+'</td></tr><tr><td colspan="3"><b>Total</b></td><td><b>'+inr(b.total)+'</b></td></tr>'+b.payments.map(p=>'<tr><td colspan="3">Paid · '+esc(p.mode)+'</td><td>'+inr(p.amount)+'</td></tr>').join("")+'<tr><td colspan="3"><b>'+(b.balance>=0?"Balance":"Refund")+'</b></td><td><b>'+inr(Math.abs(b.balance))+'</b></td></tr></tbody></table></div>')});
+}
+const DIS=[["Final diagnosis",2],["Presenting complaints",2],["Course in hospital",5],["Procedures done",2],["Key investigations",3],["Condition at discharge",1],["Medicines on discharge",4],["Advice",3],["Review",1]];
+function ipDischarge(){
+ const a=IPD.admission,ds=a.dischargeSummary?.fields||{};
+ $("#pane").innerHTML='<div class="panel"><h3>Discharge summary '+(a.dischargeSummary?'<small>Saved '+tm(a.dischargeSummary.at)+' by '+esc(a.dischargeSummary.by)+(a.dischargeSummary.final?" · final":" · draft")+'</small>':"")+'</h3><div class="pb" id="ds">'+
+ DIS.map(([k,r])=>fld(k,k,{rows:r,v:ds[k]||(k==="Final diagnosis"?a.reason:"")})).join("")+
+ '<div class="acts">'+(isDoc()?'<button class="btn" id="ad">Draft with AI</button><button class="btn" id="sd">Save draft</button><button class="btn p" id="sf">Save final</button>':"")+'<button class="btn" id="pd">Print</button></div></div></div>';
+ if(isDoc()){
+  $("#sd").onclick=()=>ipRec("discharge",{fields:readForm($("#ds")),final:false});$("#sf").onclick=()=>ipRec("discharge",{fields:readForm($("#ds")),final:true});
+  $("#ad").onclick=async()=>{$("#ad").disabled=true;$("#ad").textContent="Writing…";
+   try{const j=await aiJson("Write a discharge summary for an Indian hospital from this record. Use only facts given; write 'not recorded' where missing. Plain clinical English, no markdown.\\n"+ipCase()+'\\nReply with ONLY JSON whose keys are exactly: '+JSON.stringify(DIS.map(d=>d[0]))+' and values are strings.');
+    DIS.forEach(([k])=>{const t=$('#ds textarea[name="'+k+'"]');if(j[k]&&!t.value.trim())t.value=j[k]});toast("Draft filled in. Please check every section.")}catch(e){toast(e.message)}
+   $("#ad").disabled=false;$("#ad").textContent="Draft with AI"}}
+ $("#pd").onclick=()=>{const f=readForm($("#ds")),p=IPD.patient||{};modal('<div class="rep"><h2>Discharge summary</h2><p><b>'+esc(p.name)+'</b> · '+esc(p.id||"")+' · '+esc([p.age?p.age+"Y":"",p.sex].filter(Boolean).join(" / "))+'<br>'+esc(a.no)+' · '+esc(a.ward)+' · admitted '+tm(a.admittedAt)+(a.dischargedAt?' · discharged '+tm(a.dischargedAt):"")+' · '+esc(a.doctor||"")+'</p>'+DIS.filter(([k])=>f[k]).map(([k])=>'<h4 style="margin:10px 0 2px">'+esc(k)+'</h4><div style="white-space:pre-wrap">'+esc(f[k])+'</div>').join("")+'<p style="text-align:right;margin-top:30px">'+esc(a.doctor||ME.name||"")+'</p></div>')};
+}
+
+// ---------- operation theatre ----------
+let OTF=today();
+async function otList(){
+ let d;try{d=await api("/api/ot/list",{from:OTF,to:new Date(new Date(OTF+"T00:00:00Z").getTime()+6*864e5).toISOString().slice(0,10)})}catch(e){$("#app").innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
+ if(!ME.name){try{const m=await api("/api/me");ME={name:m.user?.name,role:m.role};$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role}catch{}}
+ const S=d.surgeries,st=(r)=>r.ot?.status||(r.status==="done"?"done":r.status==="cancelled"?"cancelled":"scheduled");
+ const pill=(x)=>'<span class="pill '+({done:"grn","in-theatre":"red",cancelled:"gry",postponed:"amb"}[x]||"")+'">'+esc({"in-theatre":"In theatre"}[x]||x)+'</span>';
+ const days={};S.forEach(r=>(days[r.date]=days[r.date]||[]).push(r));
+ $("#app").innerHTML='<div class="bar2"><button class="btn" onclick="location.hash=\\'\\'">‹ Dashboard</button><h1>Operation theatre list</h1><div class="sp"></div>From <input type="date" id="of" class="chip" value="'+OTF+'"> · 7 days</div>'+
+ '<div class="tiles" style="grid-template-columns:repeat(4,minmax(0,1fr))">'+[["Scheduled","scheduled","t1"],["In theatre","in-theatre","t5"],["Done","done","t3"],["Cancelled / postponed","x","t2"]].map(([l,k,c])=>'<div class="tile" style="background:var(--'+c+')">'+ic("sx","var(--"+c+"i)")+'<b>'+S.filter(r=>k==="x"?["cancelled","postponed"].includes(st(r)):st(r)===k).length+'</b><span class="n">'+l+'</span></div>').join("")+'</div>'+
+ (Object.keys(days).length?Object.keys(days).sort().map(dd=>'<h3 style="margin:14px 0 6px;font-size:14px">'+dt(dd)+'</h3><div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Theatre</th><th>Patient</th><th>Procedure</th><th>Surgeon</th><th>Anaesthesia</th><th>Urgency</th><th>Status</th></tr></thead><tbody>'+
+  days[dd].map(r=>'<tr class="r" data-id="'+r.id+'"><td>'+esc(r.ot?.time||r.fields.time||"–")+'</td><td>'+esc(r.ot?.theatre||"–")+'</td><td class="pn"><b>'+esc(r.patient.name)+'</b><small>'+esc(r.patient.id)+(r.admissionNo?" · "+esc(r.admissionNo):"")+'</small></td><td>'+esc(r.fields.procedure)+'</td><td>'+esc(r.ot?.team?.surgeon||r.fields.surgeon||"")+'</td><td>'+esc(r.fields.anaesthesia||"")+'</td><td>'+(r.fields.urgency==="Emergency"?'<span class="pill red">Emergency</span>':esc(r.fields.urgency||""))+'</td><td>'+pill(st(r))+'</td></tr>').join("")+'</tbody></table></div>').join(""):'<div class="empty">No surgeries in these 7 days. Book one from a patient chart (Requests → Surgery, or Surgery in the inpatient chart).</div>');
+ $("#of").onchange=(e)=>{OTF=e.target.value;otList()};$$("tr[data-id]").forEach(t=>t.onclick=()=>location.hash="ot-"+t.dataset.id);
+}
+let OT=null,OTAB="sched";
+async function otRecord(id,keep){
+ try{OT=await api("/api/ot/get",{id})}catch(e){$("#app").innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
+ if(!ME.name){try{const m=await api("/api/me");ME={name:m.user?.name,role:m.role};$("#me").textContent=ME.name||"";$("#role").textContent=ROLE[ME.role]||ME.role}catch{}}
+ if(!keep)OTAB="sched";drawOt();
+}
+async function otSave(b,msg){try{await api("/api/ot/update",Object.assign({id:OT.surgery.id},b));toast(msg||"Saved");otRecord(OT.surgery.id,true)}catch(e){toast(e.message)}}
+const PREOP=[["consent","Consent signed"],["highrisk","High-risk consent (if needed)"],["nbm","Nil by mouth confirmed"],["site","Operation site marked"],["pac","Pre-anaesthetic check: fit"],["inv","Investigations reviewed"],["blood","Blood arranged / cross-matched"],["abx","Antibiotic prophylaxis given"],["jewel","Jewellery, dentures, nail polish removed"],["bladder","Bladder emptied / catheter"],["prep","Part prepared"],["iv","IV line secured"]];
+const WHO={signin:["Sign in (before anaesthesia)",[["id","Patient identity, site, procedure and consent confirmed"],["mark","Site marked"],["machine","Anaesthesia machine and medicines checked"],["oxi","Pulse oximeter on and working"],["allergy","Known allergy checked"],["airway","Difficult airway / aspiration risk assessed"],["bloodloss","Risk of >500 ml blood loss assessed"]]],
+ timeout:["Time out (before skin incision)",[["team","Team introduced by name and role"],["confirm","Patient, site and procedure confirmed"],["abx","Antibiotic given within the last 60 minutes"],["critical","Anticipated critical events reviewed"],["imaging","Essential imaging displayed"],["sterile","Sterility confirmed, equipment ready"]]],
+ signout:["Sign out (before the patient leaves theatre)",[["recorded","Name of the procedure recorded"],["counts","Instrument, sponge and needle counts correct"],["specimen","Specimen labelled"],["equipment","Equipment problems addressed"],["recovery","Key concerns for recovery reviewed"]]]};
+const OPN=[["procedure","Procedure performed",1],["indication","Indication",1],["incision","Position and incision",1],["findings","Operative findings",4],["steps","Procedure steps",6],["implants","Implants / mesh / prosthesis",1],["ebl","Estimated blood loss",1],["drains","Drains",1],["specimen","Specimens sent (HPE / culture)",1],["closure","Closure",1],["complications","Complications",1]];
+const POSTOP=[["shift","Shift to",["Ward","ICU","HDU","Recovery then ward"]],["position","Position",["Propped up 30°","Supine","Lateral","As comfortable"]],["nbm","Nil by mouth until",null],["fluids","IV fluids",null],["abx","Antibiotics",null],["analgesia","Analgesia",null],["monitor","Monitoring",["Pulse, BP, SpO₂ every 15 min × 1 h, then hourly","Hourly for 6 h, then 4-hourly","4-hourly"]],["drain","Drain / catheter care",null],["mobil","Mobilisation",null],["diet","Diet plan",null],["inv","Investigations",null],["special","Special instructions",null]];
+function drawOt(){
+ const r=OT.surgery,o=r.ot||{},st=o.status||"scheduled",p=r.patient;
+ const tabs=[["sched","Schedule & team"],["preop","Pre-op checklist"],["who","WHO safety checklist"],["opn","Operation notes"],["post","Post-op orders"],["obs","Post-op monitoring"],["chg","OT charges"]];
+ $("#app").innerHTML='<div class="bar2"><button class="btn" onclick="location.hash=\\'ot\\'">‹ Theatre list</button><h1>'+esc(r.fields.procedure||"Surgery")+'</h1><div class="sp"></div>'+
+ [["scheduled","Scheduled"],["in-theatre","In theatre"],["done","Done"],["postponed","Postpone"],["cancelled","Cancel"]].map(([k,l])=>'<button class="chip'+(st===k?" on":"")+'" data-st="'+k+'">'+l+'</button>').join(" ")+'</div>'+
+ '<div class="panel" style="margin-bottom:10px"><div class="pb" style="display:flex;flex-wrap:wrap;gap:6px 22px"><span><b>'+esc(p.name)+'</b> · '+esc(p.id)+' · '+esc([p.age?p.age+"Y":"",p.sex].filter(Boolean).join(" / "))+'</span><span>'+dt(r.date)+' '+esc(o.time||r.fields.time||"")+(o.theatre?" · "+esc(o.theatre):"")+'</span><span>Surgeon: '+esc(o.team?.surgeon||r.fields.surgeon||"")+'</span><span>'+esc(r.fields.anaesthesia||"")+' · '+esc(r.fields.urgency||"")+'</span>'+
+ (OT.admission?'<span><a href="#ip-'+esc(OT.admission.id)+'">'+esc(OT.admission.no)+'</a> · '+esc(OT.admission.ward+" "+OT.admission.bed)+'</span>':'<span class="pill amb">Not admitted</span>')+(OT.allergy?'<span class="pill red">Allergy: '+esc(OT.allergy)+'</span>':"")+'</div></div>'+
+ '<div class="tabs">'+tabs.map(([k,l])=>'<button data-t="'+k+'" class="'+(OTAB===k?"on":"")+'">'+l+'</button>').join("")+'</div><div id="pane"></div>';
+ $$("[data-st]").forEach(b=>b.onclick=()=>otSave({status:b.dataset.st},"Status updated"));
+ $$(".tabs button").forEach(b=>b.onclick=()=>{OTAB=b.dataset.t;drawOt()});
+ const pane=$("#pane"),by=(x)=>x?'<div class="m" style="color:var(--muted);font-size:12px">Last saved '+tm(x.at)+' by '+esc(x.by)+'</div>':"";
+ if(OTAB==="sched"){const t=o.team||{};pane.innerHTML='<div class="panel"><div class="pb" id="f"><div class="fr">'+fld("date","Date",{type:"date",v:r.date})+fld("time","Time",{type:"time",v:o.time||r.fields.time||""})+fld("theatre","Theatre",{opts:["OT 1","OT 2","OT 3","Minor OT","Labour OT","Cath lab"],v:o.theatre})+'</div><div class="fr">'+fld("surgeon","Surgeon",{v:t.surgeon||r.fields.surgeon})+fld("assistant","Assistant")+fld("anaesthetist","Anaesthetist",{v:t.anaesthetist||r.fields.anaesthetist})+fld("scrub","Scrub nurse",{v:t.scrub})+fld("circulating","Circulating nurse",{v:t.circulating})+'</div><div class="acts"><button class="btn p" id="sv">Save schedule</button></div></div></div>';
+  if(t.assistant)$('#f input[name=assistant]').value=t.assistant;
+  $("#sv").onclick=()=>{const f=readForm($("#f"));otSave({schedule:{date:f.date,time:f.time,theatre:f.theatre,team:{surgeon:f.surgeon,assistant:f.assistant,anaesthetist:f.anaesthetist,scrub:f.scrub,circulating:f.circulating}}},"Schedule saved")}}
+ else if(OTAB==="preop"){const v=o.preop||{};pane.innerHTML='<div class="panel"><div class="pb" id="f">'+ckl("c",PREOP,v.c?JSON.parse(v.c):{})+'<div class="fr">'+fld("nbmFrom","Nil by mouth since",{v:v.nbmFrom,ph:"10 pm"})+fld("bloodUnits","Blood units reserved",{v:v.bloodUnits})+fld("asa","ASA grade",{opts:["","I","II","III","IV","V","E"],v:v.asa})+'</div>'+fld("notes","Notes",{rows:2,v:v.notes})+by(v)+'<div class="acts"><button class="btn p" id="sv">Save checklist</button></div></div></div>';
+  $("#sv").onclick=()=>{const f=readForm($("#f"));const c=f.c||{};delete f.c;f.c=JSON.stringify(c);otSave({preop:f},"Checklist saved")}}
+ else if(OTAB==="who"){const v=o.who||{};pane.innerHTML='<div class="grid2" style="grid-template-columns:repeat(3,minmax(0,1fr))">'+Object.entries(WHO).map(([k,[t,items]])=>'<div class="panel"><h3>'+t+'</h3><div class="pb" data-w="'+k+'">'+ckl(k,items,v[k]?JSON.parse(v[k]):{})+'</div></div>').join("")+'</div>'+by(o.who)+'<div class="acts" style="margin-top:10px"><button class="btn p" id="sv">Save WHO checklist</button></div>';
+  $("#sv").onclick=()=>{const w={};Object.keys(WHO).forEach(k=>w[k]=JSON.stringify(readForm($('[data-w="'+k+'"]'))[k]||{}));otSave({who:w},"WHO checklist saved")}}
+ else if(OTAB==="opn"){const v=o.opnote||{};pane.innerHTML='<div class="panel"><div class="pb" id="f"><div class="fr">'+fld("start","Start time",{type:"time",v:v.start})+fld("end","End time",{type:"time",v:v.end})+fld("anaesthesia","Anaesthesia",{v:v.anaesthesia||r.fields.anaesthesia})+'</div>'+OPN.map(([k,l,rw])=>fld(k,l,{rows:rw,v:v[k]||(k==="procedure"?r.fields.procedure:"")})).join("")+by(o.opnote)+
+  '<div class="acts">'+(isDoc()?'<button class="btn" id="ai">Draft steps with AI</button><button class="btn p" id="sv">Save operation notes</button>':"")+'<button class="btn" id="pr">Print</button></div></div></div>';
+  if(isDoc()){$("#sv").onclick=()=>otSave({opnote:readForm($("#f"))},"Operation notes saved");
+   $("#ai").onclick=async()=>{const f=readForm($("#f"));$("#ai").disabled=true;try{const j=await aiJson("Draft the standard operative steps for: "+f.procedure+". Findings noted by the surgeon: "+(f.findings||"none yet")+". Anaesthesia: "+f.anaesthesia+". Write numbered steps as one string, in the style of an Indian operation theatre register. The surgeon will edit. Reply ONLY JSON {\\"steps\\":\\"\\",\\"closure\\":\\"\\",\\"specimen\\":\\"\\"}");
+    [["steps",j.steps],["closure",j.closure],["specimen",j.specimen]].forEach(([k,x])=>{const t=$('#f textarea[name="'+k+'"]');if(x&&!t.value.trim())t.value=x});toast("Draft filled in. Edit to match what was done.")}catch(e){toast(e.message)}$("#ai").disabled=false}}
+  $("#pr").onclick=()=>{const f=readForm($("#f"));modal('<div class="rep"><h2>Operation notes</h2><p><b>'+esc(p.name)+'</b> · '+esc(p.id)+' · '+dt(r.date)+' · '+esc(f.start||"")+'–'+esc(f.end||"")+'<br>Surgeon: '+esc(o.team?.surgeon||r.fields.surgeon||"")+(o.team?.assistant?" · Assistant: "+esc(o.team.assistant):"")+' · Anaesthetist: '+esc(o.team?.anaesthetist||r.fields.anaesthetist||"")+' · '+esc(f.anaesthesia)+'</p>'+OPN.filter(([k])=>f[k]).map(([k,l])=>'<h4 style="margin:10px 0 2px">'+l+'</h4><div style="white-space:pre-wrap">'+esc(f[k])+'</div>').join("")+'<p style="text-align:right;margin-top:30px">'+esc(o.team?.surgeon||r.fields.surgeon||"")+'</p></div>')}}
+ else if(OTAB==="post"){const v=o.postop||{};pane.innerHTML='<div class="panel"><div class="pb" id="f"><div class="fr">'+POSTOP.map(([k,l,opts])=>opts?fld(k,l,{opts:[""].concat(opts),v:v[k]}):fld(k,l,{v:v[k]})).join("")+'</div>'+by(o.postop)+(isDoc()?'<div class="acts"><button class="btn p" id="sv">Save post-op orders</button></div>':"")+'</div></div>';
+  $("#sv")&&($("#sv").onclick=()=>otSave({postop:readForm($("#f"))},"Post-op orders saved"))}
+ else if(OTAB==="obs"){const L=(o.obs||[]).slice().reverse();pane.innerHTML='<div class="grid2" style="grid-template-columns:minmax(0,.8fr) minmax(0,1.5fr)"><div class="panel"><h3>Record observation</h3><div class="pb" id="f"><div class="fr">'+[["pulse","Pulse"],["bp","BP"],["spo2","SpO₂ %"],["rr","Resp. rate"],["pain","Pain 0–10"],["sedation","Sedation score"],["drain","Drain output ml"],["urine","Urine output ml"]].map(([k,l])=>fld(k,l)).join("")+'</div>'+fld("note","Note")+'<div class="acts"><button class="btn p" id="sv">Save</button></div></div></div>'+
+  panel("Observations",["Time","Pulse","BP","SpO₂","RR","Pain","Drain","Urine","Note","By"],L.map(x=>'<tr><td>'+tm(x.at)+'</td>'+["pulse","bp","spo2","rr","pain","drain","urine","note"].map(k=>'<td style="'+(hi(k,x[k])?"color:var(--red);font-weight:700":"")+'">'+esc(x[k]||"")+'</td>').join("")+'<td>'+esc(x.by)+'</td></tr>'),"No observations yet")+'</div>';
+  $("#sv").onclick=()=>{const f=readForm($("#f"));if(!Object.values(f).some(Boolean))return toast("Enter at least one value");otSave({obs:f},"Observation saved")}}
+ else{const T=OT.tariff||[],pick=(n)=>T.find(t=>t.name.toLowerCase()===n.toLowerCase());
+  const rows=o.charged?[]:[["OT charges",1],["Surgeon fee",1],["Anaesthetist fee",1],["Consumables",1]].map(([n,q])=>({desc:n,qty:q,rate:pick(n)?.price||0}));
+  pane.innerHTML=o.charged?'<div class="panel"><div class="pb">OT charges of <b>'+inr(o.charged.total)+'</b> were added to the inpatient bill on '+tm(o.charged.at)+' by '+esc(o.charged.by)+'.</div></div>':
+  '<div class="panel"><h3>Charges for this surgery <small>Added to the inpatient bill</small></h3><div class="pb"><table class="rx"><thead><tr><th>Item</th><th>Qty</th><th>Rate ₹</th><th></th></tr></thead><tbody id="cb">'+rows.map(c=>'<tr><td><input data-k="desc" value="'+esc(c.desc)+'"></td><td><input data-k="qty" value="'+c.qty+'"></td><td><input data-k="rate" value="'+c.rate+'"></td><td><button class="btn d" data-x>✕</button></td></tr>').join("")+'</tbody></table><div><button class="btn" id="ad">+ Implant or other item</button></div>'+
+  (OT.admission?'':'<div class="pill amb">Admit the patient first: OT charges go on the inpatient bill.</div>')+'<div class="acts"><button class="btn p" id="sv"'+(OT.admission?"":" disabled")+'>Add to inpatient bill</button></div></div></div>';
+  const bind=()=>$$("[data-x]").forEach(b=>b.onclick=()=>b.closest("tr").remove());bind();
+  $("#ad")&&($("#ad").onclick=()=>{$("#cb").insertAdjacentHTML("beforeend",'<tr><td><input data-k="desc" placeholder="e.g. Mesh 15×15 cm"></td><td><input data-k="qty" value="1"></td><td><input data-k="rate"></td><td><button class="btn d" data-x>✕</button></td></tr>');bind()});
+  $("#sv")&&($("#sv").onclick=()=>{const c=$$("#cb tr").map(tr=>{const x={};$$("[data-k]",tr).forEach(i=>x[i.dataset.k]=i.value);return {desc:x.desc,qty:+x.qty||1,rate:+x.rate||0}}).filter(x=>x.desc&&x.rate>0);if(!c.length)return toast("Enter at least one charge with a rate");otSave({charges:c},"Charges added to the inpatient bill")})}
+}
+
 route();
 </script></body></html>`;
 }

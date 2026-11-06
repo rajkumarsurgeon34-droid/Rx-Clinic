@@ -528,7 +528,7 @@ internal fun MiniStat(label: String, value: String, modifier: Modifier = Modifie
 // ---------------- Billing desk: OPD bills, patient total, inpatients, collections ----------------
 
 @Composable
-fun BillingScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
+fun BillingScreen(vm: CallViewModel, onChart: (String) -> Unit = {}, onBack: () -> Unit, onPatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("billing") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     var tab by remember { mutableStateOf("opd") }
     var newOpd by remember { mutableStateOf(false) }
@@ -543,7 +543,7 @@ fun BillingScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit,
         when (tab) {
             "opd" -> BillsPanel(vm, session, "opd", refresh, onNew = { newOpd = true }, newLabel = "New OPD bill (consultation, procedures)")
             "total" -> PatientTotal(vm, session)
-            "ip" -> InpatientsPanel(vm, session, canBill = true)
+            "ip" -> InpatientsPanel(vm, session, canBill = true, onChart = onChart)
             else -> CollectionsPanel(vm, session)
         }
     }
@@ -643,16 +643,16 @@ private fun CollectionsPanel(vm: CallViewModel, session: String) {
 // ---------------- Inpatients ----------------
 
 @Composable
-fun InpatientsScreen(vm: CallViewModel, onBack: () -> Unit, onSignedOut: () -> Unit) {
+fun InpatientsScreen(vm: CallViewModel, onChart: (String) -> Unit = {}, onBack: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("staff") ?: vm.prefs.sessionFor("doctor") ?: vm.prefs.sessionFor("billing") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     Column(Modifier.fillMaxSize()) {
         TopBar("Inpatients", onBack) { AccountButton(vm, onSignedOut) }
-        InpatientsPanel(vm, session, canBill = vm.prefs.staffRole == "billing" || vm.prefs.staffRole == "admin")
+        InpatientsPanel(vm, session, canBill = vm.prefs.staffRole == "billing" || vm.prefs.staffRole == "admin", onChart = onChart)
     }
 }
 
 @Composable
-fun InpatientsPanel(vm: CallViewModel, session: String, canBill: Boolean) {
+fun InpatientsPanel(vm: CallViewModel, session: String, canBill: Boolean, onChart: (String) -> Unit = {}) {
     val api = remember { Api(vm.prefs.serverUrl) }
     var status by remember { mutableStateOf("admitted") }
     var tick by remember { mutableIntStateOf(0) }
@@ -692,7 +692,7 @@ fun InpatientsPanel(vm: CallViewModel, session: String, canBill: Boolean) {
     }
     if (admitting) PatientPicker(vm, session, "Admit", onDismiss = { admitting = false }, onPick = { admitting = false; admitFor = it })
     admitFor?.let { p -> AdmitDialog(vm, session, p, canBill, onDismiss = { admitFor = null }, onDone = { id -> admitFor = null; tick++; open = id }) }
-    open?.let { id -> AdmissionView(vm, session, id, canBill, onDismiss = { open = null; tick++ }) }
+    open?.let { id -> AdmissionView(vm, session, id, canBill, onChart = { open = null; onChart(id) }, onDismiss = { open = null; tick++ }) }
 }
 
 @Composable
@@ -747,7 +747,7 @@ private fun AdmitDialog(vm: CallViewModel, session: String, p: JSONObject, canBi
 }
 
 @Composable
-private fun AdmissionView(vm: CallViewModel, session: String, id: String, canBill: Boolean, onDismiss: () -> Unit) {
+private fun AdmissionView(vm: CallViewModel, session: String, id: String, canBill: Boolean, onChart: () -> Unit = {}, onDismiss: () -> Unit) {
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -770,6 +770,7 @@ private fun AdmissionView(vm: CallViewModel, session: String, id: String, canBil
             Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, "Close", tint = Ui.Text) }
                 Text("Inpatient account", color = Ui.Text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif, modifier = Modifier.weight(1f))
+                TextButton(onClick = onChart) { Text("Full chart") }
             }
             val d = data ?: run { Box(Modifier.padding(16.dp)) { if (err != null) ErrorText(err) else CircularProgressIndicator(color = Ui.Teal) }; return@Column }
             val a = d.getJSONObject("admission"); val acc = d.getJSONObject("account")

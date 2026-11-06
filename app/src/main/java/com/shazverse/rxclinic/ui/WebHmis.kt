@@ -23,7 +23,7 @@ import com.shazverse.rxclinic.call.CallViewModel
 /** The HMIS web workspace (dashboard and patient chart) inside the app, already signed in. */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun HmisWebScreen(vm: CallViewModel, onBack: () -> Unit) {
+fun HmisWebScreen(vm: CallViewModel, start: String = "", onBack: () -> Unit) {
     val role = vm.prefs.staffRole
     val session = role?.let { vm.prefs.session(it) } ?: run { LaunchedEffect(Unit) { onBack() }; return }
     var web by remember { mutableStateOf<WebView?>(null) }
@@ -40,7 +40,7 @@ fun HmisWebScreen(vm: CallViewModel, onBack: () -> Unit) {
                     settings.loadWithOverviewMode = true
                     webViewClient = WebViewClient()
                     webChromeClient = WebChromeClient()
-                    loadUrl(vm.prefs.serverUrl.trimEnd('/') + "/hmis#s=" + Uri.encode(session) + "&r=" + role)
+                    loadUrl(vm.prefs.serverUrl.trimEnd('/') + "/hmis#s=" + Uri.encode(session) + "&r=" + role + (if (start.isNotBlank()) "&go=$start" else ""))
                     web = this
                 }
             },
