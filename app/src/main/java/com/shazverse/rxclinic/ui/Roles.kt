@@ -117,6 +117,7 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: (() -> Unit)?, onIn: (St
     var info by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var lic by remember { mutableStateOf<JSONObject?>(null) }
+    var forgot by remember { mutableStateOf(false) }
     var mustChange by remember { mutableStateOf<String?>(null) } // role, while the first-sign-in password change is open
     LaunchedEffect(Unit) { lic = runCatching { Api(vm.prefs.serverUrl).license() }.getOrNull() }
 
@@ -184,6 +185,7 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: (() -> Unit)?, onIn: (St
                     }
                     err?.let { Text(it, color = Ui.Red, fontSize = 14.sp) }
                     info?.let { Text(it, color = Ui.Muted, fontSize = 14.sp) }
+                    TextButton(onClick = { forgot = true }) { Text("Forgot admin password?", color = Ui.Teal, fontSize = 13.sp) }
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                         Button(
                             onClick = {
@@ -238,6 +240,35 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: (() -> Unit)?, onIn: (St
             }
             Text("${java.time.Year.now()} © ShazVerse Technologies · Rx Clinic", color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp, bottom = 24.dp))
         }
+    }
+    if (forgot) {
+        var code by remember { mutableStateOf("") }
+        var np by remember { mutableStateOf("") }
+        var ferr by remember { mutableStateOf<String?>(null) }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { forgot = false },
+            title = { Text("Reset admin password") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Enter the reset code you saved in Cloudflare as the secret ADMIN_RESET_CODE, and a new admin password. Other staff: ask your admin to reset your password.", color = Ui.Muted, fontSize = 13.sp)
+                    OutlinedTextField(code, { code = it.trim() }, label = { Text("Reset code") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    PasswordField(np, { np = it }, "New admin password (8+ characters)")
+                    ferr?.let { Text(it, color = Ui.Red, fontSize = 13.sp) }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    scope.launch {
+                        try {
+                            val r = Api(vm.prefs.serverUrl).call("/api/admin/recover", JSONObject().put("code", code).put("password", np))
+                            username = r.optString("username", "admin"); password = ""; err = null
+                            info = "Admin password changed. Sign in with the new password."; forgot = false
+                        } catch (e: Exception) { ferr = e.message }
+                    }
+                }, enabled = code.isNotBlank() && np.length >= 8) { Text("Reset") }
+            },
+            dismissButton = { TextButton(onClick = { forgot = false }) { Text("Cancel") } },
+        )
     }
     mustChange?.let { r ->
         ChangePasswordDialog(vm, knownOld = password, forced = true, onDone = { ok -> mustChange = null; if (ok) onIn(r) else vm.prefs.saveSession(r, null) })

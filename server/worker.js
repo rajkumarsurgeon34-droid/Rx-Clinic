@@ -861,6 +861,27 @@ async function handle(request, env) {
       return json({ session: await makeSession(env, f.u.role, f.id, f.u.ver || 0), role: f.u.role, user: publicUser(f.id, f.u), clinic: await clinicInfo(env) });
     }
 
+    case "/api/admin/recover": {
+      // Forgotten admin password: needs the ADMIN_RESET_CODE secret set in Cloudflare (never stored in the app).
+      const code = String(env.ADMIN_RESET_CODE || "");
+      if (code.length < 8) throw new HttpError(400, "Password reset is off. In Cloudflare, add the secret ADMIN_RESET_CODE to the rx-clinic worker, then try again.");
+      await checkLock(env, "recover");
+      if (!safeEqual(code, String(body.code || "").trim())) { await noteFail(env, "recover"); throw new HttpError(401, "That reset code is not right"); }
+      await clearFail(env, "recover");
+      const pw = String(body.password || "");
+      if (pw.length < 8) throw new HttpError(400, "Choose a new password of at least 8 characters");
+      await ensureAdmin(env);
+      const rows = (await listDocs(env, "users")).filter((d) => d.role === "admin");
+      const pick = rows.find((d) => d.username === "admin") || rows[0];
+      const id = pick ? pick.id : "admin";
+      if (pick) delete pick.id;
+      const u = pick ? pick : { username: "admin", name: "Administrator", role: "admin", created: Date.now(), createdBy: "reset" };
+      Object.assign(u, { passHash: await hashPassword(pw), mustChange: false, active: true, ver: (u.ver || 0) + 1 });
+      await putDoc(env, "users", id, u);
+      await clearFail(env, "u:" + u.username);
+      return json({ ok: true, username: u.username });
+    }
+
     case "/api/me": {
       const s = await readSession(env, body.session);
       if (s.role === "patient") return json({ role: "patient", patient: publicPatient(s.uid, s.user) });
@@ -2500,7 +2521,7 @@ h1{font:600 30px/1.2 "Segoe UI",system-ui;text-align:center;margin:4px 0 4px}
 <svg viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 20 3m-3 3 2.5 2.5M14.5 8.5 17 11"/></svg></div>
 <div class="row"><label><input type="checkbox" id="rem" checked>Remember me</label>
 <a href="/terms"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4"/></svg>Terms</a></div>
-<div class="err" id="err" role="alert"></div>
+<div class="err" id="err" role="alert"></div><div style="text-align:right;margin:-4px 0 6px"><a href="#" id="forgot" style="font-size:14px">Forgot admin password?</a></div>
 <div class="btns">
 <button type="button" class="btn new" id="new">New session <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button>
 <button type="submit" class="btn go" id="go">Login <svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg></button>
@@ -2522,6 +2543,8 @@ fetch("/api/license").then(r=>r.json()).then(l=>{
  $("who").innerHTML=(l.licensedTo||"Rx Clinic").replace(/</g,"&lt;")+",<br>"+(l.address||"").replace(/</g,"&lt;")+(l.address?"<br>":"")+l.plan+" plan"+(l.trial?" (trial)":"");
  $("exp").innerHTML=(l.expired?"License expired on ":"License expires on ")+"<strong>"+ds+"</strong>";
 }).catch(()=>{$("who").textContent="Server not reachable"});
+$("forgot").onclick=async(e)=>{e.preventDefault();const c=prompt("Reset code (the ADMIN_RESET_CODE secret you set in Cloudflare):");if(!c)return;const p=prompt("New admin password (at least 8 characters):");if(!p)return;
+ try{const r=await fetch("/api/admin/recover",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({code:c,password:p})});const j=await r.json();if(!r.ok)throw new Error(j.error||"Couldn\x27t reset");$("u").value=j.username;$("p").value="";$("err").textContent="Admin password changed. Sign in as "+j.username+" with the new password."}catch(err){$("err").textContent=err.message}};
 $("new").onclick=()=>{try{["rx_session","rx_role"].forEach(k=>{localStorage.removeItem(k);sessionStorage.removeItem(k)})}catch{};$("p").value="";$("err").textContent="Started a new session. Sign in again.";$("u").focus()};
 $("f").onsubmit=async(e)=>{e.preventDefault();$("err").textContent="";$("go").disabled=true;
  try{const r=await fetch("/api/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({username:$("u").value.trim().toLowerCase(),password:$("p").value})});
