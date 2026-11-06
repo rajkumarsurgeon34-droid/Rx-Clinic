@@ -540,6 +540,33 @@ async function listDocs(env, coll, where = "", args = []) {
   return rows.map((r) => Object.assign({ id: r.id }, JSON.parse(r.data)));
 }
 
+// ---------- subscription plans ----------
+// Bronze: 1 doctor, OPD. Silver: 2–4 doctors + inpatient. Gold: 5–20 doctors, full hospital. Platinum: 21+, OT, units, branches.
+// true = included, "addon" = needs the add-on switched on, false = not in the plan.
+const PLANS = {
+  bronze:   { name: "Bronze",   maxDoctors: 1,    maxStaff: 3,    fee: 0,     f: { lab: "addon", diagnostics: false, ip: false, ot: false, insurance: "addon", homecare: false, mobileunit: false, chat: false, reports: false, expenses: false, goals: false, templates: false, nondrug: false, purchase: false, branches: false, bookingfee: "addon" } },
+  silver:   { name: "Silver",   maxDoctors: 4,    maxStaff: 10,   fee: 2000,  f: { lab: true, diagnostics: true, ip: true, ot: false, insurance: "addon", homecare: "addon", mobileunit: false, chat: true, reports: true, expenses: true, goals: false, templates: false, nondrug: true, purchase: false, branches: false, bookingfee: "addon" } },
+  gold:     { name: "Gold",     maxDoctors: 20,   maxStaff: 9999, fee: 7500,  f: { lab: true, diagnostics: true, ip: true, ot: "addon", insurance: true, homecare: true, mobileunit: "addon", chat: true, reports: true, expenses: true, goals: true, templates: true, nondrug: true, purchase: true, branches: false, bookingfee: true } },
+  platinum: { name: "Platinum", maxDoctors: 9999, maxStaff: 9999, fee: 20000, f: { lab: true, diagnostics: true, ip: true, ot: true, insurance: true, homecare: true, mobileunit: true, chat: true, reports: true, expenses: true, goals: true, templates: true, nondrug: true, purchase: true, branches: "addon", bookingfee: true } },
+};
+const FEATURE_NAMES = { lab: "Lab", diagnostics: "Diagnostics", ip: "Inpatient", ot: "Operation theatre", insurance: "Insurance desk", homecare: "Home care", mobileunit: "Mobile unit", chat: "Patient chat", reports: "Sales reports", expenses: "Expenses ledger", goals: "Sales goals", templates: "Speciality templates", nondrug: "Non-drug items", purchase: "Supplier purchases", branches: "Branches", bookingfee: "Online booking fee" };
+
+async function planInfo(env) {
+  const p = await getSetting(env, "plan", { tier: "platinum", addons: [] }); // new installs start on Platinum (trial) so every feature can be tried
+  const tier = PLANS[p.tier] ? p.tier : "platinum";
+  const def = PLANS[tier];
+  const features = {};
+  for (const [k, v] of Object.entries(def.f)) features[k] = v === true || (v === "addon" && (p.addons || []).includes(k));
+  return { tier, name: def.name, maxDoctors: def.maxDoctors, maxStaff: def.maxStaff, fee: def.fee, addons: p.addons || [], available: def.f, features };
+}
+async function needFeature(env, key) {
+  const pl = await planInfo(env);
+  if (!pl.features[key]) throw new HttpError(403, `${FEATURE_NAMES[key] || key} is not in your ${pl.name} plan. The admin can upgrade under Admin → Plan.`);
+}
+
+// ---------- documents: certificates, referral letters, timeslips ----------
+const LETTER_TYPES = { certificate: "Medical certificate", fitness: "Fitness certificate", referral: "Referral letter", timeslip: "Timeslip" };
+
 // ---------- billing ----------
 // Department bills (pharmacy, lab, diagnostics, OPD) and inpatient (IP) admissions with a final bill.
 // Amounts are in rupees; medicine prices are MRP (tax included); clinical services carry no GST.
@@ -695,6 +722,7 @@ async function handle(request, env) {
       try { await db(env); database = true; } catch { /* reported below */ }
       return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
     }
+    if (path === "/book") return new Response(bookingPage(await clinicInfo(env)), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     if (path === "/api/slots") {
       const date = url.searchParams.get("date") || "";
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "Invalid date");
@@ -827,6 +855,15 @@ async function handle(request, env) {
         const admins = (await listDocs(env, "users")).filter((a) => a.role === "admin" && a.active !== false && a.id !== id);
         if (!admins.length) throw new HttpError(400, "Keep at least one active admin login");
       }
+      if (active && (isNew || u.role !== role || u.active === false) && role !== "admin") {
+        const pl = await planInfo(env);
+        const others = (await listDocs(env, "users")).filter((o) => o.active !== false && o.id !== id);
+        if (role === "doctor" && others.filter((o) => o.role === "doctor").length >= pl.maxDoctors)
+          throw new HttpError(409, `Your ${pl.name} plan allows ${pl.maxDoctors} doctor login${pl.maxDoctors > 1 ? "s" : ""}. Upgrade under Admin → Plan, or disable another doctor login.`);
+        if (role !== "doctor" && others.filter((o) => o.role !== "doctor" && o.role !== "admin").length >= pl.maxStaff)
+          throw new HttpError(409, `Your ${pl.name} plan allows ${pl.maxStaff} staff logins. Upgrade under Admin → Plan.`);
+        if (["lab", "diagnostics"].includes(role) && !pl.features[role]) throw new HttpError(409, `${FEATURE_NAMES[role]} is not in your ${pl.name} plan`);
+      }
       if (!isNew && (u.role !== role || (u.active !== false) !== active)) u.ver = (u.ver || 0) + 1; // signs them out
       Object.assign(u, { username, role, name, active, qual: clean(x.qual ?? u.qual, 80), reg: clean(x.reg ?? u.reg, 40), phone: digits(x.phone ?? u.phone) });
       if (isNew || x.password) {
@@ -839,7 +876,7 @@ async function handle(request, env) {
     }
 
     case "/api/settings": {
-      const who = await requireStaff(env, body.session, ["doctor"]);
+      const who = await requireStaff(env, body.session, ["doctor", "staff", "pharmacy", "lab", "diagnostics", "billing"]);
       if (body.clinic && typeof body.clinic === "object") {
         if (who !== "admin") throw new HttpError(403, "Only the admin can change clinic details");
         const c = await clinicInfo(env);
@@ -1078,7 +1115,8 @@ async function handle(request, env) {
       await requireStaff(env, body.session, ["doctor"]);
       const date = String(body.date || clinicNow(env).date);
       const rows = (await D.prepare("SELECT id, data FROM docs WHERE coll = 'visits' AND json_extract(data, '$.date') = ? ORDER BY updated DESC").bind(date).all()).results || [];
-      const list = rows.map((r) => visitSummary(r.id, JSON.parse(r.data))).sort((a, b) => (a.token || 0) - (b.token || 0));
+      // Emergency queue first, then by token.
+      const list = rows.map((r) => visitSummary(r.id, JSON.parse(r.data))).sort((a, b) => (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0) || (a.token || 0) - (b.token || 0));
       return json({ visits: list });
     }
 
@@ -1224,6 +1262,7 @@ async function handle(request, env) {
       const vit = {};
       for (const k of ["bp", "pulse", "temp", "spo2", "rr", "rbs", "weight", "height"]) vit[k] = clean(body.vitals?.[k], 12);
       v.triage = { vitals: vit, note: clean(body.note, 500), at: Date.now() };
+      if (typeof body.urgent === "boolean") v.urgent = body.urgent;
       await putDoc(env, "visits", id, v);
       return json({ ok: true });
     }
@@ -1255,6 +1294,115 @@ async function handle(request, env) {
         })(),
         pharmacy: { toDispense: count(visits, (v) => v.status === "sent"), dispensed: count(visits, (v) => v.status === "dispensed"), outOfStock: count(stock, (x) => !x.stock) },
       });
+    }
+
+    // ----- plan -----
+    case "/api/plan": {
+      await readSession(env, body.session);
+      const pl = await planInfo(env);
+      const users = (await listDocs(env, "users")).filter((u) => u.active !== false);
+      return json({ plan: pl, usage: { doctors: users.filter((u) => u.role === "doctor").length, staff: users.filter((u) => u.role !== "doctor" && u.role !== "admin").length }, plans: Object.fromEntries(Object.entries(PLANS).map(([k, v]) => [k, { name: v.name, maxDoctors: v.maxDoctors, maxStaff: v.maxStaff, fee: v.fee, f: v.f }])), featureNames: FEATURE_NAMES });
+    }
+
+    case "/api/plan/set": {
+      await requireUser(env, body.session, ["admin"]);
+      const tier = String(body.tier || "");
+      if (!PLANS[tier]) throw new HttpError(400, "Choose a plan");
+      const users = (await listDocs(env, "users")).filter((u) => u.active !== false);
+      const docs = users.filter((u) => u.role === "doctor").length;
+      if (docs > PLANS[tier].maxDoctors) throw new HttpError(409, `${PLANS[tier].name} allows ${PLANS[tier].maxDoctors} doctor login${PLANS[tier].maxDoctors > 1 ? "s" : ""}; you have ${docs} active. Disable some first, or choose a bigger plan.`);
+      const addons = (Array.isArray(body.addons) ? body.addons : []).filter((a) => PLANS[tier].f[a] === "addon");
+      await setSetting(env, "plan", { tier, addons, changedAt: Date.now() });
+      return json({ plan: await planInfo(env) });
+    }
+
+    // ----- letters and certificates -----
+    case "/api/letters/save": {
+      const x = body.letter || {};
+      const type = String(x.type || "");
+      if (!LETTER_TYPES[type]) throw new HttpError(400, "Choose the document type");
+      const me = await requireUser(env, body.session, type === "timeslip" ? ["doctor", "staff", "billing"] : ["doctor"]);
+      let patient = billPatient(x.patient || {});
+      if (x.patientId) {
+        const p = await getDoc(env, "patients", String(x.patientId).toUpperCase());
+        if (p) patient = billPatient(Object.assign({ id: String(x.patientId).toUpperCase() }, p));
+      }
+      if (!patient.name) throw new HttpError(400, "Choose the patient");
+      const fields = {};
+      for (const [k, v] of Object.entries(x.fields || {}).slice(0, 30)) fields[clean(k, 40)] = clean(v, 3000);
+      const id = crypto.randomUUID();
+      const doc = {
+        type, title: LETTER_TYPES[type], no: await nextNo(env, "letter", "DOC"), patient, visitId: clean(x.visitId, 64), fields,
+        doctor: { name: me.user.name || "", qual: me.user.qual || "", reg: me.user.reg || "" }, created: Date.now(), date: clinicNow(env).date,
+      };
+      await putDoc(env, "letters", id, doc);
+      return json({ letter: Object.assign({ id }, doc) });
+    }
+
+    case "/api/letters/list": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const list = body.patientId
+        ? await listDocs(env, "letters", "json_extract(data, '$.patient.id') = ?", [String(body.patientId).toUpperCase()])
+        : await listDocs(env, "letters", "json_extract(data, '$.date') >= ?", [addDays(clinicNow(env).date, -30)]);
+      return json({ letters: list.sort((a, b) => b.created - a.created).slice(0, 200) });
+    }
+
+    // ----- follow-ups (review dates) and call-backs -----
+    case "/api/followups": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const today = clinicNow(env).date;
+      const from = String(body.from || addDays(today, -30)), to = String(body.to || addDays(today, 7));
+      const visits = await listDocs(env, "visits", "json_extract(data, '$.rx.review') >= ? AND json_extract(data, '$.rx.review') <= ?", [from, to]);
+      const out = [];
+      for (const v of visits) {
+        const pid = v.patient?.id;
+        // Came back already? Any later visit by the same patient on or after the review date minus 3 days.
+        let came = false;
+        if (pid) came = (await listDocs(env, "visits", "json_extract(data, '$.patient.id') = ? AND json_extract(data, '$.date') > ?", [pid, v.date])).length > 0;
+        out.push({ visitId: v.id, patient: v.patient, review: v.rx.review, reviewNote: v.rx.reviewNote || "", dx: v.rx.dx || "", visitDate: v.date,
+          doctor: v.doctor?.name || "", follow: v.follow || { status: came ? "came" : "due" }, came });
+      }
+      out.sort((a, b) => a.review.localeCompare(b.review));
+      return json({ today, followups: out });
+    }
+
+    case "/api/followups/update": {
+      const me = await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const id = String(body.visitId || "");
+      const v = await getDoc(env, "visits", id);
+      if (!v) throw new HttpError(404, "Visit not found");
+      const status = ["due", "called", "no-answer", "booked", "came", "not-coming"].includes(body.status) ? body.status : "called";
+      const log = (v.follow?.log || []).concat([{ status, note: clean(body.note, 300), by: me.user.name || me.role, at: Date.now() }]).slice(-20);
+      v.follow = { status, note: clean(body.note, 300), log };
+      await putDoc(env, "visits", id, v);
+      return json({ ok: true, follow: v.follow });
+    }
+
+    case "/api/callbacks/list": {
+      await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const status = body.status === "done" ? "done" : "open";
+      const list = await listDocs(env, "callbacks", "json_extract(data, '$.status') = ?", [status]);
+      return json({ callbacks: list.sort((a, b) => (a.due || "").localeCompare(b.due || "") || b.created - a.created).slice(0, 300) });
+    }
+
+    case "/api/callbacks/save": {
+      const me = await requireUser(env, body.session, ["doctor", "staff", "billing"]);
+      const x = body.callback || {};
+      const id = x.id ? String(x.id) : crypto.randomUUID();
+      const c = x.id ? await getDoc(env, "callbacks", id) : { created: Date.now(), createdBy: me.user.name || me.role, notes: [], status: "open" };
+      if (!c) throw new HttpError(404, "Call-back not found");
+      if (!x.id) {
+        let patient = billPatient(x.patient || {});
+        if (x.patientId) { const p = await getDoc(env, "patients", String(x.patientId).toUpperCase()); if (p) patient = billPatient(Object.assign({ id: String(x.patientId).toUpperCase() }, p)); }
+        if (!patient.name || !patient.phone) throw new HttpError(400, "Enter the name and mobile number");
+        c.patient = patient;
+      }
+      if ("reason" in x) c.reason = clean(x.reason, 300);
+      if ("due" in x) c.due = /^\d{4}-\d{2}-\d{2}$/.test(x.due) ? x.due : clinicNow(env).date;
+      if (x.note) c.notes = (c.notes || []).concat([{ text: clean(x.note, 300), by: me.user.name || me.role, at: Date.now() }]).slice(-30);
+      if (x.status === "done" || x.status === "open") c.status = x.status;
+      await putDoc(env, "callbacks", id, c);
+      return json({ callback: Object.assign({ id }, c) });
     }
 
     // ----- billing: price list -----
@@ -1329,6 +1477,7 @@ async function handle(request, env) {
       if (!DEPTS[dept] || dept === "ip") throw new HttpError(400, "Unknown department");
       const me = await requireUser(env, body.session, DEPT_ROLES[dept]);
       if (!canDept(me.role, dept)) throw new HttpError(403, "Your login can't bill for this department");
+      if (dept === "lab" || dept === "diagnostics") await needFeature(env, dept);
       const isNew = !x.id;
       const id = isNew ? crypto.randomUUID() : String(x.id);
       const b = isNew ? { dept, deptName: DEPT_NAMES[dept], payments: [], created: Date.now(), createdBy: me.user.name || me.role, date: clinicNow(env).date } : await getDoc(env, "bills", id);
@@ -1456,6 +1605,7 @@ async function handle(request, env) {
     // ----- inpatients -----
     case "/api/ip/admit": {
       const me = await requireUser(env, body.session, ["billing", "staff", "doctor"]);
+      await needFeature(env, "ip");
       const pid = String(body.patientId || "").toUpperCase();
       const p = await getDoc(env, "patients", pid);
       if (!p) throw new HttpError(404, "Find or register the patient first");
@@ -1581,3 +1731,50 @@ export default {
 };
 
 export { allSlots, makeSession, requireStaff, issueToken, clinicNow, validAadhaar, hashPassword, checkPassword };
+
+
+// Booking page opened from the clinic QR code. Plain HTML, no app needed.
+function bookingPage(c) {
+  const esc = (x) => String(x || "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Book an appointment · ${esc(c.name)}</title>
+<style>
+:root{--bg:#f4f7f6;--card:#fff;--fg:#14201f;--muted:#5a6b68;--line:#d6e0dd;--teal:#0e6a64;--soft:#dfeeeb;--red:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1716;--card:#172221;--fg:#e6efed;--muted:#9db0ac;--line:#2a3a38;--teal:#5fc2b8;--soft:#1d3633;--red:#f2867f}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:20px max(16px,env(safe-area-inset-left))}
+main{max-width:520px;margin:0 auto;display:flex;flex-direction:column;gap:14px}h1{font:600 26px Georgia,serif;margin:0}.rx{color:var(--red)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:10px}
+label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4px}input,select,textarea{font:inherit;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg)}
+.row{display:flex;gap:8px}.row>*{flex:1}.slots{display:flex;flex-wrap:wrap;gap:6px}.slots button{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:999px;padding:6px 12px;font:inherit;font-size:14px}
+.slots button[aria-pressed=true]{background:var(--teal);color:#fff;border-color:var(--teal)}.slots button:disabled{opacity:.35}
+.go{background:var(--teal);color:#fff;border:0;border-radius:999px;padding:13px;font:600 16px system-ui}.go:disabled{opacity:.5}.err{color:var(--red)}.ok{font-size:15px}.code{font:700 34px ui-monospace,monospace;color:var(--teal)}.muted{color:var(--muted);font-size:14px}
+</style></head><body><main>
+<div><h1><span class="rx">℞</span> ${esc(c.name || "Rx Clinic")}</h1><div class="muted">${esc(c.doctor)} ${c.qual ? "· " + esc(c.qual) : ""}<br>${esc(c.address)} ${c.phone ? "· " + esc(c.phone) : ""}</div></div>
+<form class="card" id="f">
+<label>Full name<input id="name" required maxlength="60" autocomplete="name"></label>
+<div class="row"><label>Age<input id="age" inputmode="numeric" maxlength="3"></label><label>Sex<select id="sex"><option>Female</option><option>Male</option><option>Other</option></select></label></div>
+<label>Mobile number<input id="phone" required inputmode="tel" maxlength="10" pattern="[0-9]{10}" autocomplete="tel"></label>
+<label>Date<input id="date" type="date" required></label>
+<div class="slots" id="slots"></div>
+<label>Visit<select id="mode"><option value="clinic">At the clinic</option><option value="tele">Video consultation</option></select></label>
+<label>Reason (optional)<textarea id="reason" rows="2" maxlength="300"></textarea></label>
+<div class="err" id="err"></div>
+<button class="go" id="go" type="submit">Book appointment</button>
+</form>
+<div class="card ok" id="done" hidden></div>
+</main><script>
+const $=(i)=>document.getElementById(i);let time="";
+const t=new Date();const iso=(d)=>new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
+$("date").min=iso(t);$("date").value=iso(t);
+async function slots(){time="";$("slots").textContent="Loading times…";try{const r=await fetch("/api/slots?date="+$("date").value);const j=await r.json();
+$("slots").innerHTML="";(j.slots||[]).forEach(s=>{const b=document.createElement("button");b.type="button";b.textContent=s.t;b.disabled=!s.free;b.setAttribute("aria-pressed","false");
+b.onclick=()=>{time=s.t;[...$("slots").children].forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"))};$("slots").appendChild(b)});
+if(!$("slots").children.length)$("slots").textContent="No times left on this day. Choose another date.";}catch(e){$("slots").textContent="Couldn't load times."}}
+$("date").onchange=slots;slots();
+$("f").onsubmit=async(e)=>{e.preventDefault();$("err").textContent="";if(!time){$("err").textContent="Choose a time.";return}$("go").disabled=true;
+try{const r=await fetch("/api/book",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:$("name").value,age:$("age").value,sex:$("sex").value,phone:$("phone").value,date:$("date").value,time,mode:$("mode").value,reason:$("reason").value,lang:"en"})});
+const j=await r.json();if(!r.ok)throw new Error(j.error||"Couldn't book");const a=j.appointment;$("f").hidden=true;$("done").hidden=false;
+$("done").innerHTML="<b>Booked.</b><div>"+a.date+" at "+a.time+(a.mode==="tele"?" · video consultation":"")+"</div><div class=muted>Your booking code</div><div class=code>"+a.code+"</div><div class=muted>Keep this code. "+(a.mode==="tele"?"Open the Rx Clinic app at the time and join with this code and your mobile number.":"Show it at the desk when you arrive.")+"</div>";}
+catch(err){$("err").textContent=err.message}finally{$("go").disabled=false}};
+</script></body></html>`;
+}

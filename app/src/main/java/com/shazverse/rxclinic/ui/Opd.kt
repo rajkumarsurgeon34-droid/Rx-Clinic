@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.LocalHospital
+import androidx.compose.material.icons.filled.EventRepeat
 import androidx.compose.material.icons.filled.EventAvailable
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Refresh
@@ -126,7 +127,7 @@ private val QUICK_ADVICE = listOf(
 // ---------- Doctor home ----------
 
 @Composable
-fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onSignedOut: () -> Unit) {
+fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppointments: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         TopBar(vm.prefs.doctorName.ifBlank { "Doctor" }, onBack) {
             AccountButton(vm, onSignedOut)
@@ -135,7 +136,8 @@ fun DoctorHome(vm: CallViewModel, onBack: () -> Unit, onOpd: () -> Unit, onAppoi
             RoleCard("OPD today", "Patients who checked in, their case sheets, AI suggestions and prescriptions", Icons.Filled.Groups, onOpd)
             RoleCard("Appointments and video teleconsults", "Bookings by day; start video calls", Icons.Filled.EventAvailable, onAppointments)
             RoleCard("Patient records", "Find by Patient ID, mobile, Aadhaar or name; register; past visits", Icons.Filled.Badge, onPatients)
-            RoleCard("Inpatients", "Admitted patients, admit, ward charges", Icons.Filled.LocalHospital, onInpatients)
+            if (vm.prefs.has("ip")) RoleCard("Inpatients", "Admitted patients, admit, ward charges", Icons.Filled.LocalHospital, onInpatients)
+            RoleCard("Follow-ups", "Reviews due, missed reviews, call-back list", Icons.Filled.EventRepeat, onFollowUps)
         }
     }
 }
@@ -234,6 +236,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
     val stockNames = remember { mutableStateListOf<String>() }
     var stockText by remember { mutableStateOf("") }
     val history = remember { mutableStateListOf<JSONObject>() }
+    var letterOpen by remember { mutableStateOf(false) }
 
     LaunchedEffect(visitId) {
         try {
@@ -638,10 +641,27 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                         val text = prescriptionText(vm.prefs.doctorName, p.str("name"), p.str("age"), p.str("sex"), finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote, p.str("id"))
                         context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share prescription"))
                     }, modifier = Modifier.fillMaxWidth()) { Text("Share prescription (WhatsApp, SMS…)") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            Printer.print(context, "Prescription ${p.str("name")}", prescriptionHtml(vm.prefs, p, finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote))
+                        }, modifier = Modifier.weight(1f)) { Text("Print / PDF") }
+                        OutlinedButton(onClick = { letterOpen = true }, modifier = Modifier.weight(1f)) { Text("Certificate / letter") }
+                    }
                     Text("AI suggestions are for the doctor to verify. Nothing reaches the prescription until you add it.", color = Ui.Muted, fontSize = 12.sp)
                 }
             }
         }
+    }
+    if (letterOpen) visit?.let { v ->
+        val summary = buildString {
+            val cs = v.optJSONObject("caseSheet")
+            cs.objs("chiefComplaints").joinToString("; ") { it.str("complaint") + if (it.str("duration").isNotBlank()) " for " + it.str("duration") else "" }
+                .takeIf { it.isNotBlank() }?.let { append("Presenting complaint: $it. ") }
+            cs.str("hpi").takeIf { it.isNotBlank() }?.let { append("$it ") }
+            (finalDx.ifBlank { provisional }).takeIf { it.isNotBlank() }?.let { append("Diagnosis: $it. ") }
+            if (rx.isNotEmpty()) append("Treatment given: " + rx.joinToString(", ") { it.line() } + ".")
+        }
+        LetterDialog(vm, session, v.optJSONObject("patient") ?: JSONObject(), visitId, finalDx.ifBlank { provisional }, summary, onDismiss = { letterOpen = false })
     }
 }
 

@@ -12,8 +12,8 @@ android {
         applicationId = "com.shazverse.rxclinic"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.6"
+        versionCode = 7
+        versionName = "0.7"
         // The Rx Clinic server address (Cloudflare Worker). Override with the RX_CLINIC_SERVER_URL repo variable.
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${System.getenv("RX_CLINIC_SERVER_URL")?.takeIf { it.isNotBlank() } ?: "https://rx-clinic.rajkumarsurgeon34.workers.dev"}\"")
     }
@@ -56,4 +56,5 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.2")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("com.google.zxing:core:3.5.3")
 }

@@ -6,6 +6,7 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +32,8 @@ import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Biotech
 import androidx.compose.material.icons.filled.PriceChange
+import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.WorkspacePremium
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.LocalPharmacy
@@ -117,6 +120,9 @@ fun StaffLogin(vm: CallViewModel, role: String, onBack: () -> Unit, onIn: (Strin
                             vm.prefs.saveSession(s.role, s.token)
                             vm.prefs.staffUsername = s.username
                             vm.prefs.doctorName = s.name
+                            vm.prefs.staffQual = s.qual; vm.prefs.staffReg = s.reg
+                            vm.prefs.clinicJson = s.clinic.toString()
+                            runCatching { Api(vm.prefs.serverUrl).call("/api/plan", JSONObject().put("session", s.token)).optJSONObject("plan") }.getOrNull()?.let { vm.prefs.planJson = it.toString() }
                             if (s.mustChange) mustChange = s.role else onIn(s.role)
                         } catch (e: Exception) { err = e.message } finally { busy = false }
                     }
@@ -206,7 +212,7 @@ internal fun AccountButton(vm: CallViewModel, onSignedOut: () -> Unit) {
 // ---------------- Nursing staff: OPD triage vitals ----------------
 
 @Composable
-fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onSignedOut: () -> Unit) {
+fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onInpatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("staff") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     val api = remember { Api(vm.prefs.serverUrl) }
     val scope = rememberCoroutineScope()
@@ -226,12 +232,15 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
 
     Column(Modifier.fillMaxSize()) {
         TopBar("Nursing · Triage", onBack) {
-            TextButton(onClick = onPatients) { Text("Patients") }
-            TextButton(onClick = onInpatients) { Text("IP") }
             IconButton(onClick = { refresh++ }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Ui.Text) }
             AccountButton(vm, onSignedOut)
         }
-        Text("Today's checked-in patients. Record vitals before they see the doctor; they appear on the doctor's case sheet.",
+        QuickLinks(buildList {
+            add("Patients" to onPatients)
+            if (vm.prefs.has("ip")) add("Inpatients" to onInpatients)
+            add("Follow-ups" to onFollowUps)
+        })
+        Text("Today's checked-in patients. Record vitals before they see the doctor; they appear on the doctor's case sheet. Mark emergencies so they go to the top of the doctor's queue.",
             color = Ui.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
         Box(Modifier.padding(horizontal = 16.dp)) { ErrorText(err) }
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -257,6 +266,7 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
         val fields = listOf("bp" to "BP (mmHg)", "pulse" to "Pulse (/min)", "temp" to "Temp (°F)", "spo2" to "SpO₂ (%)", "rr" to "Resp. rate", "rbs" to "RBS (mg/dL)", "weight" to "Weight (kg)", "height" to "Height (cm)")
         val vals = remember(v) { mutableStateMapOf<String, String>().apply { fields.forEach { (k, _) -> put(k, prev.str(k)) } } }
         var note by remember(v) { mutableStateOf(v.obj("triage").str("note")) }
+        var urgent by remember(v) { mutableStateOf(v.optBoolean("urgent")) }
         AlertDialog(
             onDismissRequest = { editing = null },
             title = { Text("Vitals · ${v.obj("patient").str("name")}") },
@@ -267,6 +277,13 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
                             keyboardOptions = KeyboardOptions(keyboardType = if (k == "bp") KeyboardType.Text else KeyboardType.Decimal), modifier = Modifier.fillMaxWidth())
                     }
                     OutlinedTextField(note, { note = it.take(500) }, label = { Text("Nursing note") }, modifier = Modifier.fillMaxWidth())
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Emergency", color = if (urgent) Ui.Red else Ui.Text, fontWeight = FontWeight.SemiBold)
+                            Text("Moves the patient to the top of the doctor's queue", color = Ui.Muted, fontSize = 12.sp)
+                        }
+                        Switch(checked = urgent, onCheckedChange = { urgent = it })
+                    }
                 }
             },
             confirmButton = {
@@ -274,7 +291,7 @@ fun NurseScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, o
                     scope.launch {
                         try {
                             val vo = JSONObject(); vals.forEach { (k, x) -> vo.put(k, x) }
-                            api.call("/api/nurse/vitals", JSONObject().put("session", session).put("id", v.str("id")).put("vitals", vo).put("note", note))
+                            api.call("/api/nurse/vitals", JSONObject().put("session", session).put("id", v.str("id")).put("vitals", vo).put("note", note).put("urgent", urgent))
                             Toast.makeText(context, "Vitals saved", Toast.LENGTH_SHORT).show()
                             editing = null; refresh++
                         } catch (e: Exception) { Toast.makeText(context, e.message ?: "Couldn't save", Toast.LENGTH_LONG).show() }
@@ -608,6 +625,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
     val users = remember { mutableStateListOf<JSONObject>() }
     val clinic = remember { mutableStateMapOf<String, String>() }
     var editing by remember { mutableStateOf<JSONObject?>(null) }
+    var qr by remember { mutableStateOf(false) }
 
     LaunchedEffect(refresh) {
         err = null
@@ -652,6 +670,8 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
             item { RoleCard("Patient records", "Register, find and edit patients", Icons.Filled.Badge) { onOpen("patients") } }
             item { RoleCard("Billing", "OPD bills, patient totals, inpatients, collections", Icons.AutoMirrored.Filled.ReceiptLong) { onOpen("billing") } }
             item { RoleCard("Price list", "Consultation, tests, scans, rooms and inpatient charges", Icons.Filled.PriceChange) { onOpen("prices") } }
+            item { RoleCard("Plan", "Bronze, Silver, Gold or Platinum; add-ons; logins in use", Icons.Filled.WorkspacePremium) { onOpen("plan") } }
+            item { RoleCard("Clinic QR code", "Patients scan to book; print a poster for the desk", Icons.Filled.QrCode2) { qr = true } }
             item { RoleCard("Lab", "Test orders and reports", Icons.Filled.Biotech) { onOpen("lab") } }
             item { RoleCard("Diagnostics", "USG, CT, MRI, PET-CT, X-ray", Icons.Filled.MonitorHeart) { onOpen("diagnostics") } }
             item {
@@ -698,6 +718,7 @@ fun AdminScreen(vm: CallViewModel, onBack: () -> Unit, onOpen: (String) -> Unit,
         }
     }
 
+    if (qr) ClinicQrDialog(vm, onDismiss = { qr = false })
     editing?.let { u ->
         UserDialog(vm, session, u, onDone = { changed -> editing = null; if (changed) { refresh++; Toast.makeText(context, "Login saved", Toast.LENGTH_SHORT).show() } })
     }
@@ -793,4 +814,12 @@ internal fun RowCard(onClick: (() -> Unit)? = null, content: @Composable android
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) { content() }
+}
+
+/** A row of quick shortcuts under the top bar. */
+@Composable
+internal fun QuickLinks(links: List<Pair<String, () -> Unit>>) {
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        links.forEach { (label, go) -> OutlinedButton(onClick = go, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp)) { Text(label, fontSize = 13.sp) } }
+    }
 }

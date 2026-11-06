@@ -28,7 +28,7 @@ data class Appt(
 }
 
 data class Slot(val time: String, val free: Boolean)
-data class Session(val token: String, val role: String, val name: String, val username: String, val mustChange: Boolean, val clinicName: String)
+data class Session(val token: String, val role: String, val name: String, val username: String, val mustChange: Boolean, val clinicName: String, val qual: String = "", val reg: String = "", val clinic: JSONObject = JSONObject())
 data class Joined(val url: String, val token: String, val identity: String, val role: String, val room: String, val title: String)
 
 class ApiException(message: String) : Exception(message)
@@ -62,7 +62,7 @@ class Api(private val baseUrl: String) {
         val o = post("/api/login", JSONObject().put("username", username.trim()).put("password", password))
         val u = o.optJSONObject("user") ?: JSONObject()
         val c = o.optJSONObject("clinic") ?: JSONObject()
-        return Session(o.getString("session"), o.getString("role"), u.optString("name"), u.optString("username"), u.optBoolean("mustChange"), c.optString("name"))
+        return Session(o.getString("session"), o.getString("role"), u.optString("name"), u.optString("username"), u.optBoolean("mustChange"), c.optString("name"), u.optString("qual"), u.optString("reg"), c)
     }
 
     /** Changes the signed-in person's password; returns the new session (old ones stop working). */

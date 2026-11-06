@@ -98,7 +98,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry, Billing, Inpatients, PriceList }
+private enum class Screen { Home, PatientHome, Book, MyAppointments, StaffLogin, DoctorDay, DoctorHome, OpdQueue, Case, Checkin, Nurse, Pharmacy, Lab, Diagnostics, Admin, PatientAccount, Registry, Billing, Inpatients, PriceList, FollowUps, Plan }
 
 private fun roleScreen(role: String) = when (role) {
     "doctor" -> Screen.DoctorHome; "staff" -> Screen.Nurse; "pharmacy" -> Screen.Pharmacy
@@ -117,6 +117,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     fun open(role: String) {
         if (role == "patients") { screen = Screen.Registry; return }
         if (role == "prices") { screen = Screen.PriceList; return }
+        if (role == "plan") { screen = Screen.Plan; return }
         val has = if (role == "admin") prefs.session("admin") != null else prefs.sessionFor(role) != null
         if (has) screen = roleScreen(role) else { loginRole = role; screen = Screen.StaffLogin }
     }
@@ -127,7 +128,7 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
     CompositionLocalProvider(LocalContentColor provides Ui.Text) {
     Box(Modifier.fillMaxSize().background(Ui.Bg).statusBarsPadding().navigationBarsPadding()) {
         when (screen) {
-            Screen.Home -> HomeScreen(onPatient = { screen = Screen.PatientHome }, onRole = { open(it) }, onSettings = { showSettings = true })
+            Screen.Home -> HomeScreen(vm, onPatient = { screen = Screen.PatientHome }, onRole = { open(it) }, onSettings = { showSettings = true })
             Screen.PatientHome -> PatientHome(
                 vm,
                 onAccount = { screen = Screen.PatientAccount },
@@ -140,12 +141,14 @@ fun RxApp(vm: CallViewModel, withMedia: (() -> Unit) -> Unit) {
             Screen.MyAppointments -> MyAppointments(vm, withMedia, onBack = { screen = Screen.PatientHome }, onBook = { screen = Screen.Book })
             Screen.StaffLogin -> StaffLogin(vm, loginRole, onBack = { screen = Screen.Home }, onIn = { r -> screen = roleScreen(r) })
             Screen.DoctorDay -> DoctorDay(vm, withMedia, onBack = { screen = Screen.DoctorHome }, onSignedOut = signedOut("doctor"))
-            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onSignedOut = signedOut("doctor"))
+            Screen.DoctorHome -> DoctorHome(vm, onBack = back, onOpd = { screen = Screen.OpdQueue }, onAppointments = { screen = Screen.DoctorDay }, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("doctor"))
             Screen.OpdQueue -> OpdQueue(vm, onBack = { screen = Screen.DoctorHome }, onOpen = { caseId = it; screen = Screen.Case }, onSignedOut = signedOut("doctor"))
             Screen.Case -> CaseScreen(vm, caseId, onBack = { screen = Screen.OpdQueue })
             Screen.Checkin -> CheckinScreen(vm, onBack = { screen = Screen.PatientHome })
-            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onSignedOut = signedOut("staff"))
-            Screen.Billing -> BillingScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onSignedOut = signedOut("billing"))
+            Screen.Nurse -> NurseScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onInpatients = { screen = Screen.Inpatients }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("staff"))
+            Screen.FollowUps -> FollowUpsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
+            Screen.Plan -> PlanScreen(vm, onBack = { screen = Screen.Admin })
+            Screen.Billing -> BillingScreen(vm, onBack = back, onPatients = { screen = Screen.Registry }, onFollowUps = { screen = Screen.FollowUps }, onSignedOut = signedOut("billing"))
             Screen.Inpatients -> InpatientsScreen(vm, onBack = { screen = prefs.staffRole?.let { roleScreen(it) } ?: Screen.Home }, onSignedOut = signedOut("staff"))
             Screen.PriceList -> PriceListScreen(vm, onBack = { screen = Screen.Admin })
             Screen.PatientAccount -> PatientAccountScreen(vm, onBack = { screen = Screen.PatientHome })
@@ -230,7 +233,7 @@ fun time12(t: String): String = runCatching {
 // ---------------- Home ----------------
 
 @Composable
-private fun HomeScreen(onPatient: () -> Unit, onRole: (String) -> Unit, onSettings: () -> Unit) {
+private fun HomeScreen(vm: CallViewModel, onPatient: () -> Unit, onRole: (String) -> Unit, onSettings: () -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("℞", color = Ui.Red, fontSize = 34.sp, fontFamily = FontFamily.Serif)
@@ -238,8 +241,20 @@ private fun HomeScreen(onPatient: () -> Unit, onRole: (String) -> Unit, onSettin
             Text("Rx Clinic", color = Ui.Text, fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Serif, modifier = Modifier.weight(1f))
             IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings", tint = Ui.Text) }
         }
-        Text("Who is using the app?", color = Ui.Muted, modifier = Modifier.padding(bottom = 16.dp))
-        RoleCard("Patient", "Check in, book an appointment, video teleconsult", Icons.Filled.Person, onPatient)
+        val role = vm.prefs.staffRole
+        if (role != null) {
+            Column(
+                Modifier.fillMaxWidth().padding(vertical = 8.dp).clip(RoundedCornerShape(18.dp)).background(Ui.Teal).clickable { onRole(role) }.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text("SIGNED IN", color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.75f), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                Text(vm.prefs.doctorName.ifBlank { vm.prefs.staffUsername }, color = androidx.compose.ui.graphics.Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Text("Continue to ${ROLE_TITLES[role] ?: role} →", color = androidx.compose.ui.graphics.Color.White, fontSize = 14.sp)
+            }
+        }
+        Text("PATIENTS", color = Ui.Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
+        RoleCard(if (vm.prefs.patientSession != null) "Patient · ${vm.prefs.patientName}" else "Patient", "Check in, book an appointment, video consult, my records", Icons.Filled.Person, onPatient)
+        Text("STAFF SIGN-IN", color = Ui.Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
         RoleCard("Doctor", "OPD case sheets with AI, appointments, video", Icons.Filled.MedicalServices) { onRole("doctor") }
         RoleCard("Nursing staff", "Triage vitals for today's OPD", Icons.Filled.LocalHospital) { onRole("staff") }
         RoleCard("Pharmacy", "Prescriptions to dispense, medicine stock", Icons.Filled.LocalPharmacy) { onRole("pharmacy") }

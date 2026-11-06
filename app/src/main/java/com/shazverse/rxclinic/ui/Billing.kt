@@ -383,6 +383,7 @@ fun BillView(vm: CallViewModel, session: String, start: JSONObject, onDismiss: (
             Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, "Close", tint = Ui.Text) }
                 Text("${b.str("deptName")} bill", color = Ui.Text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif, modifier = Modifier.weight(1f))
+                TextButton(onClick = { Printer.print(context, "Bill ${b.str("no")}", billHtml(vm.prefs, b)) }) { Text("Print / PDF") }
                 TextButton(onClick = { shareText(context, billText(b, "")) }) { Text("Share") }
             }
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -527,19 +528,17 @@ internal fun MiniStat(label: String, value: String, modifier: Modifier = Modifie
 // ---------------- Billing desk: OPD bills, patient total, inpatients, collections ----------------
 
 @Composable
-fun BillingScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onSignedOut: () -> Unit) {
+fun BillingScreen(vm: CallViewModel, onBack: () -> Unit, onPatients: () -> Unit, onFollowUps: () -> Unit, onSignedOut: () -> Unit) {
     val session = vm.prefs.sessionFor("billing") ?: run { LaunchedEffect(Unit) { onSignedOut() }; return }
     var tab by remember { mutableStateOf("opd") }
     var newOpd by remember { mutableStateOf(false) }
     var opdPatient by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableIntStateOf(0) }
     Column(Modifier.fillMaxSize()) {
-        TopBar("Billing", onBack) {
-            TextButton(onClick = onPatients) { Text("Patients") }
-            AccountButton(vm, onSignedOut)
-        }
+        TopBar("Billing", onBack) { AccountButton(vm, onSignedOut) }
+        QuickLinks(listOf("Patients" to onPatients, "Follow-ups" to onFollowUps))
         FlowRow(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("opd" to "OPD bills", "total" to "Patient total", "ip" to "Inpatients", "day" to "Collections").forEach { (k, l) -> Choice(l, tab == k) { tab = k } }
+            listOf("opd" to "OPD bills", "total" to "Patient total", "ip" to "Inpatients", "day" to "Collections").filter { it.first != "ip" || vm.prefs.has("ip") }.forEach { (k, l) -> Choice(l, tab == k) { tab = k } }
         }
         when (tab) {
             "opd" -> BillsPanel(vm, session, "opd", refresh, onNew = { newOpd = true }, newLabel = "New OPD bill (consultation, procedures)")

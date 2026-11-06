@@ -44,6 +44,29 @@ class Prefs(context: Context) {
             else { putString("staff_session", token); putString("staff_role", role) }
         }.apply()
 
+    /** Signed-in doctor's qualification and registration number, for prescriptions and certificates. */
+    var staffQual: String
+        get() = sp.getString("staff_qual", "") ?: ""
+        set(v) = sp.edit().putString("staff_qual", v).apply()
+    var staffReg: String
+        get() = sp.getString("staff_reg", "") ?: ""
+        set(v) = sp.edit().putString("staff_reg", v).apply()
+
+    /** Clinic letterhead (name, address, phone, hours) as JSON. */
+    var clinicJson: String
+        get() = sp.getString("clinic_json", "{}") ?: "{}"
+        set(v) = sp.edit().putString("clinic_json", v).apply()
+
+    /** Features switched on by the clinic's plan, as JSON {"ip":true,...}. Empty = not loaded yet (show everything). */
+    var planJson: String
+        get() = sp.getString("plan_json", "") ?: ""
+        set(v) = sp.edit().putString("plan_json", v).apply()
+
+    fun has(feature: String): Boolean {
+        val j = planJson.ifBlank { return true }
+        return runCatching { org.json.JSONObject(j).optJSONObject("features")?.optBoolean(feature, true) ?: true }.getOrDefault(true)
+    }
+
     // ----- patient sign-in -----
 
     val patientSession: String? get() = sp.getString("patient_session", null)
