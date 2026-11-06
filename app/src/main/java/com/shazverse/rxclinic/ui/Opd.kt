@@ -643,7 +643,7 @@ fun CaseScreen(vm: CallViewModel, visitId: String, onBack: () -> Unit) {
                     }, modifier = Modifier.fillMaxWidth()) { Text("Share prescription (WhatsApp, SMS…)") }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(onClick = {
-                            Printer.print(context, "Prescription ${p.str("name")}", prescriptionHtml(vm.prefs, p, finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote))
+                            Printer.print(context, "Prescription ${p.str("name")}", prescriptionHtml(vm.prefs, p ?: JSONObject(), finalDx.ifBlank { provisional }, surgery, rx, advice, physio, psych, review, reviewNote))
                         }, modifier = Modifier.weight(1f)) { Text("Print / PDF") }
                         OutlinedButton(onClick = { letterOpen = true }, modifier = Modifier.weight(1f)) { Text("Certificate / letter") }
                     }
