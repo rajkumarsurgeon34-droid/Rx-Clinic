@@ -15,7 +15,7 @@ Video calls are built in, using the same engine as **SRK Meet** (LiveKit): the d
 ## How it fits together
 
 ```
-Rx Clinic app ──(booking, sign-in, video pass)──▶ Rx Clinic server (Cloudflare Worker + D1)
+Rx Clinic app ──(booking, sign-in, video pass)──▶ Rx Clinic server (Cloudflare Worker + D1, reports in R2)
 Rx Clinic app ◀══════════ live audio / video / chat ══════════▶ LiveKit Cloud (shared with SRK Meet)
 Rx Clinic server ──(AI prompts, next stage)──▶ OpenAI
 ```
@@ -24,6 +24,12 @@ Rx Clinic server ──(AI prompts, next stage)──▶ OpenAI
 
 ### 1. Database (Cloudflare D1, free)
 Nothing to do: the first deploy creates the D1 database `rxclinic-db` and links it to the worker. Tables are created automatically on first use.
+
+### 1b. Report storage (Cloudflare R2, free 10 GB)
+Lab and scan photos/PDFs are kept in R2 so they don't fill the 1 GB D1 database.
+In the Cloudflare dashboard open **R2 Object Storage → Enable R2** (it asks for a card; the first 10 GB a month are free).
+The next deploy creates the bucket `rxclinic-files` and links it as `FILES`. Reports can then be up to 5 MB,
+and older reports saved in D1 move into R2 the first time they are opened. `/status` shows `"files": "r2"`.
 
 ### 2. The Rx Clinic server (Cloudflare Worker)
 1. **Workers & Pages → Create → Import a repository →** this repo, worker name `rx-clinic` (leave the root directory as `/`).

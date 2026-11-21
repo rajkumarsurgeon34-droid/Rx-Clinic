@@ -508,6 +508,15 @@ Reply with ONLY this JSON:
 {"chiefComplaints":[{"complaint":"","duration":""}],"hpi":"one clinical paragraph","past":{"medical":"","surgical":"","transfusion":"","drugs":"","allergies":""},"habits":{"smoking":"","alcohol":"","tobacco":"","diet":"","sleep":"","appetiteBowelBladder":""},"menstrualObstetric":"","family":"","redFlags":[]}`;
 }
 
+// ---------- report files in Cloudflare R2 ----------
+// Stored as the same base64 text the app sends, so no decoding is needed (keeps CPU time low on the free plan).
+const FILE_MAX_B64 = 7000000; // about 5 MB of original file
+async function putFileR2(env, id, b64, type) {
+  const key = `files/${id}`;
+  await env.FILES.put(key, b64, { httpMetadata: { contentType: "text/plain" }, customMetadata: { type } });
+  return key;
+}
+
 async function getDoc(env, coll, id) {
   const r = await (await db(env)).prepare("SELECT data FROM docs WHERE coll = ? AND id = ?").bind(coll, id).first();
   return r ? JSON.parse(r.data) : null;
@@ -766,7 +775,7 @@ async function handle(request, env) {
     if (path === "/" || path === "/status") {
       let database = false;
       try { await db(env); database = true; } catch { /* reported below */ }
-      return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
+      return json({ ok: true, service: "rx-clinic", database, video: liveKitReady(env), ai: !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.AI), files: env.FILES ? "r2" : "d1", aiProvider: env.ANTHROPIC_API_KEY ? "claude" : env.OPENAI_API_KEY ? "openai" : env.AI ? "cloudflare-workers-ai" : "none", freeFallback: !!env.AI });
     }
     if (path === "/login" || path === "/portal" || path === "/terms" || path === "/hmis" || path === "/me") {
       const page = path === "/login" ? loginPage : path === "/portal" ? portalPage : path === "/hmis" ? hmisPage : path === "/me" ? mePage : termsPage;
@@ -1635,11 +1644,15 @@ async function handle(request, env) {
       const me = await requireUser(env, body.session, ["doctor", "staff", "lab", "diagnostics"]);
       const data = String(body.data || "");
       if (!/^[A-Za-z0-9+/=]+$/.test(data)) throw new HttpError(400, "File data is not valid");
-      if (data.length > 1200000) throw new HttpError(400, "File is too large. Keep it under 850 KB (photos are shrunk automatically).");
+      // Reports go to Cloudflare R2 (binding FILES, 10 GB free) when it is connected; otherwise they fall back to D1,
+      // which has only 1 GB for the whole clinic, so the limit there stays small.
+      if (env.FILES ? data.length > FILE_MAX_B64 : data.length > 1200000)
+        throw new HttpError(400, env.FILES ? "File is too large. Keep it under 5 MB." : "File is too large. Keep it under 850 KB (photos are shrunk automatically).");
       const type = ["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(body.type) ? body.type : "";
       if (!type) throw new HttpError(400, "Only photos (JPG, PNG) and PDF files");
       const id = crypto.randomUUID();
-      await putDoc(env, "files", id, { name: clean(body.name, 120) || "report", type, data, patientId: String(body.patientId || "").toUpperCase(), orderId: clean(body.orderId, 64), visitId: clean(body.visitId, 64), at: Date.now(), by: me.user.name || me.role });
+      const stored = env.FILES ? { r2: await putFileR2(env, id, data, type) } : { data };
+      await putDoc(env, "files", id, { name: clean(body.name, 120) || "report", type, ...stored, patientId: String(body.patientId || "").toUpperCase(), orderId: clean(body.orderId, 64), visitId: clean(body.visitId, 64), at: Date.now(), by: me.user.name || me.role });
       if (body.orderId) { const o = await getDoc(env, "orders", String(body.orderId)); if (o) { o.files = (o.files || []).concat([id]).slice(-10); await putDoc(env, "orders", String(body.orderId), o); } }
       return json({ id });
     }
@@ -1656,6 +1669,18 @@ async function handle(request, env) {
       const f = await getDoc(env, "files", String(body.id || ""));
       if (!f) throw new HttpError(404, "File not found");
       if (s2.role === "patient" && f.patientId !== s2.uid) throw new HttpError(403, "Not your file");
+      if (f.r2) {
+        if (!env.FILES) throw new HttpError(503, "File storage (R2) is not connected to the server");
+        const obj = await env.FILES.get(f.r2);
+        if (!obj) throw new HttpError(404, "File not found in storage");
+        return json({ name: f.name, type: f.type, data: await obj.text() });
+      }
+      // Older report kept inside D1: move it to R2 now to free database space.
+      if (env.FILES && f.data) {
+        const data = f.data;
+        try { f.r2 = await putFileR2(env, String(body.id), data, f.type); delete f.data; await putDoc(env, "files", String(body.id), f); } catch { /* keep it in D1 */ }
+        return json({ name: f.name, type: f.type, data });
+      }
       return json({ name: f.name, type: f.type, data: f.data });
     }
 
@@ -3378,7 +3403,7 @@ async function pagePharmacy(){
 function pickFile(){return new Promise(res=>{const i=document.createElement("input");i.type="file";i.accept="image/*,application/pdf";i.onchange=()=>res(i.files[0]);i.click()})}
 async function toB64(file){
  if(file.type.startsWith("image/")){const img=await createImageBitmap(file);const s=Math.min(1,1600/Math.max(img.width,img.height));const c=document.createElement("canvas");c.width=Math.round(img.width*s);c.height=Math.round(img.height*s);c.getContext("2d").drawImage(img,0,0,c.width,c.height);return {type:"image/jpeg",data:c.toDataURL("image/jpeg",.75).split(",")[1]}}
- if(file.size>850000)throw new Error("PDF is too large. Keep it under 850 KB.");
+ if(file.size>5000000)throw new Error("PDF is too large. Keep it under 5 MB.");
  const u=new Uint8Array(await file.arrayBuffer());let bin="";for(let i=0;i<u.length;i+=8192)bin+=String.fromCharCode(...u.subarray(i,i+8192));return {type:"application/pdf",data:btoa(bin)}}
 async function uploadFor(meta){const f=await pickFile();if(!f)return false;try{const b=await toB64(f);await api("/api/files/upload",Object.assign({name:f.name,type:b.type,data:b.data},meta));toast("Uploaded");return true}catch(e){toast(e.message);return false}}
 async function viewFile(id){try{const f=await api("/api/files/get",{id});const url="data:"+f.type+";base64,"+f.data;
