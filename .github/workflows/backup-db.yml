@@ -1,0 +1,74 @@
+name: Nightly database backup
+# Copies the whole Rx Clinic D1 database (rxclinic-db) into the private R2 bucket
+# rxclinic-files, under backups/. One file per day of the month, so the last
+# ~31 days are kept and older ones are overwritten automatically.
+#
+# One-time setup — add two repository secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   a Cloudflare API token with "D1: Edit" and "Workers R2 Storage: Edit"
+#   CLOUDFLARE_ACCOUNT_ID  your Cloudflare account ID
+#
+# This repo is public, so the backup is NEVER saved as a GitHub artifact or printed
+# in the log: it goes straight to the private R2 bucket and the local copy is deleted.
+#
+# To restore (only if needed): download the file from R2 → backups/, unzip it, then
+#   npx wrangler d1 execute rxclinic-db --remote --file db.sql
+# (restore into a new, empty database first to check it, before touching the live one).
+
+on:
+  schedule:
+    - cron: "30 21 * * *"   # 03:00 India time, every night
+  workflow_dispatch:         # Actions → Nightly database backup → Run workflow (to test)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Check the secrets are set
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::Add the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets first (see the top of this file)."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Install Wrangler
+        run: npm install --no-save --no-audit --no-fund wrangler@4 >/dev/null
+
+      - name: Export the database
+        run: |
+          set -euo pipefail
+          umask 077
+          npx wrangler d1 export rxclinic-db --remote --output "$RUNNER_TEMP/db.sql" >/dev/null
+          gzip -9 "$RUNNER_TEMP/db.sql"
+          SIZE=$(stat -c %s "$RUNNER_TEMP/db.sql.gz")
+          if [ "$SIZE" -lt 200 ]; then echo "::error::Backup looks empty ($SIZE bytes)"; exit 1; fi
+          echo "Backup size: $SIZE bytes (compressed)"
+
+      - name: Upload to the private R2 bucket
+        run: |
+          set -euo pipefail
+          DAY=$(TZ=Asia/Kolkata date +%d)
+          npx wrangler r2 object put "rxclinic-files/backups/db-day-$DAY.sql.gz" --remote \
+            --file "$RUNNER_TEMP/db.sql.gz" --content-type application/gzip >/dev/null
+          printf '%s\n' "$(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M IST') db-day-$DAY.sql.gz" > "$RUNNER_TEMP/latest.txt"
+          npx wrangler r2 object put "rxclinic-files/backups/latest.txt" --remote \
+            --file "$RUNNER_TEMP/latest.txt" --content-type text/plain >/dev/null
+          echo "Saved backups/db-day-$DAY.sql.gz"
+
+      - name: Delete the local copy
+        if: always()
+        run: rm -f "$RUNNER_TEMP/db.sql" "$RUNNER_TEMP/db.sql.gz" "$RUNNER_TEMP/latest.txt"

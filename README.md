@@ -31,6 +31,12 @@ In the Cloudflare dashboard open **R2 Object Storage → Enable R2** (it asks fo
 The next deploy creates the bucket `rxclinic-files` and links it as `FILES`. Reports can then be up to 5 MB,
 and older reports saved in D1 move into R2 the first time they are opened. `/status` shows `"files": "r2"`.
 
+### 1c. Nightly database backup (GitHub Actions → R2)
+Every night at 03:00 IST the **Nightly database backup** workflow exports `rxclinic-db` into the private
+bucket at `rxclinic-files/backups/db-day-DD.sql.gz` (one per day of the month, so ~31 days are kept).
+Add two repository secrets once: `CLOUDFLARE_API_TOKEN` (D1: Edit + Workers R2 Storage: Edit) and
+`CLOUDFLARE_ACCOUNT_ID`. Restore steps are at the top of `.github/workflows/backup-db.yml`.
+
 ### 2. The Rx Clinic server (Cloudflare Worker)
 1. **Workers & Pages → Create → Import a repository →** this repo, worker name `rx-clinic` (leave the root directory as `/`).
 2. In the worker's **Settings → Variables and Secrets**, add Secrets:
